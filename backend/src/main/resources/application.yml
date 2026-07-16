@@ -1,0 +1,86 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/${MYSQL_DATABASE:rag_kb}?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
+    username: ${MYSQL_USER:root}
+    password: ${MYSQL_ROOT_PASSWORD:rag123456}
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+
+# MyBatis-Plus
+mybatis-plus:
+  mapper-locations: classpath*:/mapper/**/*.xml
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+# Milvus
+milvus:
+  host: localhost
+  port: 19530
+  collection-name: rag_document_chunks
+  dimension: 1024
+
+# MinIO
+minio:
+  endpoint: ${MINIO_ENDPOINT:http://localhost:9000}
+  access-key: ${MINIO_ROOT_USER:minioadmin}
+  secret-key: ${MINIO_ROOT_PASSWORD:minioadmin}
+  bucket-name: rag-documents
+
+# Embedding
+embedding:
+  # 本地bge-large-zh或使用智谱API
+  provider: zhipu
+  zhipu:
+    api-key: ${ZHIPU_API_KEY:your-api-key-here}
+    model: embedding-3
+  # bge-local维度为1024, zhipu为2048，请根据provider调整milvus.dimension
+
+# LLM大模型
+llm:
+  provider: deepseek
+  deepseek:
+    api-key: ${DEEPSEEK_API_KEY:your-api-key-here}
+    base-url: https://api.deepseek.com
+    model: deepseek-chat
+    max-tokens: 2048
+    temperature: 0.7
+
+# RAG配置
+rag:
+  chunk-size: 512
+  chunk-overlap: 64
+  top-k: 5
+  prompt-template: |
+    你是一个专业的知识库问答助手。请根据以下参考资料回答用户的问题。
+    如果参考资料中没有相关信息，请诚实地说明你无法回答。
+    回答时请引用具体的来源文档。
+
+    参考资料：
+    {context}
+
+    用户问题：{question}
+
+    请给出详细、准确的回答：
+
+# Knife4j
+knife4j:
+  enable: true
+  setting:
+    language: zh_cn
+
+logging:
+  level:
+    com.liushuwen.rag: debug
