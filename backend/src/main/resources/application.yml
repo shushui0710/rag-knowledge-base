@@ -1,10 +1,10 @@
 server:
-  port: 8080
+  port: 18080
 
 spring:
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/${MYSQL_DATABASE:rag_kb}?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3307}/${MYSQL_DATABASE:rag_kb}?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
     username: ${MYSQL_USER:root}
     password: ${MYSQL_ROOT_PASSWORD:rag123456}
   servlet:
@@ -30,7 +30,7 @@ milvus:
   host: localhost
   port: 19530
   collection-name: rag_document_chunks
-  dimension: 1024
+  dimension: 2048
 
 # MinIO
 minio:

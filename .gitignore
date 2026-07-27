@@ -54,3 +54,6 @@ out/
 
 # Misc
 .launch.vbs
+
+# Test files
+test-*.txt
