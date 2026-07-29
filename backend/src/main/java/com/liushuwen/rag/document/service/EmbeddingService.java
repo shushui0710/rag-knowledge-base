@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.liushuwen.rag.common.BusinessException;
 
 import lombok.Data;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
@@ -28,6 +29,7 @@ import java.util.Map;
  */
 @Slf4j
 @Service
+@RequiredArgsConstructor
 public class EmbeddingService {
 
     @Value("${embedding.zhipu.api-key}")
@@ -42,8 +44,9 @@ public class EmbeddingService {
     // 智谱一次最多处理64条文本
     private static final int BATCH_SIZE = 64;
 
-    private final RestTemplate restTemplate = new RestTemplate();
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    // 由Spring容器注入（RestTemplateConfig中定义的@Bean + Spring Boot自动配置的ObjectMapper）
+    private final RestTemplate restTemplate;
+    private final ObjectMapper objectMapper;
 
     /**
      * 批量文本向量化
@@ -72,8 +75,6 @@ public class EmbeddingService {
         //       // 调用 embedBatch(batch) 得到向量，加到 allVectors 里
         //   }
         //
-        // 把下面的代码替换成你的实现：
-        // ============================================================
         for (int i = 0; i < texts.size(); i += BATCH_SIZE) {
             int end = Math.min(i + BATCH_SIZE, texts.size());
             List<String> batch = texts.subList(i, end);

@@ -1,17 +1,36 @@
 package com.liushuwen.rag.chat.service.impl;
 
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONObject;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.liushuwen.rag.common.BusinessException;
 import com.liushuwen.rag.chat.entity.ChatMessage;
 import com.liushuwen.rag.chat.entity.ChatSession;
 import com.liushuwen.rag.chat.mapper.ChatMessageMapper;
 import com.liushuwen.rag.chat.mapper.ChatSessionMapper;
 import com.liushuwen.rag.chat.service.ChatService;
+import com.liushuwen.rag.chat.service.LlmService;
+import com.liushuwen.rag.document.service.EmbeddingService;
+import com.liushuwen.rag.document.service.MilvusService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
 
+/**
+ * 智能问答服务实现 - RAG在线流程的核心
+ *
+ * 在线流程：用户提问 → 向量检索 → 拼接Prompt → 大模型生成 → 答案+来源
+ *
+ * 跨模块调用说明：
+ * - EmbeddingService（document模块）：把用户问题转成向量
+ * - MilvusService（document模块）：向量搜索相关文档块
+ * - LlmService（chat模块）：调用DeepSeek生成回答
+ *
+ * 面试考点：RAG在线流程编排 — 为什么是这个顺序，每一步的作用
+ */
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -19,6 +38,15 @@ public class ChatServiceImpl implements ChatService {
 
     private final ChatSessionMapper chatSessionMapper;
     private final ChatMessageMapper chatMessageMapper;
+    private final EmbeddingService embeddingService;
+    private final MilvusService milvusService;
+    private final LlmService llmService;
+
+    @Value("${rag.top-k}")
+    private int topK;
+
+    @Value("${rag.prompt-template}")
+    private String promptTemplate;
 
     @Override
     public ChatSession createSession() {
@@ -35,28 +63,189 @@ public class ChatServiceImpl implements ChatService {
 
     @Override
     public ChatMessage ask(Long sessionId, String question) {
-        // TODO: 实现RAG问答核心流程
-        // 1. 将question向量化
-        // 2. Milvus检索Top-K相关文档块
-        // 3. 拼接Prompt（上下文 + 问题）
-        // 4. 调用大模型API生成回答
-        // 5. 存储问答消息到MySQL
-        // 6. 返回回答 + 来源引用
-        // 注意：此步骤需要跨模块调用 DocumentService 获取检索上下文
         log.info("问答请求 - 会话:{}, 问题:{}", sessionId, question);
-        throw new BusinessException("智能问答功能待实现 - 第4周开发");
+
+        // ============================================================
+        // TODO 3（⭐ 难度）：保存用户问题到chat_message
+        //
+        // 提示：
+        //   ChatMessage userMsg = new ChatMessage();
+        //   userMsg.setSessionId(sessionId);
+        //   userMsg.setRole("user");
+        //   userMsg.setContent(question);
+        //   chatMessageMapper.insert(userMsg);
+        //
+        // 面试考点：为什么要先存用户问题？
+        //   即使后续流程失败，用户的问题记录也保留了
+        // ============================================================
+        ChatMessage userMsg=new ChatMessage();
+        userMsg.setSessionId(sessionId);
+        userMsg.setRole("user");
+        userMsg.setContent(question);
+        chatMessageMapper.insert(userMsg);
+
+
+
+        // ============================================================
+        // TODO 4（⭐⭐ 难度）：将问题向量化 + 检索Top-K
+        //
+        // 步骤1：调用 embeddingService.embed(List.of(question)) 得到向量列表
+        // 步骤2：取第一个向量（因为只有一条文本）：vectors.get(0)
+        // 步骤3：调用 milvusService.search(queryVector, topK) 检索
+        //
+        // 提示：
+        //   List<float[]> vectors = embeddingService.embed(List.of(question));
+        //   float[] queryVector = vectors.get(0);
+        //   List<MilvusService.SearchResult> results = milvusService.search(queryVector, topK);
+        //
+        // 面试考点：为什么用户问题也要向量化？
+        //   Milvus是向量搜索，查询向量和存储向量在同一空间才能比较相似度
+        // ============================================================
+        List<float[]> vectors=embeddingService.embed(List.of(question));
+        float[] queryVector = vectors.get(0);
+        List<MilvusService.SearchResult> results = milvusService.search(queryVector, topK);
+
+
+
+        // ============================================================
+        // TODO 5（⭐⭐ 难度）：拼接上下文 + 构建Prompt
+        //
+        // 步骤1：把检索到的文本块拼接成一个字符串（用编号格式）
+        //   StringBuilder sb = new StringBuilder();
+        //   for (int i = 0; i < results.size(); i++) {
+        //       sb.append("【参考").append(i + 1).append("】")
+        //         .append(results.get(i).getContent()).append("\n\n");
+        //   }
+        //   String context = sb.toString();
+        //
+        // 步骤2：用promptTemplate拼接最终prompt
+        //   promptTemplate 里有 {context} 和 {question} 两个占位符
+        //   String prompt = promptTemplate.replace("{context}", context)
+        //                                 .replace("{question}", question);
+        //
+        // 面试考点：Prompt工程 — 给大模型明确的上下文和指令，防止幻觉
+        // ============================================================
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < results.size(); i++) {
+            sb.append("【参考").append(i + 1).append("】")
+                    .append(results.get(i).getContent()).append("\n\n");
+        }
+        String context = sb.toString();
+        String prompt = promptTemplate.replace("{context}", context)
+                .replace("{question}", question);
+
+
+
+        // ============================================================
+        // TODO 6（⭐⭐ 难度）：调用大模型 + 构建来源 + 保存回答 + 返回
+        //
+        // 步骤1：调用 llmService.chat(prompt) 得到回答
+        //   String answer = llmService.chat(prompt);
+        //
+        // 步骤2：构建sources JSON（用FastJSON，和MilvusService一致）
+        //   JSONArray sourcesArray = new JSONArray();
+        //   for (MilvusService.SearchResult sr : results) {
+        //       JSONObject source = new JSONObject();
+        //       source.put("chunkId", sr.getChunkId());
+        //       source.put("score", sr.getScore());
+        //       String preview = sr.getContent().length() > 100
+        //           ? sr.getContent().substring(0, 100) + "..."
+        //           : sr.getContent();
+        //       source.put("content", preview);
+        //       sourcesArray.add(source);
+        //   }
+        //   String sources = sourcesArray.toJSONString();
+        //
+        // 步骤3：保存助手回答到chat_message
+        //   ChatMessage assistantMsg = new ChatMessage();
+        //   assistantMsg.setSessionId(sessionId);
+        //   assistantMsg.setRole("assistant");
+        //   assistantMsg.setContent(answer);
+        //   assistantMsg.setSources(sources);
+        //   chatMessageMapper.insert(assistantMsg);
+        //
+        // 步骤4：返回助手消息
+        //   return assistantMsg;
+        //
+        // 面试考点：
+        // - 为什么要存sources？—— 可追溯性，用户知道答案从哪来的
+        // - 为什么用FastJSON不用Jackson？—— Milvus SDK依赖FastJSON，项目统一用
+        // ============================================================
+        String answer=llmService.chat(prompt);
+
+        JSONArray sourcesArray = new JSONArray();
+        for (MilvusService.SearchResult sr : results) {
+            JSONObject source = new JSONObject();
+            source.put("chunkId", sr.getChunkId());
+            source.put("score", sr.getScore());
+            String preview = sr.getContent().length() > 100
+                    ? sr.getContent().substring(0, 100) + "..."
+                    : sr.getContent();
+            source.put("content", preview);
+            sourcesArray.add(source);
+        }
+        String sources = sourcesArray.toJSONString();
+
+        ChatMessage assistantMsg = new ChatMessage();
+        assistantMsg.setSessionId(sessionId);
+        assistantMsg.setRole("assistant");
+        assistantMsg.setContent(answer);
+        assistantMsg.setSources(sources);
+        chatMessageMapper.insert(assistantMsg);
+
+
+        return assistantMsg;
+
+
+
+        
     }
 
     @Override
     public List<ChatMessage> getHistory(Long sessionId) {
-        // TODO: 查询会话历史消息
-        return chatMessageMapper.selectList(null);
+        // ============================================================
+        // TODO 7（⭐ 难度）：按sessionId查询历史消息
+        //
+        // 当前代码：chatMessageMapper.selectList(null)  ← 查所有会话的消息！
+        // 应该改为：用LambdaQueryWrapper按sessionId过滤，按createTime排序
+        //
+        // 提示：
+        //   LambdaQueryWrapper<ChatMessage> wrapper = new LambdaQueryWrapper<>();
+        //   wrapper.eq(ChatMessage::getSessionId, sessionId)
+        //          .orderByAsc(ChatMessage::getCreateTime);
+        //   return chatMessageMapper.selectList(wrapper);
+        //
+        // 面试考点：LambdaQueryWrapper条件查询 — MyBatis-Plus的核心API
+        // ============================================================
+        LambdaQueryWrapper<ChatMessage> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(ChatMessage::getSessionId, sessionId)
+                .orderByAsc(ChatMessage::getCreateTime);
+        return chatMessageMapper.selectList(wrapper);
     }
 
     @Override
     public void deleteSession(Long sessionId) {
-        chatSessionMapper.deleteById(sessionId);
-        chatMessageMapper.delete(null);
+        // ============================================================
+        // TODO 8（⭐ 难度）：级联删除 — 先删消息，再删会话
+        //
+        // 当前代码：chatMessageMapper.delete(null)  ← 删所有会话的消息！
+        // 应该改为：
+        //   1. 先按sessionId删除该会话的所有消息
+        //   2. 再删除会话本身（逻辑删除）
+        //
+        // 提示：
+        //   LambdaQueryWrapper<ChatMessage> wrapper = new LambdaQueryWrapper<>();
+        //   wrapper.eq(ChatMessage::getSessionId, sessionId);
+        //   chatMessageMapper.delete(wrapper);
+        //   chatSessionMapper.deleteById(sessionId);
+        //
+        // 面试考点：级联删除顺序 — 先删子表（消息）再删父表（会话），
+        //          否则会留下孤儿记录
+        // ============================================================
+        LambdaQueryWrapper<ChatMessage> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(ChatMessage::getSessionId, sessionId);
+        chatMessageMapper.delete(wrapper);
+        chatSessionMapper.deleteById(sessionId);        
         log.info("删除会话: {}", sessionId);
     }
 }
