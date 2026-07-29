@@ -49,4 +49,11 @@ public class ChatController {
         chatService.deleteSession(sessionId);
         return Result.success();
     }
+
+    @Operation(summary = "更新会话标题")
+    @PutMapping("/session/{sessionId}/title")
+    public Result<Void> updateTitle(@PathVariable Long sessionId, @RequestBody String title) {
+        chatService.updateTitle(sessionId, title);
+        return Result.success();
+    }
 }

@@ -9,7 +9,7 @@ export function createSession() {
 }
 
 export function askQuestion(sessionId, question) {
-  return request.post(`/chat/ask/${sessionId}`, question, {
+  return request.post(`/chat/ask/${sessionId}`, JSON.stringify(question), {
     headers: { 'Content-Type': 'application/json' },
   })
 }
@@ -20,4 +20,10 @@ export function getHistory(sessionId) {
 
 export function deleteSession(sessionId) {
   return request.delete(`/chat/session/${sessionId}`)
+}
+
+export function updateSessionTitle(sessionId, title) {
+  return request.put(`/chat/session/${sessionId}/title`, JSON.stringify(title), {
+    headers: { 'Content-Type': 'application/json' },
+  })
 }

@@ -248,4 +248,15 @@ public class ChatServiceImpl implements ChatService {
         chatSessionMapper.deleteById(sessionId);        
         log.info("删除会话: {}", sessionId);
     }
+
+    @Override
+    public void updateTitle(Long sessionId, String title) {
+        ChatSession session = chatSessionMapper.selectById(sessionId);
+        if (session == null) {
+            throw new BusinessException("会话不存在: " + sessionId);
+        }
+        session.setTitle(title);
+        chatSessionMapper.updateById(session);
+        log.info("更新会话标题: {} -> {}", sessionId, title);
+    }
 }

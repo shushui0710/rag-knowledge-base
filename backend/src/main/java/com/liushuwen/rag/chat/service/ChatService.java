@@ -16,4 +16,6 @@ public interface ChatService {
     List<ChatMessage> getHistory(Long sessionId);
 
     void deleteSession(Long sessionId);
+
+    void updateTitle(Long sessionId, String title);
 }
