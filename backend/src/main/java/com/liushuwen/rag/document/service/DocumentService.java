@@ -7,7 +7,7 @@ import java.util.List;
 
 public interface DocumentService {
 
-    Document upload(MultipartFile file);
+    Document upload(MultipartFile file, String category);
 
     List<Document> list();
 

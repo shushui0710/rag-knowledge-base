@@ -2,6 +2,7 @@ package com.liushuwen.rag.document.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.liushuwen.rag.common.BusinessException;
+import com.liushuwen.rag.common.UserContext;
 import com.liushuwen.rag.document.entity.Document;
 import com.liushuwen.rag.document.entity.DocumentChunk;
 import com.liushuwen.rag.document.mapper.DocumentChunkMapper;
@@ -83,7 +84,7 @@ public class DocumentServiceImpl implements DocumentService {
      *   如果文件有问题还去上传MinIO，浪费资源还可能留下脏数据
      */
     @Override
-    public Document upload(MultipartFile file) {
+    public Document upload(MultipartFile file, String category) {
         // ========== Step 1: 文件校验 ==========
         validateFile(file);
 
@@ -114,15 +115,31 @@ public class DocumentServiceImpl implements DocumentService {
             // - fileType: 文件类型（pdf/docx/md/txt）
             // - fileSize: 文件大小（字节）
             // - minioPath: MinIO存储路径
-            // - userId: 所属用户（暂用1，后面加认证）
+            // - userId: 所属用户（从UserContext获取当前登录用户）
             // - chunkCount: 分块数（暂为0，下个任务实现解析分块后更新）
             // - embeddingStatus: 向量化状态（0=待入库）
             Document document = new Document();
-            document.setUserId(1L);  // TODO: 从认证上下文获取真实用户ID
+            // ============================================================
+            // TODO 4（⭐ 难度）：设置真实用户ID
+            //
+            // 当前代码：document.setUserId(1L);  ← 写死了，所有文档都属于userId=1
+            // 应该改为：从 UserContext 获取当前登录用户的ID
+            //
+            // 提示：
+            //   document.setUserId(UserContext.getUserId());
+            //
+            // 面试考点：
+            //   - UserContext.getUserId() 的数据从哪来？
+            //     JwtInterceptor 从 JWT 解析出 userId，存入 ThreadLocal
+            //   - 为什么要数据隔离？
+            //     多用户系统不能让A看到B的文档
+            // ============================================================
+            document.setUserId(UserContext.getUserId());  // TODO 4: 替换为 UserContext.getUserId()
             document.setTitle(extractTitle(originalFileName));
             document.setFileName(originalFileName);
             document.setFileType(fileType);
             document.setFileSize(file.getSize());
+            document.setCategory(category != null ? category : "其他");
             document.setMinioPath(minioPath);
             document.setChunkCount(0);  // 下面解析分块后更新
             document.setEmbeddingStatus(0);  // 0=待入库
@@ -225,10 +242,26 @@ public class DocumentServiceImpl implements DocumentService {
 
     @Override
     public List<Document> list() {
-        // 查询所有未删除的文档（MyBatis-Plus逻辑删除自动生效）
-        // 因为Document.java里有 @TableLogic private Integer deleted;
-        // selectList(null) 自动加 WHERE deleted = 0
-        return documentMapper.selectList(null);
+        // ============================================================
+        // TODO 5（⭐ 难度）：按当前用户ID过滤文档列表
+        //
+        // 当前代码：return documentMapper.selectList(null);  ← 查所有人的文档！
+        // 应该改为：用 LambdaQueryWrapper 按 userId 过滤
+        //
+        // 提示：
+        //   LambdaQueryWrapper<Document> wrapper = new LambdaQueryWrapper<>();
+        //   wrapper.eq(Document::getUserId, UserContext.getUserId())
+        //          .orderByDesc(Document::getCreateTime);
+        //   return documentMapper.selectList(wrapper);
+        //
+        // 面试考点：
+        //   - 数据隔离：每个用户只能看到自己的文档
+        //   - orderByDesc：按创建时间倒序，最新文档排最前
+        // ============================================================
+        LambdaQueryWrapper<Document> wrapper= new LambdaQueryWrapper<>();
+        wrapper.eq(Document::getUserId,UserContext.getUserId())
+               .orderByDesc(Document::getCreateTime);
+        return documentMapper.selectList(wrapper);  // TODO 5: 替换为按 userId 过滤
     }
 
     @Override

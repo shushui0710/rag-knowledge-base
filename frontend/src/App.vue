@@ -35,6 +35,11 @@
             <span>返回对话</span>
           </el-menu-item>
         </el-menu>
+        <div class="user-info">
+          <el-icon><UserFilled /></el-icon>
+          <span class="username">{{ authStore.user?.nickname || authStore.user?.username || '用户' }}</span>
+          <el-button text size="small" @click="handleLogout">退出</el-button>
+        </div>
       </div>
     </el-aside>
     <el-main style="padding: 0;">
@@ -48,11 +53,17 @@ import { onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { useChatStore } from './stores/chat'
+import { useAuthStore } from './stores/auth'
 
 const router = useRouter()
 const chatStore = useChatStore()
+const authStore = useAuthStore()
 
 onMounted(async () => {
+  // 先恢复用户信息
+  if (authStore.token && !authStore.user) {
+    await authStore.fetchUser()
+  }
   try {
     await chatStore.fetchSessions()
   } catch (e) {
@@ -74,37 +85,6 @@ function switchSession(id) {
   router.push(`/chat/${id}`)
 }
 
-// ============================================================
-// TODO 5（⭐ 难度）：删除会话（带确认弹窗）
-//
-// 背景：侧边栏每个会话右侧有一个 × 图标，点击后应弹出确认框，
-// 确认后调用 Pinia store 的 deleteSession 方法删除。
-//
-// 提示：
-//   async function deleteSession(id) {
-//     try {
-//       await ElMessageBox.confirm('确定删除这个会话？删除后不可恢复。', '提示', {
-//         type: 'warning',
-//         confirmButtonText: '删除',
-//         cancelButtonText: '取消',
-//       })
-//       await chatStore.deleteSession(id)
-//       ElMessage.success('删除成功')
-//       // 如果删的是当前会话，跳回 /chat
-//       if (router.currentRoute.value.params.sessionId == id) {
-//         router.push('/chat')
-//       }
-//     } catch (e) {
-//       // 用户点"取消"也会进 catch，不用报错
-//       if (e !== 'cancel') console.warn('删除失败', e)
-//     }
-//   }
-//
-// 面试考点：
-//   - @click.stop 的作用？—— 阻止事件冒泡，否则会同时触发 switchSession
-//   - 为什么用 ElMessageBox 不用 confirm()？—— Element Plus 风格统一
-// ============================================================
-
 async function deleteSession(id) {
   try {
     await ElMessageBox.confirm('确定删除这个会话？删除后不可恢复。', '提示', {
@@ -114,14 +94,17 @@ async function deleteSession(id) {
     })
     await chatStore.deleteSession(id)
     ElMessage.success('删除成功')
-    // 如果删的是当前会话，跳回 /chat
     if (router.currentRoute.value.params.sessionId == id) {
       router.push('/chat')
     }
   } catch (e) {
-    // 用户点"取消"也会进 catch，不用报错
     if (e !== 'cancel') console.warn('删除失败', e)
   }
+}
+
+function handleLogout() {
+  authStore.logout()
+  router.push('/login')
 }
 
 </script>
@@ -170,5 +153,23 @@ async function deleteSession(id) {
 
 .session-item:hover .session-delete:hover {
   opacity: 1;
+}
+
+.user-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 0;
+  border-top: 1px solid #e4e7ed;
+  margin-top: 8px;
+  font-size: 13px;
+  color: #606266;
+}
+
+.username {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

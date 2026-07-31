@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS `document` (
     `file_name` VARCHAR(200) NOT NULL COMMENT '文件名',
     `file_type` VARCHAR(20) NOT NULL COMMENT '文件类型(pdf/docx/md/txt)',
     `file_size` BIGINT DEFAULT 0 COMMENT '文件大小(字节)',
+    `category` VARCHAR(50) DEFAULT '其他' COMMENT '文档分类',
     `minio_path` VARCHAR(500) DEFAULT NULL COMMENT 'MinIO存储路径',
     `chunk_count` INT DEFAULT 0 COMMENT '分块数量',
     `embedding_status` INT DEFAULT 0 COMMENT '向量化状态: 0-待入库 1-已入库 2-入库失败',
@@ -63,5 +64,5 @@ CREATE TABLE IF NOT EXISTS `chat_message` (
     INDEX `idx_session_id` (`session_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='对话消息表';
 
--- 插入测试用户
-INSERT INTO `user` (`username`, `password`, `nickname`) VALUES ('admin', 'admin123', '管理员');
+-- 测试用户请通过注册接口创建：POST /api/auth/register
+-- 密码现在使用BCrypt加密，不能直接INSERT明文密码

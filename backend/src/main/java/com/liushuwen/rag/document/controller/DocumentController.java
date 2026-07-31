@@ -21,8 +21,9 @@ public class DocumentController {
 
     @Operation(summary = "上传文档")
     @PostMapping("/upload")
-    public Result<Document> upload(@RequestParam("file") MultipartFile file) {
-        return Result.success(documentService.upload(file));
+    public Result<Document> upload(@RequestParam("file") MultipartFile file,
+                                   @RequestParam(value = "category", defaultValue = "其他") String category) {
+        return Result.success(documentService.upload(file, category));
     }
 
     @Operation(summary = "获取文档列表")

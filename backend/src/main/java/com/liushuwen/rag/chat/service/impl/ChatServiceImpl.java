@@ -4,6 +4,7 @@ import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.liushuwen.rag.common.BusinessException;
+import com.liushuwen.rag.common.UserContext;
 import com.liushuwen.rag.chat.entity.ChatMessage;
 import com.liushuwen.rag.chat.entity.ChatSession;
 import com.liushuwen.rag.chat.mapper.ChatMessageMapper;
@@ -52,13 +53,46 @@ public class ChatServiceImpl implements ChatService {
     public ChatSession createSession() {
         ChatSession session = new ChatSession();
         session.setTitle("新对话");
+        // ============================================================
+        // TODO 6（⭐ 难度）：设置当前用户ID
+        //
+        // 当前代码：session 没有设置 userId（userId 为 null）
+        // 应该改为：从 UserContext 获取当前登录用户的ID
+        //
+        // 提示：
+        //   session.setUserId(UserContext.getUserId());
+        //
+        // 面试考点：
+        //   - 会话必须关联用户，否则无法实现数据隔离
+        // ============================================================
+        // TODO 6: 在这里添加 session.setUserId(UserContext.getUserId());
+        session.setUserId(UserContext.getUserId());
         chatSessionMapper.insert(session);
         return session;
     }
 
     @Override
     public List<ChatSession> listSessions() {
-        return chatSessionMapper.selectList(null);
+        // ============================================================
+        // TODO 7（⭐ 难度）：按当前用户ID过滤会话列表
+        //
+        // 当前代码：return chatSessionMapper.selectList(null);  ← 查所有人的会话！
+        // 应该改为：用 LambdaQueryWrapper 按 userId 过滤
+        //
+        // 提示：
+        //   LambdaQueryWrapper<ChatSession> wrapper = new LambdaQueryWrapper<>();
+        //   wrapper.eq(ChatSession::getUserId, UserContext.getUserId())
+        //          .orderByDesc(ChatSession::getUpdateTime);
+        //   return chatSessionMapper.selectList(wrapper);
+        //
+        // 面试考点：
+        //   - 为什么按 updateTime 排序？最近更新的会话排最前
+        // ============================================================
+        LambdaQueryWrapper<ChatSession> wrapper=new LambdaQueryWrapper<>();
+        wrapper.eq(ChatSession::getUserId,UserContext.getUserId())
+                .orderByDesc(ChatSession::getUpdateTime);
+
+        return chatSessionMapper.selectList(wrapper);  // TODO 7: 替换为按 userId 过滤
     }
 
     @Override

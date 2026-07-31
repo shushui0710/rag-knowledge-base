@@ -58,6 +58,11 @@ llm:
     max-tokens: 2048
     temperature: 0.7
 
+# JWT配置
+jwt:
+  secret: ${JWT_SECRET:RagKnowledgeBaseSecretKey2024VeryLongSecretForHS256Algorithm}
+  expiration: 86400000  # 24小时（毫秒）
+
 # RAG配置
 rag:
   chunk-size: 512

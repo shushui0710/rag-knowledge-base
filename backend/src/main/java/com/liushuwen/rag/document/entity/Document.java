@@ -21,6 +21,8 @@ public class Document {
 
     private Long fileSize;
 
+    private String category;
+
     private String minioPath;
 
     private Integer chunkCount;
