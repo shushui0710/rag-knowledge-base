@@ -52,9 +52,9 @@ services:
       timeout: 20s
       retries: 3
 
-  # Milvus 向量数据库
+  # Milvus 向量数据库（路线A：2.4.10 → 2.5.16，启用内置 BM25 Function 做混合检索）
   milvus:
-    image: milvusdb/milvus:v2.4.10
+    image: milvusdb/milvus:v2.5.16
     container_name: rag-milvus
     command: ["milvus", "run", "standalone"]
     security_opt:

@@ -9,6 +9,7 @@ import io.minio.PutObjectArgs;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import io.minio.GetObjectArgs;
 
 import java.io.InputStream;
 
@@ -133,5 +134,14 @@ public class MinioService {
                 java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd")
         );
         return "documents/" + datePath + "/" + originalFileName;
+    }
+
+    public byte[] download(String objectName) {
+        try (InputStream in = minioClient.getObject(GetObjectArgs.builder()
+                .bucket(minioConfig.getBucketName()).object(objectName).build())) {
+            return in.readAllBytes();
+        } catch (Exception e) {
+            throw new BusinessException("文件下载失败: " + e.getMessage());
+        }
     }
 }

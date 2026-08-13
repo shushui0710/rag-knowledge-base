@@ -2,6 +2,7 @@ package com.liushuwen.rag.chat.service;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.liushuwen.rag.agent.Tool;
 import com.liushuwen.rag.common.BusinessException;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
@@ -15,6 +16,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * LLM大模型服务 - 调用DeepSeek API生成回答
@@ -173,8 +175,170 @@ public class LlmService {
     public static class Message {
         private String role;
         private String content;
+        /** DeepSeek 返回的 JSON 字段名是 tool_calls，必须显式映射（否则 Jackson 匹配不到，一直为 null） */
+        @com.fasterxml.jackson.annotation.JsonProperty("tool_calls")
+        private List<ToolCall> toolCalls;
     }
 
+    // ============================================================
+    // 阶段3新增：Function Calling 支持（Agentic RAG）
+    // ============================================================
 
+    /**
+     * 工具调用（Function Calling）结果 DTO
+     * DeepSeek 返回的 message.tool_calls 结构：
+     * [{"id": "call_xxx", "function": {"name": "query_document_stats", "arguments": "{...}"}}]
+     */
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class ToolCall {
+        private String id;
+        private Function function;
+
+        @Data
+        @JsonIgnoreProperties(ignoreUnknown = true)
+        public static class Function {
+            private String name;
+            /** arguments 是 JSON 字符串，使用时需 parseObject */
+            private String arguments;
+        }
+    }
+
+    /**
+     * 带工具定义的对话调用（阶段3 ✅ 已实现：Function Calling）
+     *
+     * @param messages 对话历史（List of Map：{"role":..,"content":..}，ReAct 循环逐轮追加）
+     * @param tools    可用工具列表（转成 OpenAI tools 参数）
+     * @return LlmResponse（ANSWER=最终回答 / TOOL_CALL=需要调用工具）
+     */
+    public LlmResponse chatWithTools(List<Map<String, Object>> messages, List<Tool> tools) {
+        try {
+            // 1. 请求头（与 chat() 一致）
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            headers.setBearerAuth(apiKey);
+
+            // 2. 请求体：messages + tools 定义
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("model", model);                        // deepseek-v4-flash
+            body.put("messages", messages);
+            body.put("tools", tools.stream().map(t -> {
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("type", "function");
+                Map<String, Object> fn = new LinkedHashMap<>();
+                fn.put("name", t.name());
+                fn.put("description", t.description());
+                // ⚠️ readTree 抛受检异常 JsonProcessingException——lambda 内无法被外层 try-catch
+                //    捕获，必须就地转成 RuntimeException（外层 catch(Exception) 统一处理）
+                try {
+                    fn.put("parameters", objectMapper.readTree(t.parametersJsonSchema()));
+                } catch (Exception ex) {
+                    throw new RuntimeException("工具参数 schema 解析失败: " + t.name(), ex);
+                }
+                f.put("function", fn);
+                return f;
+            }).collect(Collectors.toList()));
+            body.put("tool_choice", "auto");
+            body.put("temperature", 0.3);
+
+            // 3. 发送请求
+            String apiUrl = baseUrl + "/v1/chat/completions";
+            HttpEntity<String> entity = new HttpEntity<>(
+                    objectMapper.writeValueAsString(body), headers);
+            ResponseEntity<String> response = restTemplate.exchange(
+                    apiUrl, HttpMethod.POST, entity, String.class);
+            DeepSeekResponse resp = objectMapper.readValue(response.getBody(), DeepSeekResponse.class);
+
+            // 4. 解析（⚠️ choices 是数组，先 get(0) 再取 message）
+            Message msg = resp.getChoices().get(0).getMessage();
+            if (msg.getToolCalls() != null && !msg.getToolCalls().isEmpty()) {
+                // 把模型返回的 assistant 消息【原样】保存（含 tool_calls），
+                // ReAct 循环后续要原样回填，漏了必报 400
+                Map<String, Object> raw = new LinkedHashMap<>();
+                raw.put("role", "assistant");
+                raw.put("content", msg.getContent() == null ? "" : msg.getContent());
+                raw.put("tool_calls", msg.getToolCalls());
+                return LlmResponse.toolCalls(msg.getToolCalls(), raw);
+            }
+            return LlmResponse.answer(msg.getContent() == null ? "" : msg.getContent());
+        } catch (Exception e) {
+            log.error("Function Calling 调用失败: {}", e.getMessage(), e);
+            throw new BusinessException("大模型生成失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Function Calling 响应（ANSWER / TOOL_CALL 两态）
+     *
+     * - ANSWER 态：content 有值，toolCalls 为空 → AgentExecutor 直接返回
+     * - TOOL_CALL 态：toolCalls 有值，content 可为空 → AgentExecutor 执行工具
+     * - rawAssistantMsg：模型返回的 assistant 消息原样（ReAct 回填对话历史用）
+     */
+    @Data
+    public static class LlmResponse {
+        private String content;                       // ANSWER 态：最终回答
+        private List<ToolCall> toolCalls;             // TOOL_CALL 态：要调用的工具
+        private Map<String, Object> rawAssistantMsg;  // assistant 消息原样（回填用）
+
+        public boolean isAnswer() {
+            return toolCalls == null || toolCalls.isEmpty();
+        }
+
+        public static LlmResponse answer(String content) {
+            LlmResponse r = new LlmResponse();
+            r.setContent(content);
+            return r;
+        }
+
+        public static LlmResponse toolCalls(List<ToolCall> calls, Map<String, Object> raw) {
+            LlmResponse r = new LlmResponse();
+            r.setToolCalls(calls);
+            r.setRawAssistantMsg(raw);
+            return r;
+        }
+    }
+
+    /**
+     * 带 system 指令的对话生成（阶段2/3/4 共用前置方法）
+     *
+     * 用途：TODO 2-3 查询改写 / TODO 3-4 意图路由 / TODO 4-3 反思评审——
+     * 都需要"自定义 system + 可控 temperature"的 LLM 调用。
+     * 与 chat(prompt) 的区别：chat() 的 system 固定为知识库问答助手，且 temperature 走配置。
+     *
+     * @param system      system 指令（角色设定/输出格式约束）
+     * @param user        用户内容
+     * @param temperature 温度（改写/路由用 0.1~0.2，生成用 0.7）
+     * @return 大模型生成的文本
+     */
+    public String chatWithSystem(String system, String user, double temperature) {
+        try {
+            // 1. 请求头（与 chat() 一致）
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            headers.setBearerAuth(apiKey);
+
+            // 2. 请求体：messages = [system, user]，temperature 参数化
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("model", model);                       // yml 已改 deepseek-v4-flash
+            List<Map<String, String>> msgs = new ArrayList<>();
+            msgs.add(Map.of("role", "system", "content", system));
+            msgs.add(Map.of("role", "user", "content", user));
+            body.put("messages", msgs);
+            body.put("max_tokens", maxTokens);
+            body.put("temperature", temperature);
+
+            // 3. 发送 + 解析（复用 chat() 的 POJO 绑定）
+            String apiUrl = baseUrl + "/v1/chat/completions";
+            HttpEntity<String> entity = new HttpEntity<>(
+                    objectMapper.writeValueAsString(body), headers);
+            ResponseEntity<String> response = restTemplate.exchange(
+                    apiUrl, HttpMethod.POST, entity, String.class);
+            DeepSeekResponse resp = objectMapper.readValue(response.getBody(), DeepSeekResponse.class);
+            return resp.getChoices().get(0).getMessage().getContent();
+        } catch (Exception e) {
+            log.error("chatWithSystem 调用失败: {}", e.getMessage(), e);
+            throw new BusinessException("大模型生成失败: " + e.getMessage());
+        }
+    }
 
 }

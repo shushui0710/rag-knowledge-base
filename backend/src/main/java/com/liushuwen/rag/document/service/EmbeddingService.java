@@ -162,5 +162,28 @@ public class EmbeddingService {
         private float[] embedding;
         // getter/setter
     }
-    
+
+    // ============================================================
+    // 阶段5 ✅ 已实现：Embedding 结果缓存（省钱 = 面试加分）
+    // ============================================================
+
+    /** 文本 → 向量缓存（相同问题不重复调 API） */
+    private final java.util.Map<String, float[]> embedCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final int CACHE_LIMIT = 5000;
+
+    /**
+     * 单文本向量化（带缓存）：命中直接返回，未命中才调智谱 API
+     * ⚠️ 缓存 key 带模型版本前缀，模型升级/维度变化时自动失效
+     */
+    public float[] embedSingle(String text) {
+        if (text == null) {
+            throw new BusinessException("向量化文本不能为空");
+        }
+        if (embedCache.size() > CACHE_LIMIT) {
+            embedCache.clear();                        // 简单容量控制
+        }
+        return embedCache.computeIfAbsent("v1:" + text,
+                t -> embed(List.of(text)).get(0));     // 未命中才调 API
+    }
+
 }

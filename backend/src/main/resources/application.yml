@@ -54,7 +54,9 @@ llm:
   deepseek:
     api-key: ${DEEPSEEK_API_KEY:your-api-key-here}
     base-url: https://api.deepseek.com
-    model: deepseek-chat
+    # ⚠️ 2026-07-24 起 deepseek-chat / deepseek-reasoner 已弃用（兼容仍可用），
+    # 新模型名：deepseek-v4-flash（非思考）/ deepseek-v4-pro（更强）。问答场景用 flash 即可。
+    model: deepseek-v4-flash
     max-tokens: 2048
     temperature: 0.7
 
@@ -79,6 +81,20 @@ rag:
     用户问题：{question}
 
     请给出详细、准确的回答：
+
+  # ========== Agentic RAG 演进配置（第8周新增） ==========
+  # 对应 RagProperties.java（@ConfigurationProperties 松散绑定：kebab-case → camelCase）
+  agent:
+    max-iterations: 5          # ReAct 循环最大轮数
+    min-score: 0.35            # 检索结果最低相似度阈值
+    breaker-failure-threshold: 5   # 熔断阈值：连续失败次数
+    breaker-open-millis: 60000     # 熔断时长（毫秒）
+    critic-max-retry: 1        # 反思重写最大次数
+  retrieval:
+    hybrid-alpha: 0.7          # 混合检索：稠密分权重
+    recall-top-k: 20           # 召回条数（重排前）
+    rerank-top-n: 5            # 重排后进入 Prompt 的条数
+    embed-cache-limit: 5000    # Embedding 缓存上限
 
 # Knife4j
 knife4j:

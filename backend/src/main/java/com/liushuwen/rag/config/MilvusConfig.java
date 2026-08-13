@@ -2,6 +2,8 @@ package com.liushuwen.rag.config;
 
 import io.milvus.client.MilvusServiceClient;
 import io.milvus.param.ConnectParam;
+import io.milvus.v2.client.ConnectConfig;
+import io.milvus.v2.client.MilvusClientV2;
 import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -37,5 +39,20 @@ public class MilvusConfig {
                 .withPort(port)
                 .build();
         return new MilvusServiceClient(connectParam);
+    }
+
+    /**
+     * 创建 MilvusClientV2（v2 API 客户端，TODO 2-1 路线A：BM25 Function 专用）
+     *
+     * 为什么需要第二个客户端？
+     * - v1 客户端（MilvusServiceClient）没有 v2 方法（FunctionType/EmbeddedText/SearchReq 都是 v2 的）
+     * - v1 / v2 是两个独立 Bean，各自连同一个 Milvus，操作同一个 collection，互不影响
+     */
+    @Bean
+    public MilvusClientV2 milvusClientV2() {
+        ConnectConfig connectConfig = ConnectConfig.builder()
+                .uri("http://" + host + ":" + port)
+                .build();
+        return new MilvusClientV2(connectConfig);
     }
 }

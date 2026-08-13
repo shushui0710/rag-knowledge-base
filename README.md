@@ -2,13 +2,22 @@
 
 企业级智能知识库问答平台 —— 基于 RAG（检索增强生成）技术，支持文档上传解析、文本分块、向量化入库、语义检索与大模型问答，附带 JWT 认证与多用户数据隔离。
 
+已从"普通 RAG"演进为 **Agentic RAG**：通过 Function Calling 工具调用、ReAct 循环与意图路由，让助手能自主决定"查文档 / 查数据库 / 生成报告"；检索侧升级 **Milvus 2.5 内置 BM25 Function** 实现稠密 + 稀疏双路混合检索。
+
 ## 功能特性
 
 | 模块 | 功能 |
 |------|------|
 | 用户认证 | 注册 / 登录（JWT + BCrypt 加密），登录态管理，路由守卫 |
-| 文档管理 | 上传（PDF/Word/MD/TXT）、解析分块、向量化入库、分类筛选、删除 |
+| 文档管理 | 上传（PDF/Word/MD/TXT）、解析分块、向量化入库、分类筛选、删除、增量重传（TODO） |
 | 智能问答 | 多会话管理、流式问答、来源引用、Markdown 渲染、历史记录 |
+| **Agent 智能问答** | `POST /api/agent/ask`：Function Calling + ReAct 循环，多工具自主调度（工具调用/检索/路由，骨架已就绪） |
+| **多 Agent 编排** | `POST /api/agent/orchestrate`：主管 Agent 路由分派 + HYBRID 组合回答 + 反思重写（✅ 已实现） |
+| **长期记忆 / 反思** | qa_memory 独立 collection 存问答对 + LLM 评审重写（✅ 已实现） |
+| **检索评估** | `docs/eval/questions.json` + EvalRunnerTest 命中率评测（✅ 已实现） |
+| **混合检索** | Milvus 2.5 BM25 Function（路线A）：稠密 + 稀疏双路召回 + 加权融合（✅ 已实现） |
+| **Rerank / 查询改写** | 智谱 rerank 精排（召回20→精排5）+ LLM 查询改写（✅ 已实现） |
+| **指标观测** | `GET /api/metrics/today`：问答次数、平均耗时、LLM/工具调用次数 |
 | 数据隔离 | 文档与会话按用户隔离，用户只能看到自己的数据 |
 | 接口文档 | Knife4j 在线 API 文档，支持在线调试 |
 
@@ -49,6 +58,24 @@
 
 用户提问 → 智谱 Embedding 向量化 → Milvus 语义检索 Top-K → Prompt 拼接 → DeepSeek 大模型生成 → 答案 + 来源引用
 
+### Agentic 问答流程（阶段 3，骨架已就绪）
+
+```
+用户提问 → [意图路由 Router] → 判断走哪条链路
+   ├─ DOCUMENT → RAG 检索问答（原链路）
+   ├─ STATS    → Agent 调数据工具（query_document_stats / query_document_list）
+   └─ HYBRID   → AgentExecutor 完整 ReAct 循环：
+                  思考 → 调工具 → 观察结果 → 再思考 → 最终回答（最多 5 轮）
+```
+
+### 混合检索流程（TODO 2-1，路线 A）
+
+```
+查询改写 → 双路召回 → 分数融合 → Rerank（TODO 2-2）→ Top5 → Prompt
+          ├─ 稠密路：embedding 向量（Milvus FloatVector）
+          └─ 稀疏路：BM25 Function 自动生成稀疏向量（Milvus 2.5+，SparseFloatVector）
+```
+
 ## 技术栈
 
 | 层 | 技术 | 版本 | 说明 |
@@ -60,11 +87,13 @@
 | 前端框架 | Vue3 + Element Plus | 3.4 / 2.7 | Vite 构建，Composition API |
 | 前端状态 | Pinia | 2.1 | 替代 Vuex，更轻量 |
 | 前端路由 | Vue Router | 4.3 | 含路由守卫 |
-| 向量库 | Milvus | 2.4.10 | Docker 容器，端口 19530 |
+| 向量库 | Milvus | 2.5.16 | Docker 容器，端口 19530；启用内置 BM25 Function（路线A） |
+| Milvus SDK | milvus-sdk-java | 2.5.14 | v1 API（MilvusServiceClient）继续使用；SDK 2.5 起不再传递 fastjson，需显式依赖 |
+| JSON | fastjson | 1.2.83 | 显式声明（原由 Milvus SDK 2.4.1 传递） |
 | 文件存储 | MinIO | 2023.03 | Docker 容器，API 9000 / 控制台 9002 |
 | 文档解析 | Apache PDFBox + POI | 3.0.1 / 5.2.5 | PDF / Word / MD / TXT |
 | Embedding | 智谱 API (embedding-3) | — | 2048 维向量 |
-| 大模型 | DeepSeek API (deepseek-chat) | — | OpenAI 兼容格式 |
+| 大模型 | DeepSeek API (deepseek-v4-flash) | — | OpenAI 兼容格式（deepseek-chat 已于 2026-07-24 弃用） |
 | 接口文档 | Knife4j | 4.4.0 | http://localhost:18080/doc.html |
 | 部署 | Docker Compose | — | 一键编排所有中间件 |
 
@@ -123,12 +152,19 @@ JWT_SECRET=your-random-secret
 ### 第 2 步：启动基础设施
 
 ```bash
-# 启动全部中间件（MySQL + MinIO + Milvus + etcd）
+# 启动全部中间件（MySQL + MinIO + Milvus 2.5.16 + etcd）
 docker-compose up -d
 
 # 确认容器状态
 docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 ```
+
+> ⚠️ **从 Milvus 2.4 升级**：docker-compose.yml 已更新为 `milvusdb/milvus:v2.5.16`，需重新拉取镜像：
+> ```bash
+> docker-compose down
+> docker-compose up -d   # 会拉取 v2.5.16 新镜像
+> ```
+> 旧 collection 数据可继续使用（v1 gRPC 协议向后兼容）；但要启用 BM25 Function 混合检索（TODO 2-1），需**重建 collection**（新增 `bm25_vector` 稀疏字段 + BM25 Function）。
 
 预期输出 5 个容器均为 healthy：
 
@@ -219,8 +255,32 @@ rag-knowledge-base/
 │       │   │   ├── mapper/ChatMessageMapper.java
 │       │   │   └── service/
 │       │   │       ├── ChatService.java
-│       │   │       ├── LlmService.java                DeepSeek API调用
+│       │   │       ├── LlmService.java                DeepSeek API调用（chat/chatWithSystem/chatWithTools）
 │       │   │       └── impl/ChatServiceImpl.java      RAG在线流程编排
+│       │   │
+│       │   ├── agent/                   🤖 Agent 模块（第8周新增）
+│       │   │   ├── Tool.java / ToolRegistry.java      工具抽象 + 注册表
+│       │   │   ├── QueryDocumentStatsTool.java        ✅ 工具1：文档统计（已实现）
+│       │   │   ├── QueryDocumentListTool.java         ✅ 工具2：文档列表（已实现）
+│       │   │   ├── GenerateReportTool.java            ✅ 工具3：报告生成（已实现）
+│       │   │   ├── AgentExecutor.java                 ✅ ReAct 循环执行器（已实现）
+│       │   │   ├── Agent.java + Document/Stats/ReportAgent + OrchestratorAgent ✅ 多Agent 编排（含反思）
+│       │   │   ├── AgentMetrics.java                  ✅ 指标埋点（已实现）
+│       │   │   └── LlmCircuitBreaker.java             ✅ 熔断器（已实现）
+│       │   │
+│       │   ├── rag/                     🔍 检索增强（第8周新增）
+│       │   │   ├── Route.java / RouterService.java    ✅ 意图路由（已实现）
+│       │   │   ├── QueryRewriterService.java          查询改写（✅ 已实现）
+│       │   │   ├── RerankService.java                 重排序（✅ 已实现）
+│       │   │   ├── MemoryService.java                 ✅ 长期记忆（qa_memory collection）
+│       │   │   └── CriticService.java                 反思评审（TODO 4-3）
+│       │   │
+│       │   ├── controller/               🌐 控制器
+│       │   │   ├── AgentController.java               /api/agent/ask + /orchestrate
+│       │   │   └── MetricsController.java             /api/metrics/today
+│       │   │
+│       │   ├── eval/                     📊 评估（第8周新增）
+│       │   │   └── EvalRunner.java                    ✅ 评估（test 目录 EvalRunnerTest + docs/eval/questions.json）
 │       │   │
 │       │   ├── common/                  🔧 通用组件
 │       │   │   ├── Result.java                        统一响应封装
@@ -235,6 +295,7 @@ rag-knowledge-base/
 │       │       ├── RestTemplateConfig.java            HTTP客户端@Bean
 │       │       ├── MilvusConfig.java                  Milvus客户端配置
 │       │       ├── MinioConfig.java                   MinIO客户端配置
+│       │       ├── RagProperties.java                 RAG/Agent配置组（@ConfigurationProperties）
 │       │       ├── MybatisPlusConfig.java             分页插件
 │       │       ├── MyMetaObjectHandler.java           自动填充时间
 │       │       └── CorsConfig.java                    跨域配置
@@ -268,9 +329,17 @@ rag-knowledge-base/
 │       └── migration_week6.sql          已有库迁移脚本
 │
 ├── docs/
-│   ├── 学习笔记.md                       12章+10个面试亮点
+│   ├── README.md                          文档导航（按场景选文档）
+│   ├── 学习笔记.md                       13章+11个面试亮点
 │   ├── 面试复习提纲.md                    面试速查卡
-│   └── 第3-6周开发任务书.md
+│   ├── 技术亮点与架构设计.md              架构图+选型理由+11亮点（面试规范版）
+│   ├── AgenticRAG面试速记卡.md            面试前30分钟速记（链路图+10话术+手撕清单）
+│   ├── 测试报告与验收结论.md              验收结论+降级矩阵+边界防御
+│   ├── AgenticRAG演进辅导方案.md          第8周：5阶段演进方案（含【思路提示】+【标准答案】+📁目录）
+│   ├── AgenticRAG骨架落地说明.md          骨架文件清单/TODO分布/里程碑验证
+│   ├── AgenticRAG辅导方案逐项审查报告.md   全部TODO事实核查（已验证/待确认分级）
+│   ├── 第3-6周开发任务书.md
+│   └── eval/questions.json                检索评估集（5题示例，可扩展20题）
 │
 ├── docker-compose.yml                    Docker编排
 ├── .env.example                          环境变量模板
@@ -308,10 +377,15 @@ MySQL 启动时自动执行 `docker/mysql/init/init.sql`：
 | DELETE | `/api/chat/session/{id}` | 删除会话（级联删除消息） | 是 |
 | POST | `/api/chat/ask` | 智能问答 | 是 |
 | GET | `/api/chat/history/{sessionId}` | 获取对话历史 | 是 |
+| POST | `/api/agent/ask` | Agent 单轮问答（ReAct + 工具调用，骨架直通 LLM） | 是 |
+| POST | `/api/agent/orchestrate` | 多 Agent 编排问答（主管分派） | 是 |
+| GET | `/api/metrics/today` | 今日 Agent 指标（问答数/耗时/LLM/工具调用） | 是 |
 
 > 完整接口文档：http://localhost:18080/doc.html
 >
 > 认证接口需在请求头添加 `Authorization: Bearer <token>`，Knife4j 中可在「Authorize」按钮统一配置。
+>
+> ⚠️ Agent 接口当前为骨架直通模式（TODO 3-2/3-3 完成后才真正调用工具），详见 `docs/AgenticRAG骨架落地说明.md`。
 
 ## 开发进度
 
@@ -324,6 +398,18 @@ MySQL 启动时自动执行 `docker/mysql/init/init.sql`：
 | 第5周 | 前端对话交互（Markdown/路由/Pinia） | ✅ |
 | 第6周 | JWT 认证 + 数据隔离 + 文档分类 | ✅ |
 | 第7周 | 项目文档 + 面试复习材料 | ✅ |
+| 第8周 | Agentic RAG 演进 5 阶段全部完成（检索优化/Agentic核心/多Agent/记忆反思/评估缓存） | ✅ |
+
+### 第 8 周演进 TODO 清单（骨架已落地，标准答案见文档）
+
+| 优先级 | TODO | 状态 |
+|--------|------|------|
+| ⭐ | 1-1 增量更新 / 1-1b 删向量 | 🔄 已实现（reparseDocument+deleteByDocumentId） |
+| ⭐⭐ | 2-1 混合检索（路线A：Milvus 2.5 BM25 Function） | ✅ 已实现 |
+| ⭐⭐ | 2-2 Rerank / 2-3 查询改写 | ✅ 已实现 |
+| ⭐⭐⭐ | 3-2 Function Calling / 3-3 ReAct 循环 / 3-4 意图路由 | ✅ 已实现 |
+| ⭐⭐⭐ | 4-1 多 Agent / 4-2 长期记忆 / 4-3 反思 | ✅ 已实现 |
+| ⭐⭐ | 5-1 评估集 / 5-2 观测 / 5-3 缓存 / 5-4 容错 | ✅ 已实现 |
 
 ## 常见问题
 
@@ -375,6 +461,18 @@ Git Bash 中使用 `mvn.cmd` 代替 `mvn`，这是 Windows 路径格式兼容问
 ```bash
 docker exec -i rag-mysql mysql -uroot -prag123456 rag_kb < docker/mysql/migration_week6.sql
 ```
+
+### Q: Milvus 从 2.4 升级到 2.5（本次路线 A 改动）？
+
+| 项 | 2.4（旧） | 2.5（新） | 需要改什么 |
+|----|-----------|-----------|-----------|
+| 服务端镜像 | `milvusdb/milvus:v2.4.10` | `v2.5.16` | `docker-compose.yml` 已更新，`docker-compose up -d` 重拉镜像 |
+| Java SDK | `milvus-sdk-java 2.4.1` | `2.5.14` | `pom.xml` 已更新 |
+| JSON 库 | SDK 传递 fastjson | SDK 改用 **Gson** | ① `pom.xml` 显式声明 fastjson 1.2.83（项目代码直接用）② `MilvusService.insertVectors` 已从 fastjson 改 Gson `JsonObject` |
+| v1 API | — | 兼容保留 | `MilvusServiceClient` / `DeleteParam` / `SearchParam` 均无需改动（已编译验证） |
+| BM25 Function | 不支持 | 支持 | TODO 2-1：重建 collection，新增 `bm25_vector`（SparseFloatVector）+ `FunctionType.BM25`，详见 `MilvusService.hybridSearch` 注释 |
+
+> 旧 collection 数据不迁移也能继续查询（协议向后兼容）；启用混合检索才需要重建 collection。
 
 ### Q: Knife4j 测试需要认证的接口？
 

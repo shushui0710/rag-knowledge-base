@@ -1,0 +1,22 @@
+[
+  {
+    "question": "Java 的 HashMap 底层原理是什么？",
+    "expectedKeyword": "HashMap"
+  },
+  {
+    "question": "Spring 事务传播行为有哪几种？",
+    "expectedKeyword": "事务"
+  },
+  {
+    "question": "MySQL 索引为什么用 B+ 树？",
+    "expectedKeyword": "B+树"
+  },
+  {
+    "question": "线程池的核心参数有哪些？",
+    "expectedKeyword": "线程池"
+  },
+  {
+    "question": "JWT 认证流程是怎么实现的？",
+    "expectedKeyword": "JWT"
+  }
+]

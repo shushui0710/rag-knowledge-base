@@ -13,10 +13,13 @@ import com.liushuwen.rag.chat.service.ChatService;
 import com.liushuwen.rag.chat.service.LlmService;
 import com.liushuwen.rag.document.service.EmbeddingService;
 import com.liushuwen.rag.document.service.MilvusService;
+import com.liushuwen.rag.rag.QueryRewriterService;
+import com.liushuwen.rag.rag.RerankService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import com.liushuwen.rag.config.RagProperties;
 
 import java.util.List;
 
@@ -42,6 +45,11 @@ public class ChatServiceImpl implements ChatService {
     private final EmbeddingService embeddingService;
     private final MilvusService milvusService;
     private final LlmService llmService;
+    private final RagProperties ragProperties;
+    /** 阶段2：查询改写（口语 → 检索词） */
+    private final QueryRewriterService queryRewriterService;
+    /** 阶段2：Rerank 精排（召回 → 精排） */
+    private final RerankService rerankService;
 
     @Value("${rag.top-k}")
     private int topK;
@@ -137,7 +145,60 @@ public class ChatServiceImpl implements ChatService {
         // ============================================================
         List<float[]> vectors=embeddingService.embed(List.of(question));
         float[] queryVector = vectors.get(0);
-        List<MilvusService.SearchResult> results = milvusService.search(queryVector, topK);
+
+        // ============================================================
+        // 阶段2 检索链（✅ 已实现）：
+        //   查询改写 → 混合检索（稠密+BM25稀疏，召回 recallTopK=20）→ Rerank 精排 → topN=5
+        //
+        // 说明：
+        // - 改写结果只用于"检索"，回答 Prompt 仍用原问题（queryRewriterService 内部已兜底）
+        // - 混合检索：collection 未重建（无 bm25_vector）时自动降级纯稠密（hybridSearch 内部）
+        // - Rerank：API 失败自动降级按原分数排序（rerankService 内部）
+        // - 参数从 rag.retrieval.* 读（RagProperties）
+        // ============================================================
+        String rewriteQuery = queryRewriterService.rewrite(question);
+        int recallTopK = ragProperties.getRetrieval().getRecallTopK();
+        int rerankTopN = ragProperties.getRetrieval().getRerankTopN();
+        List<MilvusService.SearchResult> results = rerankService.rerank(question,
+                milvusService.hybridSearch(rewriteQuery, queryVector, recallTopK),
+                rerankTopN);
+
+        // ============================================================
+        // TODO 1-2（⭐ 难度）：score 阈值过滤（低分片段不进 Prompt，防幻觉+省钱）
+        //
+        // 【标准答案】完整实现（可直接插入下面这 5 行）
+        //
+        // 前置：给 ChatServiceImpl 增加注入（@RequiredArgsConstructor 自动构造注入）：
+        //   private final RagProperties ragProperties;
+        //   // import com.liushuwen.rag.config.RagProperties;
+        //
+        // 插入代码（在"拼接上下文"之前）：
+        //   double minScore = ragProperties.getAgent().getMinScore();   // yml 默认 0.35
+        //   results.removeIf(h -> h.getScore() < minScore);
+        //   if (results.isEmpty()) {
+        //       ChatMessage fallback = new ChatMessage();
+        //       fallback.setSessionId(sessionId);
+        //       fallback.setRole("assistant");
+        //       fallback.setContent("知识库中没有找到足够相关的内容，请换个问法或先上传相关文档。");
+        //       chatMessageMapper.insert(fallback);
+        //       return fallback;
+        //   }
+        //
+        // 面试考点：
+        // - COSINE 分数 ∈ [-1,1]，中文语义相似度普遍偏低（0.3~0.5 常见），
+        //   阈值要拿你的测试集校准，不要拍脑袋
+        // - 过滤后为空 → 走兜底文案，而不是让 LLM 硬编
+        // ============================================================
+        double minScore = ragProperties.getAgent().getMinScore();   // yml 默认 0.35
+        results.removeIf(h -> h.getScore() < minScore);
+        if (results.isEmpty()) {
+            ChatMessage fallback = new ChatMessage();
+            fallback.setSessionId(sessionId);
+            fallback.setRole("assistant");
+            fallback.setContent("知识库中没有找到足够相关的内容，请换个问法或先上传相关文档。");
+            chatMessageMapper.insert(fallback);
+            return fallback;
+        }
 
 
 

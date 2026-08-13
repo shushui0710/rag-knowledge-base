@@ -23,6 +23,8 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 
 /**
  * 文档服务实现类 - 处理文档上传、列表、删除、向量化等业务逻辑
@@ -350,6 +352,106 @@ public class DocumentServiceImpl implements DocumentService {
         document.setEmbeddingStatus(1);
         documentMapper.updateById(document);
         log.info("向量化完成: id={}, chunkCount={}", id, chunks.size());
+
+    }
+
+    @Override
+    public void reparseDocument(Long id) {
+        log.info("增量更新文档: id={}", id);
+
+        Document document = documentMapper.selectById(id);
+        if (document == null) {
+            throw new BusinessException("文档不存在: " + id);
+        }
+
+        // ============================================================
+        // TODO 1-1（⭐ 难度）：增量更新三步
+        //
+        // 【标准答案】完整实现（可直接替换下方"骨架实现"两行）
+        //
+        // 前置①：MinioService 新增 download 方法：
+        //   import io.minio.GetObjectArgs;
+        //   public byte[] download(String objectName) {
+        //       try (InputStream in = minioClient.getObject(GetObjectArgs.builder()
+        //               .bucket(minioConfig.getBucketName()).object(objectName).build())) {
+        //           return in.readAllBytes();
+        //       } catch (Exception e) {
+        //           throw new BusinessException("文件下载失败: " + e.getMessage());
+        //       }
+        //   }
+        //
+        // 前置②：DocumentParserService 新增 parse(InputStream, String) 重载：
+        //   public String parse(InputStream in, String fileType) {
+        //       switch (fileType) {
+        //           case "pdf":  return parsePdf(in);
+        //           case "docx": return parseDocx(in);
+        //           case "txt":
+        //           case "md":   return parseText(in);
+        //           default:     throw new BusinessException("不支持的文件格式: " + fileType);
+        //       }
+        //   }
+        //   // 说明：parse(MultipartFile, String) 内部就是这三兄弟，重载直接复用私有方法
+        //
+        // 方法体（⚠️ 参照 upload() 的异常处理模式：catch(Exception) → log.error → throw BusinessException）：
+        //   try {
+        //       // 步骤1：删 MySQL 旧分块（delete(条件)，不是 deleteById(主键)！）
+        //       documentChunkMapper.delete(new LambdaQueryWrapper<DocumentChunk>()
+        //               .eq(DocumentChunk::getDocumentId, id));
+        //       // 步骤2：删 Milvus 旧向量（内部 expr = "document_id in [id]"）
+        //       milvusService.deleteByDocumentId(id);
+        //       // 步骤3：重新解析 + 分块 + 向量化
+        //       byte[] data = minioService.download(document.getMinioPath());
+        //       String text = documentParserService.parse(new ByteArrayInputStream(data),
+        //               document.getFileType());
+        //       int chunkCount = documentChunkService.chunkAndSave(id, text);
+        //       document.setChunkCount(chunkCount);
+        //       document.setEmbeddingStatus(0);
+        //       documentMapper.updateById(document);
+        //       embed(id);   // 复用已有向量化流程（embed 里会校验"文档已向量化"，状态已重置为0）
+        //       log.info("增量更新完成: id={}, chunkCount={}", id, chunkCount);
+        //   } catch (BusinessException e) {
+        //       throw e;   // 业务异常（如文档不存在、embed 校验失败）原样上抛
+        //   } catch (Exception e) {
+        //       log.error("增量更新失败: id={}, error={}", id, e.getMessage(), e);
+        //       throw new BusinessException("文档增量更新失败: " + e.getMessage());
+        //   }
+        //
+        // 面试考点：
+        // - 增量更新 vs 全量重建：文档多时全量重建代价高，增量只动该文档
+        // - 顺序：先删旧（MySQL+Milvus）再建新，避免检索到旧内容
+        // - 异常处理：BusinessException 原样上抛（GlobalExceptionHandler 转 Result），
+        //   其他异常统一包装成 BusinessException（与 upload() 完全一致）
+        // - MyBatis-Plus 删除三兄弟：deleteById(主键) / delete(条件) / deleteByMap(字段)
+        // ============================================================
+
+        // 骨架实现：仅重置状态（不删数据、不重建），保证可运行且不破坏现有数据。
+        // 完整实现时把上面【标准答案】填进来，替换下面两行。
+        try {
+            // 步骤1：删 MySQL 旧分块（delete(条件)，不是 deleteById(主键)！）
+            documentChunkMapper.delete(new LambdaQueryWrapper<DocumentChunk>()
+                    .eq(DocumentChunk::getDocumentId, id));
+            // 步骤2：删 Milvus 旧向量（内部 expr = "document_id in [id]"）
+            milvusService.deleteByDocumentId(id);
+            // 步骤3：重新解析 + 分块 + 向量化
+            // ⚠️ parse(InputStream, String) 重载声明 throws IOException（受检异常），
+            //    必须在本方法捕获或声明——这里由 catch (Exception) 统一处理
+            byte[] data = minioService.download(document.getMinioPath());
+            String text = documentParserService.parse(new ByteArrayInputStream(data),
+                    document.getFileType());
+            int chunkCount = documentChunkService.chunkAndSave(id, text);
+            document.setChunkCount(chunkCount);
+            document.setEmbeddingStatus(0);
+            documentMapper.updateById(document);
+            embed(id);   // 复用已有向量化流程（embed 里会校验"文档已向量化"，状态已重置为0）
+            log.info("增量更新完成: id={}, chunkCount={}", id, chunkCount);
+        } catch (BusinessException e) {
+            // 业务异常（如文档不存在、embed 校验失败）原样上抛，GlobalExceptionHandler 统一转 Result
+            throw e;
+        } catch (Exception e) {
+            // 其余异常（含 IOException）统一包装成业务异常，与 upload() 的异常处理模式一致
+            log.error("增量更新失败: id={}, error={}", id, e.getMessage(), e);
+            throw new BusinessException("文档增量更新失败: " + e.getMessage());
+        }
 
     }
 }

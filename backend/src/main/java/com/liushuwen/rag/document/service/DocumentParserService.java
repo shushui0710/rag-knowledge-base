@@ -148,4 +148,24 @@ public class DocumentParserService {
         log.info("文本解析完成: textLength={}", text.length());
         return text.trim();
     }
+            // 前置②：DocumentParserService 新增 parse(InputStream, String) 重载：
+        //   public String parse(InputStream in, String fileType) {
+        //       switch (fileType) {
+        //           case "pdf":  return parsePdf(in);
+        //           case "docx": return parseDocx(in);
+        //           case "txt":
+        //           case "md":   return parseText(in);
+        //           default:     throw new BusinessException("不支持的文件格式: " + fileType);
+        //       }
+        //   }
+    
+    public String parse(InputStream in, String fileType)throws IOException {
+        switch (fileType) {
+            case "pdf":  return parsePdf(in);
+            case "docx": return parseDocx(in);
+            case "txt":
+            case "md":   return parseText(in);
+            default:     throw new BusinessException("不支持的文件格式: " + fileType);
+        }
+    }
 }
