@@ -275,10 +275,12 @@ public class MilvusService {
             // 提示：查询向量要用 List.of(new float[][]{queryVector}) 或
             //       .withVectors(List.of(queryVector))
 
+            // ⚠️ Milvus 2.5 SDK 要求 FloatVector 查询向量为 List<Float>，传 float[] 会报
+            //    "Search target vector type is illegal"（2.4 时代可传 float[]，升级后必须转）
             SearchParam searchParam = SearchParam.newBuilder()
                     .withCollectionName(collectionName)
                     .withVectorFieldName("embedding")
-                    .withVectors(List.of(queryVector))
+                    .withVectors(List.of(toVectorList(queryVector)))
                     .withTopK(topK)
                     .withOutFields(List.of("id", "content", "document_id"))
                     .withMetricType(MetricType.COSINE)
@@ -316,6 +318,19 @@ public class MilvusService {
         private Long chunkId;
         private float score;
         private String content;
+    }
+
+    /**
+     * float[] → List&lt;Float&gt;
+     * ⚠️ Milvus 2.5 SDK 要求 FloatVector 查询向量必须是 List&lt;Float&gt;，
+     *    传 float[] 会报 "Search target vector type is illegal"（2.4 时代可传 float[]）
+     */
+    private List<Float> toVectorList(float[] vector) {
+        List<Float> list = new ArrayList<>(vector.length);
+        for (float v : vector) {
+            list.add(v);
+        }
+        return list;
     }
 
     // ============================================================
@@ -404,7 +419,7 @@ public class MilvusService {
             SearchParam param = SearchParam.newBuilder()
                     .withCollectionName(MEMORY_COLLECTION)
                     .withVectorFieldName("embedding")
-                    .withVectors(List.of(vector))
+                    .withVectors(List.of(toVectorList(vector)))   // 2.5 SDK 要求 List<Float>
                     .withTopK(topK)
                     .withOutFields(List.of("id", "content"))
                     .withMetricType(MetricType.COSINE)

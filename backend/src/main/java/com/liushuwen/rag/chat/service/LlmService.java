@@ -178,6 +178,10 @@ public class LlmService {
         /** DeepSeek 返回的 JSON 字段名是 tool_calls，必须显式映射（否则 Jackson 匹配不到，一直为 null） */
         @com.fasterxml.jackson.annotation.JsonProperty("tool_calls")
         private List<ToolCall> toolCalls;
+        /** ⚠️ deepseek-v4-flash 思考模式的思考内容：回填 assistant 消息时必须原样带上，
+         *    否则报 "The `reasoning_content` in the thinking mode must be passed back to the API" */
+        @com.fasterxml.jackson.annotation.JsonProperty("reasoning_content")
+        private String reasoningContent;
     }
 
     // ============================================================
@@ -193,6 +197,8 @@ public class LlmService {
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class ToolCall {
         private String id;
+        /** DeepSeek 返回的 tool_calls 带 index，回填时需保留（原样序列化依赖此字段） */
+        private Integer index;
         private Function function;
 
         @Data
@@ -252,12 +258,15 @@ public class LlmService {
             // 4. 解析（⚠️ choices 是数组，先 get(0) 再取 message）
             Message msg = resp.getChoices().get(0).getMessage();
             if (msg.getToolCalls() != null && !msg.getToolCalls().isEmpty()) {
-                // 把模型返回的 assistant 消息【原样】保存（含 tool_calls），
-                // ReAct 循环后续要原样回填，漏了必报 400
-                Map<String, Object> raw = new LinkedHashMap<>();
-                raw.put("role", "assistant");
-                raw.put("content", msg.getContent() == null ? "" : msg.getContent());
-                raw.put("tool_calls", msg.getToolCalls());
+                // 把模型返回的 assistant 消息【完整原样】保存（含 role/content/reasoning_content/tool_calls），
+                // ReAct 循环后续要原样回填：⚠️ 思考型模型缺 reasoning_content 必报错；
+                // tool_calls 缺 index/type 也会报 "missing field type"（2026-08 验收实测）
+                // ⚠️ 必须从原始 JSON 取（JsonNode→Map 保持 JSON 字段名 reasoning_content/tool_calls；
+                //    convertValue(POJO→Map) 会退化成 Java 字段名 reasoningContent/toolCalls，API 不认）
+                com.fasterxml.jackson.databind.JsonNode rawNode = objectMapper.readTree(response.getBody())
+                        .path("choices").get(0).path("message");
+                Map<String, Object> raw = objectMapper.convertValue(rawNode, Map.class);
+                raw.put("type", "message");   // ⚠️ deepseek-v4-flash 要求每条消息带 type 字段
                 return LlmResponse.toolCalls(msg.getToolCalls(), raw);
             }
             return LlmResponse.answer(msg.getContent() == null ? "" : msg.getContent());

@@ -52,7 +52,12 @@ public class AgentExecutor {
             // 阶段3 ✅ 已实现：ReAct 循环（思考→行动→观察→再思考）
             // ============================================================
             List<Map<String, Object>> messages = new ArrayList<>();
-            messages.add(Map.of("role", "user", "content", userQuestion));
+            // ⚠️ deepseek-v4-flash 要求每条消息带 type 字段（message/tool），2026-08 验收实测
+            Map<String, Object> userMsg = new java.util.LinkedHashMap<>();
+            userMsg.put("type", "message");
+            userMsg.put("role", "user");
+            userMsg.put("content", userQuestion);
+            messages.add(userMsg);
             int iterations = 0;
             int toolCount = 0;
 
@@ -88,10 +93,12 @@ public class AgentExecutor {
                     }
                     metrics.recordToolCall(call.getFunction().getName());
                     toolCount++;
-                    messages.add(Map.of(
-                            "role", "tool",
-                            "tool_call_id", call.getId(),
-                            "content", result));
+                    Map<String, Object> toolMsg = new java.util.LinkedHashMap<>();
+                    toolMsg.put("type", "tool");              // ⚠️ 必须带 type（deepseek-v4-flash）
+                    toolMsg.put("role", "tool");
+                    toolMsg.put("tool_call_id", call.getId());
+                    toolMsg.put("content", result);
+                    messages.add(toolMsg);
                 }
             }
             // 超过 maxIterations 仍没出答案 → 降级提示

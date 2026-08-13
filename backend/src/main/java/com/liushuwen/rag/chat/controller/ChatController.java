@@ -33,8 +33,19 @@ public class ChatController {
 
     @Operation(summary = "发送问题并获取回答")
     @PostMapping("/ask/{sessionId}")
-    public Result<ChatMessage> ask(@PathVariable Long sessionId, @RequestBody String question) {
-        return Result.success(chatService.ask(sessionId, question));
+    public Result<ChatMessage> ask(@PathVariable Long sessionId, @RequestBody AskRequest req) {
+        // 验收修复：空问题直接 400（之前用 @RequestBody String 接整个 JSON 无法校验，
+        //   且 /api/auth/me 类接口也存在同类问题；DTO 化后可按字段校验）
+        if (req == null || req.getQuestion() == null || req.getQuestion().isBlank()) {
+            return Result.error(400, "问题不能为空");
+        }
+        return Result.success(chatService.ask(sessionId, req.getQuestion()));
+    }
+
+    /** 提问请求体（DTO 化，2026-08 验收修复：String 裸 JSON 无法做字段校验） */
+    @lombok.Data
+    public static class AskRequest {
+        private String question;
     }
 
     @Operation(summary = "获取会话历史消息")

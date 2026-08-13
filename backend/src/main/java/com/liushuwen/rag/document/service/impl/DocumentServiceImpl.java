@@ -270,6 +270,11 @@ public class DocumentServiceImpl implements DocumentService {
     public void delete(Long id) {
         // TODO: 还应该删除MinIO文件和Milvus向量（后续完善）
         // 目前只做逻辑删除（deleted从0改为1）
+        // ⚠️ 验收修复：先校验文档存在（与 reparseDocument 一致），删除不存在文档应报错而非静默成功
+        Document document = documentMapper.selectById(id);
+        if (document == null) {
+            throw new BusinessException("文档不存在: " + id);
+        }
         log.info("删除文档: {}", id);
         documentMapper.deleteById(id);
     }

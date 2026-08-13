@@ -37,7 +37,10 @@ public class WebMvcConfig implements WebMvcConfigurer {
         registry.addInterceptor(jwtInterceptor)
                 .addPathPatterns("/api/**")           // 拦截所有 /api 开头的请求
                 .excludePathPatterns(                  // 排除不需要认证的路径
-                        "/api/auth/**",                // 登录、注册
+                        // ⚠️ 验收修复：原来排除 "/api/auth/**" 把 /api/auth/me 也放行了，
+                        //   导致 me 拿不到 UserContext 恒报"用户未登录"。改为精确排除 login/register
+                        "/api/auth/login",             // 登录（免认证）
+                        "/api/auth/register",          // 注册（免认证）
                         "/doc.html",                   // Knife4j 文档页面
                         "/webjars/**",                 // Knife4j 静态资源
                         "/v3/api-docs/**",             // OpenAPI 文档

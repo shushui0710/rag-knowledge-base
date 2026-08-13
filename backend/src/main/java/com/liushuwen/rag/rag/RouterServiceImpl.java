@@ -23,8 +23,9 @@ public class RouterServiceImpl implements RouterService {
         try {
             String out = llmService.chatWithSystem(
                     "你是意图分类器。判断用户问题需要的能力："
-                            + "DOCUMENT=检索知识库文档内容；STATS=查询数据统计（数量、分类、状态）；"
-                            + "HYBRID=两者都要。只输出一个词，不要解释。",
+                            + "DOCUMENT=检索知识库文档内容（问题问的是文档里的知识点）；"
+                            + "STATS=查询文档统计/列表/数量/分类（如'有多少文档''列出文档''有哪些文档''文档统计'）；"
+                            + "HYBRID=两者都要（既问数量又问内容）。只输出一个词，不要解释。",
                     question, 0.1);
             if (out.contains("STATS") && out.contains("DOCUMENT")) {
                 return Route.HYBRID;

@@ -181,10 +181,16 @@ rag-milvus-minio     Up (healthy)        0.0.0.0:9001->9001/tcp
 
 ### 第 3 步：启动后端
 
-```bash
-cd backend
-mvn.cmd spring-boot:run -Dspring-boot.run.arguments="--server.port=18080"
-```
+> ⚠️ 先加载 `.env` 环境变量（Spring 不会自动读取 .env 文件，这是实测踩坑）：
+> Git Bash：
+> ```bash
+> set -a && source .env && set +a
+> cd backend
+> mvn.cmd spring-boot:run -Dspring-boot.run.arguments="--server.port=18080"
+> ```
+> IDE（IntelliJ）：Run Configuration → Environment variables 填入 `ZHIPU_API_KEY=...;DEEPSEEK_API_KEY=...;JWT_SECRET=...`
+>
+> 不加载的话 `embedding.zhipu.api-key` 会用默认占位值，向量化报 401。
 
 启动成功后控制台显示 `Started RagKnowledgeBaseApplication`。
 
@@ -330,16 +336,14 @@ rag-knowledge-base/
 │
 ├── docs/
 │   ├── README.md                          文档导航（按场景选文档）
-│   ├── 学习笔记.md                       13章+11个面试亮点
-│   ├── 面试复习提纲.md                    面试速查卡
-│   ├── 技术亮点与架构设计.md              架构图+选型理由+11亮点（面试规范版）
+│   ├── 项目技术架构说明.md                架构图+三条链路+技术决策+性能实测
+│   ├── 核心功能模块说明.md                6大模块职责+关键实现+实测边界
+│   ├── 项目亮点与难点总结.md              9大亮点+8个真实踩坑攻克（面试讲坑素材）
 │   ├── AgenticRAG面试速记卡.md            面试前30分钟速记（链路图+10话术+手撕清单）
-│   ├── 测试报告与验收结论.md              验收结论+降级矩阵+边界防御
-│   ├── AgenticRAG演进辅导方案.md          第8周：5阶段演进方案（含【思路提示】+【标准答案】+📁目录）
-│   ├── AgenticRAG骨架落地说明.md          骨架文件清单/TODO分布/里程碑验证
-│   ├── AgenticRAG辅导方案逐项审查报告.md   全部TODO事实核查（已验证/待确认分级）
-│   ├── 第3-6周开发任务书.md
-│   └── eval/questions.json                检索评估集（5题示例，可扩展20题）
+│   ├── 测试报告与验收结论.md              实测数据（274 req/s）+8个问题修复记录
+│   ├── 学习笔记.md                       13章完整记录
+│   ├── 面试复习提纲.md                    面试速查卡
+│   └── eval/questions.json                检索评估集（配合 EvalRunnerTest）
 │
 ├── docker-compose.yml                    Docker编排
 ├── .env.example                          环境变量模板
