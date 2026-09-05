@@ -18,5 +18,65 @@
   {
     "question": "JWT 认证流程是怎么实现的？",
     "expectedKeyword": "JWT"
+  },
+  {
+    "question": "密码为什么用 BCrypt 加密而不是 MD5？",
+    "expectedKeyword": "BCrypt"
+  },
+  {
+    "question": "ThreadLocal 是什么？为什么用完要 remove？",
+    "expectedKeyword": "ThreadLocal"
+  },
+  {
+    "question": "文档分块的滑动窗口算法是怎么工作的？",
+    "expectedKeyword": "滑动窗口"
+  },
+  {
+    "question": "分块时为什么要设置 64 字符的重叠？",
+    "expectedKeyword": "重叠"
+  },
+  {
+    "question": "Embedding 向量化是什么？为什么 RAG 需要它？",
+    "expectedKeyword": "Embedding"
+  },
+  {
+    "question": "Milvus 的 IVF_FLAT 索引是什么原理？",
+    "expectedKeyword": "IVF_FLAT"
+  },
+  {
+    "question": "向量检索用什么相似度度量？余弦相似度和欧氏距离有什么区别？",
+    "expectedKeyword": "余弦相似度"
+  },
+  {
+    "question": "Milvus 检索时 COSINE 度量和 nprobe 参数怎么配合？",
+    "expectedKeyword": "COSINE"
+  },
+  {
+    "question": "为什么选模块化单体而不是微服务？",
+    "expectedKeyword": "模块化单体"
+  },
+  {
+    "question": "模块之间怎么跨模块调用？",
+    "expectedKeyword": "跨模块"
+  },
+  {
+    "question": "BM25 混合检索是怎么实现的？",
+    "expectedKeyword": "BM25"
+  },
+  {
+    "question": "Rerank 精排的作用是什么？为什么先召回再精排？",
+    "expectedKeyword": "Rerank"
+  },
+  {
+    "question": "Function Calling 是什么？和让模型输出 JSON 有什么区别？",
+    "expectedKeyword": "Function Calling"
+  },
+  {
+    "question": "ReAct 循环是怎么执行的？怎么防止死循环？",
+    "expectedKeyword": "ReAct"
+  },
+  {
+    "question": "LLM 熔断器怎么设计？熔断和限流有什么区别？",
+    "expectedKeyword": "熔断"
   }
 ]

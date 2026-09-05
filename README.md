@@ -82,7 +82,7 @@
 |----|------|------|------|
 | 后端框架 | Spring Boot | 3.2.5 | Java 17，模块化单体架构 |
 | ORM | MyBatis-Plus | 3.5.5 | 零代码 CRUD + 逻辑删除 + 自动填充 |
-| 认证 | JJWT + spring-security-crypto | 0.12.6 / 6.3.0 | JWT 签发解析 + BCrypt 密码加密 |
+| 认证 | JJWT + spring-security-crypto | 0.12.5 / 6.3.0 | JWT 签发解析 + BCrypt 密码加密 |
 | 数据库 | MySQL | 8.0 | Docker 容器，端口 3307→3306 |
 | 前端框架 | Vue3 + Element Plus | 3.4 / 2.7 | Vite 构建，Composition API |
 | 前端状态 | Pinia | 2.1 | 替代 Vuex，更轻量 |
@@ -389,7 +389,7 @@ MySQL 启动时自动执行 `docker/mysql/init/init.sql`：
 >
 > 认证接口需在请求头添加 `Authorization: Bearer <token>`，Knife4j 中可在「Authorize」按钮统一配置。
 >
-> ⚠️ Agent 接口当前为骨架直通模式（TODO 3-2/3-3 完成后才真正调用工具），详见 `docs/AgenticRAG骨架落地说明.md`。
+> Agent 接口已实现 Function Calling + ReAct 循环（AgentExecutor，≤5 轮），配套意图路由与多 Agent 编排，详见 `agent` 模块代码。
 
 ## 开发进度
 
