@@ -1,25 +1,26 @@
 # RAG 智能知识库问答系统
 
-企业级智能知识库问答平台 —— 基于 RAG（检索增强生成）技术，支持文档上传解析、文本分块、向量化入库、语义检索与大模型问答，附带 JWT 认证与多用户数据隔离。
+基于 RAG（检索增强生成）的企业级智能知识库问答平台：文档上传解析、分块向量化入库、混合检索与大模型问答，附带 JWT 认证与多用户数据隔离，并已演进为 **Agentic RAG** —— 通过 Function Calling + ReAct 循环、意图路由与多 Agent 编排，让助手能自主决定"检索文档 / 查询统计 / 生成报告"。
 
-已从"普通 RAG"演进为 **Agentic RAG**：通过 Function Calling 工具调用、ReAct 循环与意图路由，让助手能自主决定"查文档 / 查数据库 / 生成报告"；检索侧升级 **Milvus 2.5 内置 BM25 Function** 实现稠密 + 稀疏双路混合检索。
+核心亮点：
 
-## 功能特性
+- **混合检索**：Milvus 2.5 内置 BM25 Function，稠密 + 稀疏双路召回，加权融合（alpha=0.7）后经智谱 Rerank 精排（召回 20 → 精排 5），并按最低相似度 0.35 过滤
+- **Agentic 能力**：ReAct 循环（≤5 轮）+ 工具调用 + 意图路由（DOCUMENT / STATS / HYBRID）+ 多 Agent 编排与反思重写
+- **生产化设计**：长期记忆（qa_memory）、三层降级 + LLM 熔断器（5 次/60s）、指标观测、评估集回归测试
+
+## 核心功能
 
 | 模块 | 功能 |
 |------|------|
-| 用户认证 | 注册 / 登录（JWT + BCrypt 加密），登录态管理，路由守卫 |
-| 文档管理 | 上传（PDF/Word/MD/TXT）、解析分块、向量化入库、分类筛选、删除、增量重传（TODO） |
-| 智能问答 | 多会话管理、流式问答、来源引用、Markdown 渲染、历史记录 |
-| **Agent 智能问答** | `POST /api/agent/ask`：Function Calling + ReAct 循环，多工具自主调度（工具调用/检索/路由，骨架已就绪） |
-| **多 Agent 编排** | `POST /api/agent/orchestrate`：主管 Agent 路由分派 + HYBRID 组合回答 + 反思重写（✅ 已实现） |
-| **长期记忆 / 反思** | qa_memory 独立 collection 存问答对 + LLM 评审重写（✅ 已实现） |
-| **检索评估** | `docs/eval/questions.json` + EvalRunnerTest 命中率评测（✅ 已实现） |
-| **混合检索** | Milvus 2.5 BM25 Function（路线A）：稠密 + 稀疏双路召回 + 加权融合（✅ 已实现） |
-| **Rerank / 查询改写** | 智谱 rerank 精排（召回20→精排5）+ LLM 查询改写（✅ 已实现） |
-| **指标观测** | `GET /api/metrics/today`：问答次数、平均耗时、LLM/工具调用次数 |
-| 数据隔离 | 文档与会话按用户隔离，用户只能看到自己的数据 |
-| 接口文档 | Knife4j 在线 API 文档，支持在线调试 |
+| 用户认证 | 注册 / 登录（JWT + BCrypt），`JwtInterceptor` + ThreadLocal 登录态，路由守卫 |
+| 文档管理 | 上传（PDF/Word/MD/TXT，支持分类）、解析分块、向量化入库、删除（级联清理向量）、重建混合索引 |
+| 智能问答 | 多会话管理、来源引用、Markdown 渲染、历史记录、会话标题修改 |
+| Agentic 问答 | 单 Agent（ReAct + 工具调用）、多 Agent 编排（主管分派 + 反思重写） |
+| 长期记忆 | qa_memory 独立 collection 存问答对，问答时自动召回相关历史 |
+| 检索评估 | `docs/eval/questions.json`（20 题）+ EvalRunnerTest 命中率评测 |
+| 指标观测 | 今日问答量、平均耗时、LLM / 工具调用次数 |
+| 数据隔离 | 文档、会话、记忆均按用户隔离；检索支持 documentIds 过滤 |
+| 接口文档 | Knife4j 在线 API 文档（http://localhost:18080/doc.html） |
 
 ## 系统架构
 
@@ -33,48 +34,42 @@
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                    Spring Boot 后端 :18080 (模块化单体)                    │
 │                                                                          │
-│  ┌─────────┐  ┌──────────────┐  ┌────────────┐  ┌──────────────────┐  │
-│  │  auth   │  │  document    │  │   chat     │  │     config       │  │
-│  │ 认证模块 │  │  文档模块    │  │  问答模块  │  │  JWT/跨域/拦截器  │  │
-│  └─────────┘  └──────┬───────┘  └─────┬──────┘  └──────────────────┘  │
-│                      │                │                                 │
-│     JwtInterceptor ──┴── UserContext ──┘  (ThreadLocal 持有当前用户)     │
-└──────────────────────┬──────────────────────┬───────────────────────────┘
+│  ┌─────────┐ ┌──────────┐ ┌──────────┐ ┌─────────┐ ┌─────────────────┐  │
+│  │  auth   │ │ document │ │   chat   │ │  agent  │ │       rag       │  │
+│  │ 认证模块 │ │ 文档模块 │ │ 问答模块 │ │ Agent   │ │ 检索增强/路由/   │  │
+│  │         │ │          │ │          │ │ 编排+工具│ │ 改写/重排/记忆  │  │
+│  └─────────┘ └────┬─────┘ └────┬─────┘ └────┬────┘ └────────┬────────┘  │
+│                   │            │            │               │            │
+│  JwtInterceptor ──┴──── UserContext (ThreadLocal 持有当前用户) ──┘        │
+└──────────────────────┬──────────────────────┬────────────────────────────┘
                        │                      │
            ┌───────────┼───────────┐          │
            ▼           ▼           ▼          ▼
-      ┌────────┐ ┌────────┐ ┌─────────┐ ┌───────────┐
+      ┌────────┐ ┌────────┐ ┌─────────┐ ┌────────────┐
       │ MinIO  │ │ MySQL  │ │ Milvus  │ │DeepSeek API│
-      │ 文件存储 │ │元数据+ │ │向量检索  │ │ + 智谱API  │
-      │ :9000   │ │分块+会话│ │ :19530  │ │ (Embedding)│
-      └────────┘ └────────┘ └─────────┘ └───────────┘
+      │ 文件存储│ │元数据+ │ │向量检索  │ │ + 智谱API   │
+      │ :9000  │ │分块+会话│ │ :19530  │ │(Embedding/ │
+      └────────┘ └────────┘ └─────────┘ │ Rerank)    │
+                                        └────────────┘
 ```
 
-### 离线流程（文档入库）
+### 三条核心链路
 
-文档上传 → MinIO 存储文件 → PDFBox/POI 解析 → 滑动窗口分块 → 智谱 Embedding 向量化 → Milvus 存储
+**离线入库**：文档上传 → MinIO 存储 → PDFBox/POI 解析 → 滑动窗口分块（512/64）→ 智谱 Embedding 向量化 → Milvus 存储
 
-### 在线流程（智能问答）
+**在线问答**（`ChatServiceImpl.ask`）：长期记忆召回 → LLM 查询改写 → 混合检索（稠密 + BM25 稀疏，召回 20）→ Rerank 精排（Top 5）→ 相似度阈值过滤（≥0.35）→ Prompt 拼接 → DeepSeek 生成 → 答案 + 来源引用 → 问答对写入长期记忆
 
-用户提问 → 智谱 Embedding 向量化 → Milvus 语义检索 Top-K → Prompt 拼接 → DeepSeek 大模型生成 → 答案 + 来源引用
-
-### Agentic 问答流程（阶段 3，骨架已就绪）
+**Agentic 问答**（`AgentController`）：
 
 ```
-用户提问 → [意图路由 Router] → 判断走哪条链路
+用户提问 → [意图路由 Router]
    ├─ DOCUMENT → RAG 检索问答（原链路）
    ├─ STATS    → Agent 调数据工具（query_document_stats / query_document_list）
-   └─ HYBRID   → AgentExecutor 完整 ReAct 循环：
-                  思考 → 调工具 → 观察结果 → 再思考 → 最终回答（最多 5 轮）
+   └─ HYBRID   → AgentExecutor 完整 ReAct 循环（≤5 轮）：
+                 思考 → 调工具 → 观察结果 → 再思考 → 最终回答
 ```
 
-### 混合检索流程（TODO 2-1，路线 A）
-
-```
-查询改写 → 双路召回 → 分数融合 → Rerank（TODO 2-2）→ Top5 → Prompt
-          ├─ 稠密路：embedding 向量（Milvus FloatVector）
-          └─ 稀疏路：BM25 Function 自动生成稀疏向量（Milvus 2.5+，SparseFloatVector）
-```
+> **降级策略**：collection 未重建（无 BM25 字段）时混合检索自动降级为纯稠密；Rerank API 失败时降级按原分数排序；LLM 连续失败 5 次触发熔断 60 秒。
 
 ## 技术栈
 
@@ -84,20 +79,23 @@
 | ORM | MyBatis-Plus | 3.5.5 | 零代码 CRUD + 逻辑删除 + 自动填充 |
 | 认证 | JJWT + spring-security-crypto | 0.12.5 / 6.3.0 | JWT 签发解析 + BCrypt 密码加密 |
 | 数据库 | MySQL | 8.0 | Docker 容器，端口 3307→3306 |
-| 前端框架 | Vue3 + Element Plus | 3.4 / 2.7 | Vite 构建，Composition API |
-| 前端状态 | Pinia | 2.1 | 替代 Vuex，更轻量 |
-| 前端路由 | Vue Router | 4.3 | 含路由守卫 |
-| 向量库 | Milvus | 2.5.16 | Docker 容器，端口 19530；启用内置 BM25 Function（路线A） |
-| Milvus SDK | milvus-sdk-java | 2.5.14 | v1 API（MilvusServiceClient）继续使用；SDK 2.5 起不再传递 fastjson，需显式依赖 |
-| JSON | fastjson | 1.2.83 | 显式声明（原由 Milvus SDK 2.4.1 传递） |
+| 向量库 | Milvus | 2.5.16 | Docker 容器，端口 19530；内置 BM25 Function |
+| Milvus SDK | milvus-sdk-java | 2.5.14 | v1 API（MilvusServiceClient）；需显式依赖 fastjson |
+| JSON | fastjson | 1.2.83 | 显式声明（原由 SDK 2.4.1 传递） |
 | 文件存储 | MinIO | 2023.03 | Docker 容器，API 9000 / 控制台 9002 |
 | 文档解析 | Apache PDFBox + POI | 3.0.1 / 5.2.5 | PDF / Word / MD / TXT |
-| Embedding | 智谱 API (embedding-3) | — | 2048 维向量 |
-| 大模型 | DeepSeek API (deepseek-v4-flash) | — | OpenAI 兼容格式（deepseek-chat 已于 2026-07-24 弃用） |
+| Embedding | 智谱 API（embedding-3） | — | 2048 维向量 |
+| Rerank | 智谱 API | — | 精排（召回 20 → 精排 5） |
+| 大模型 | DeepSeek API（deepseek-v4-flash） | — | OpenAI 兼容格式 |
+| 前端框架 | Vue3 + Element Plus | 3.4 / 2.7 | Vite 构建，Composition API |
+| 前端状态 | Pinia | 2.1 | 替代 Vuex，更轻量 |
+| 前端路由 | Vue Router | 4.3 | 含登录路由守卫 |
 | 接口文档 | Knife4j | 4.4.0 | http://localhost:18080/doc.html |
-| 部署 | Docker Compose | — | 一键编排所有中间件 |
+| 部署 | Docker Compose | — | 一键编排 MySQL + MinIO + etcd + Milvus |
 
-## 环境要求
+## 快速开始
+
+### 环境要求
 
 | 软件 | 最低版本 | 验证命令 |
 |------|----------|----------|
@@ -105,68 +103,37 @@
 | Maven | 3.8+ | `mvn.cmd -version`（Git Bash 中用 `mvn.cmd`） |
 | Node.js | 18+ | `node -v` |
 | Docker Desktop | 最新版 | `docker --version` |
-| Git | 任意 | `git --version` |
 
 > **Windows 用户**：Git Bash 中 Maven 命令需用 `mvn.cmd` 而非 `mvn`，否则路径格式不兼容。
 
-## 快速启动
-
-### 第 0 步：克隆项目
+### 第 1 步：配置环境变量
 
 ```bash
 git clone <仓库地址>
 cd rag-knowledge-base
-```
-
-### 第 1 步：配置环境变量
-
-复制 `.env.example` 为 `.env`，填入 API 密钥：
-
-```bash
 cp .env.example .env
 ```
 
+编辑 `.env`，填入以下关键项（完整字段见 `.env.example`）：
+
 ```env
-# 数据库
 MYSQL_ROOT_PASSWORD=rag123456
 MYSQL_DATABASE=rag_kb
-
-# MinIO
 MINIO_ROOT_USER=minioadmin
 MINIO_ROOT_PASSWORD=minioadmin
-
-# Milvus 内部 MinIO（默认即可）
-MILVUS_MINIO_ACCESS_KEY=minioadmin
-MILVUS_MINIO_SECRET_KEY=minioadmin
-
-# 大模型 API（必填）
-DEEPSEEK_API_KEY=your-deepseek-api-key
-ZHIPU_API_KEY=your-zhipu-api-key
-
-# JWT（开发环境可用默认值，生产环境务必修改）
-JWT_SECRET=your-random-secret
+DEEPSEEK_API_KEY=your-deepseek-api-key     # https://platform.deepseek.com
+ZHIPU_API_KEY=your-zhipu-api-key           # https://open.bigmodel.cn
+JWT_SECRET=your-random-secret              # 生产环境务必修改
 ```
-
-> API 密钥获取：[DeepSeek](https://platform.deepseek.com) / [智谱](https://open.bigmodel.cn)
 
 ### 第 2 步：启动基础设施
 
 ```bash
-# 启动全部中间件（MySQL + MinIO + Milvus 2.5.16 + etcd）
 docker-compose up -d
-
-# 确认容器状态
 docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 ```
 
-> ⚠️ **从 Milvus 2.4 升级**：docker-compose.yml 已更新为 `milvusdb/milvus:v2.5.16`，需重新拉取镜像：
-> ```bash
-> docker-compose down
-> docker-compose up -d   # 会拉取 v2.5.16 新镜像
-> ```
-> 旧 collection 数据可继续使用（v1 gRPC 协议向后兼容）；但要启用 BM25 Function 混合检索（TODO 2-1），需**重建 collection**（新增 `bm25_vector` 稀疏字段 + BM25 Function）。
-
-预期输出 5 个容器均为 healthy：
+预期 5 个容器均为 healthy：
 
 ```
 NAMES                STATUS              PORTS
@@ -181,20 +148,18 @@ rag-milvus-minio     Up (healthy)        0.0.0.0:9001->9001/tcp
 
 ### 第 3 步：启动后端
 
-> ⚠️ 先加载 `.env` 环境变量（Spring 不会自动读取 .env 文件，这是实测踩坑）：
-> Git Bash：
-> ```bash
-> set -a && source .env && set +a
-> cd backend
-> mvn.cmd spring-boot:run -Dspring-boot.run.arguments="--server.port=18080"
-> ```
-> IDE（IntelliJ）：Run Configuration → Environment variables 填入 `ZHIPU_API_KEY=...;DEEPSEEK_API_KEY=...;JWT_SECRET=...`
->
-> 不加载的话 `embedding.zhipu.api-key` 会用默认占位值，向量化报 401。
+> ⚠️ Spring 不会自动读取 `.env` 文件，需先加载环境变量（实测踩坑）：
 
-启动成功后控制台显示 `Started RagKnowledgeBaseApplication`。
+```bash
+# Git Bash
+set -a && source .env && set +a
+cd backend
+mvn.cmd spring-boot:run -Dspring-boot.run.arguments="--server.port=18080"
+```
 
-接口文档：浏览器打开 http://localhost:18080/doc.html
+IDE（IntelliJ）方式：Run Configuration → Environment variables 填入 `ZHIPU_API_KEY=...;DEEPSEEK_API_KEY=...;JWT_SECRET=...`。不加载的话 `embedding.zhipu.api-key` 会用默认占位值，向量化报 401。
+
+启动成功后控制台显示 `Started RagKnowledgeBaseApplication`，接口文档：http://localhost:18080/doc.html
 
 ### 第 4 步：启动前端
 
@@ -204,222 +169,233 @@ npm install
 npm run dev
 ```
 
-浏览器打开 http://localhost:5173，首次访问会跳转到登录页，点击「注册」创建账号即可开始使用。
+浏览器打开 http://localhost:5173 （Vite 已将 `/api` 代理到 `localhost:18080`），注册账号后即可使用。
 
-## 端口一览
+## 使用指南
 
-| 服务 | 端口 | 说明 |
-|------|------|------|
-| Spring Boot 后端 | 18080 | REST API + Knife4j 文档 |
-| Vue3 前端 | 5173 | Vite 开发服务器 |
-| MySQL | 3307 | 映射到容器内 3306 |
-| MinIO API | 9000 | S3 兼容接口 |
-| MinIO 控制台 | 9002 | Web 管理界面 |
-| Milvus | 19530 | 向量数据库 |
-| Milvus 健康检查 | 9091 | /healthz |
-| Knife4j 文档 | 18080/doc.html | 接口文档页面 |
+### Web 界面
+
+1. **注册登录**：首次访问跳转登录页，注册并登录；
+2. **上传文档**：文档管理页上传 PDF/Word/MD/TXT（可选分类），上传后点击"向量化"入库；
+3. **智能问答**：对话页创建会话提问，回答附带来源引用，支持 Markdown 渲染。
+
+### API 调用示例
+
+所有接口（除注册/登录）需在请求头携带 `Authorization: Bearer <token>`。
+
+```bash
+# 1. 注册并登录，获取 token
+curl -X POST http://localhost:18080/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"demo","password":"demo123"}'
+
+curl -X POST http://localhost:18080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"demo","password":"demo123"}'
+# → {"data":{"user":{...},"token":"eyJhbGci..."}}
+
+TOKEN=eyJhbGci...
+
+# 2. 上传文档（可选 category）并触发向量化
+curl -X POST http://localhost:18080/api/document/upload \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@./产品手册.pdf" -F "category=技术"
+curl -X POST http://localhost:18080/api/document/embed/1 \
+  -H "Authorization: Bearer $TOKEN"
+
+# 3. 创建会话并提问（RAG 问答）
+curl -X POST http://localhost:18080/api/chat/session -H "Authorization: Bearer $TOKEN"
+curl -X POST http://localhost:18080/api/chat/ask/1 \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"question":"产品的保修政策是什么？"}'
+
+# 4. Agentic 问答（ReAct + 工具调用 / 多 Agent 编排）
+curl -X POST http://localhost:18080/api/agent/ask \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"question":"目前知识库里有哪些分类的文档？各有多少篇？"}'
+curl -X POST http://localhost:18080/api/agent/orchestrate \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"question":"总结知识库内容并生成一份分析报告"}'
+
+# 5. 查看今日指标
+curl http://localhost:18080/api/metrics/today -H "Authorization: Bearer $TOKEN"
+```
+
+### 检索效果评估
+
+评估集位于 `docs/eval/questions.json`（20 题），通过 Spring Boot 测试运行（需后端环境在线）：
+
+```bash
+cd backend
+mvn.cmd test -Dtest=EvalRunnerTest
+```
+
+## 配置说明
+
+### 环境变量（.env）
+
+| 变量 | 说明 | 默认/示例 |
+|------|------|-----------|
+| `MYSQL_ROOT_PASSWORD` | MySQL root 密码 | `rag123456` |
+| `MYSQL_DATABASE` | 数据库名 | `rag_kb` |
+| `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` | MinIO 凭据 | `minioadmin` |
+| `DEEPSEEK_API_KEY` | DeepSeek 大模型密钥（必填） | — |
+| `ZHIPU_API_KEY` | 智谱密钥（Embedding/Rerank，必填） | — |
+| `JWT_SECRET` | JWT 签名密钥 | 开发可用默认值，生产必改 |
+
+### 检索与 Agent 调优（application.yml → `rag.*`）
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `rag.chunk-size` / `chunk-overlap` | 512 / 64 | 分块滑动窗口 |
+| `rag.retrieval.hybrid-alpha` | 0.7 | 混合检索中稠密分权重（稀疏占 1-alpha） |
+| `rag.retrieval.recall-top-k` | 20 | 混合检索召回条数（重排前） |
+| `rag.retrieval.rerank-top-n` | 5 | 重排后进入 Prompt 的条数 |
+| `rag.agent.max-iterations` | 5 | ReAct 循环最大轮数 |
+| `rag.agent.min-score` | 0.35 | 检索结果最低相似度阈值 |
+| `rag.agent.breaker-failure-threshold` / `breaker-open-millis` | 5 / 60000 | 熔断：连续失败次数 / 熔断时长(ms) |
+| `rag.agent.critic-max-retry` | 1 | 多 Agent 反思重写最大次数 |
+| `rag.prompt-template` | （内置） | 问答 Prompt 模板，`{context}`/`{question}` 占位 |
+
+模型与中间件连接配置（`llm.*` / `embedding.*` / `milvus.*` / `minio.*`）同样在 `application.yml`，均支持环境变量覆盖。
 
 ## 项目结构
-
-模块化单体（Modular Monolith）架构，按业务域分包：
 
 ```
 rag-knowledge-base/
 ├── backend/                              Spring Boot 后端
-│   ├── pom.xml                           Maven 依赖
-│   └── src/main/
-│       ├── java/com/liushuwen/rag/
+│   ├── pom.xml
+│   └── src/
+│       ├── main/java/com/liushuwen/rag/
 │       │   ├── RagKnowledgeBaseApplication.java   启动入口
-│       │   │
 │       │   ├── auth/                     🔐 认证模块
-│       │   │   ├── controller/AuthController.java    注册/登录/获取当前用户
-│       │   │   ├── entity/User.java                  用户实体
+│       │   │   ├── controller/AuthController.java
+│       │   │   ├── entity/User.java
 │       │   │   ├── mapper/UserMapper.java
-│       │   │   └── service/UserService.java
-│       │   │       └── impl/UserServiceImpl.java     BCrypt加密+JWT
-│       │   │
-│       │   ├── document/                 📄 文档管理模块
+│       │   │   └── service/UserService.java + impl/UserServiceImpl.java
+│       │   ├── document/                 📄 文档模块
 │       │   │   ├── controller/DocumentController.java
-│       │   │   ├── entity/Document.java              +category字段
-│       │   │   ├── entity/DocumentChunk.java
-│       │   │   ├── mapper/DocumentMapper.java
-│       │   │   ├── mapper/DocumentChunkMapper.java
+│       │   │   ├── entity/Document.java + DocumentChunk.java
+│       │   │   ├── mapper/DocumentMapper.java + DocumentChunkMapper.java
 │       │   │   └── service/
-│       │   │       ├── DocumentService.java
-│       │   │       ├── MinioService.java             MinIO文件操作
-│       │   │       ├── DocumentParserService.java    PDF/Word/MD/TXT解析
-│       │   │       ├── DocumentChunkService.java      滑动窗口分块
-│       │   │       ├── EmbeddingService.java          智谱API向量化
-│       │   │       ├── MilvusService.java             向量库CRUD+检索
-│       │   │       └── impl/DocumentServiceImpl.java  编排全流程
-│       │   │
-│       │   ├── chat/                    💬 智能问答模块
+│       │   │       ├── DocumentService.java + impl/DocumentServiceImpl.java   编排全流程
+│       │   │       ├── MinioService.java            MinIO 文件操作
+│       │   │       ├── DocumentParserService.java   PDF/Word/MD/TXT 解析
+│       │   │       ├── DocumentChunkService.java    滑动窗口分块
+│       │   │       ├── EmbeddingService.java        智谱向量化
+│       │   │       └── MilvusService.java           向量库 CRUD + 混合检索
+│       │   ├── chat/                     💬 问答模块
 │       │   │   ├── controller/ChatController.java
-│       │   │   ├── entity/ChatSession.java
-│       │   │   ├── entity/ChatMessage.java
-│       │   │   ├── mapper/ChatSessionMapper.java
-│       │   │   ├── mapper/ChatMessageMapper.java
-│       │   │   └── service/
-│       │   │       ├── ChatService.java
-│       │   │       ├── LlmService.java                DeepSeek API调用（chat/chatWithSystem/chatWithTools）
-│       │   │       └── impl/ChatServiceImpl.java      RAG在线流程编排
-│       │   │
-│       │   ├── agent/                   🤖 Agent 模块（第8周新增）
-│       │   │   ├── Tool.java / ToolRegistry.java      工具抽象 + 注册表
-│       │   │   ├── QueryDocumentStatsTool.java        ✅ 工具1：文档统计（已实现）
-│       │   │   ├── QueryDocumentListTool.java         ✅ 工具2：文档列表（已实现）
-│       │   │   ├── GenerateReportTool.java            ✅ 工具3：报告生成（已实现）
-│       │   │   ├── AgentExecutor.java                 ✅ ReAct 循环执行器（已实现）
-│       │   │   ├── Agent.java + Document/Stats/ReportAgent + OrchestratorAgent ✅ 多Agent 编排（含反思）
-│       │   │   ├── AgentMetrics.java                  ✅ 指标埋点（已实现）
-│       │   │   └── LlmCircuitBreaker.java             ✅ 熔断器（已实现）
-│       │   │
-│       │   ├── rag/                     🔍 检索增强（第8周新增）
-│       │   │   ├── Route.java / RouterService.java    ✅ 意图路由（已实现）
-│       │   │   ├── QueryRewriterService.java          查询改写（✅ 已实现）
-│       │   │   ├── RerankService.java                 重排序（✅ 已实现）
-│       │   │   ├── MemoryService.java                 ✅ 长期记忆（qa_memory collection）
-│       │   │   └── CriticService.java                 反思评审（TODO 4-3）
-│       │   │
-│       │   ├── controller/               🌐 控制器
-│       │   │   ├── AgentController.java               /api/agent/ask + /orchestrate
-│       │   │   └── MetricsController.java             /api/metrics/today
-│       │   │
-│       │   ├── eval/                     📊 评估（第8周新增）
-│       │   │   └── EvalRunner.java                    ✅ 评估（test 目录 EvalRunnerTest + docs/eval/questions.json）
-│       │   │
-│       │   ├── common/                  🔧 通用组件
-│       │   │   ├── Result.java                        统一响应封装
-│       │   │   ├── BusinessException.java             业务异常
-│       │   │   ├── GlobalExceptionHandler.java        全局异常处理
-│       │   │   └── UserContext.java                   ThreadLocal持有userId
-│       │   │
-│       │   └── config/                   ⚙️ 配置类
-│       │       ├── JwtUtil.java                        JWT生成/解析/验证
-│       │       ├── JwtInterceptor.java                请求拦截+身份提取
-│       │       ├── WebMvcConfig.java                  注册拦截器+排除路径
-│       │       ├── RestTemplateConfig.java            HTTP客户端@Bean
-│       │       ├── MilvusConfig.java                  Milvus客户端配置
-│       │       ├── MinioConfig.java                   MinIO客户端配置
-│       │       ├── RagProperties.java                 RAG/Agent配置组（@ConfigurationProperties）
-│       │       ├── MybatisPlusConfig.java             分页插件
-│       │       ├── MyMetaObjectHandler.java           自动填充时间
-│       │       └── CorsConfig.java                    跨域配置
-│       │
-│       └── resources/
-│           └── application.yml           后端配置
+│       │   │   ├── entity/ChatSession.java + ChatMessage.java
+│       │   │   ├── mapper/ChatSessionMapper.java + ChatMessageMapper.java
+│       │   │   └── service/ChatService.java + impl/ChatServiceImpl.java
+│       │   │       └── LlmService.java              DeepSeek 调用（chat/chatWithSystem/chatWithTools）
+│       │   ├── agent/                    🤖 Agent 模块
+│       │   │   ├── Tool.java + ToolRegistry.java    工具抽象 + 注册表
+│       │   │   ├── QueryDocumentStatsTool.java      工具：文档统计
+│       │   │   ├── QueryDocumentListTool.java       工具：文档列表
+│       │   │   ├── GenerateReportTool.java          工具：报告生成
+│       │   │   ├── AgentExecutor.java               ReAct 循环执行器（≤5 轮）
+│       │   │   ├── Agent.java + DocumentAgent / StatsAgent / ReportAgent
+│       │   │   ├── OrchestratorAgent.java           多 Agent 编排（主管分派）
+│       │   │   ├── AgentMetrics.java                指标埋点
+│       │   │   └── LlmCircuitBreaker.java           熔断器
+│       │   ├── rag/                      🔍 检索增强模块
+│       │   │   ├── Route.java + RouterService.java + Impl   意图路由
+│       │   │   ├── QueryRewriterService.java + Impl         查询改写
+│       │   │   ├── RerankService.java + Impl                重排序
+│       │   │   ├── CriticService.java + Impl + Critique     反思评审
+│       │   │   └── MemoryService.java + Impl                长期记忆（qa_memory）
+│       │   ├── controller/               🌐 顶层控制器
+│       │   │   ├── AgentController.java             /api/agent/ask + /orchestrate
+│       │   │   └── MetricsController.java           /api/metrics/today
+│       │   ├── eval/                     📊 评估（EvalRunner.java）
+│       │   ├── common/                   🔧 Result / BusinessException / GlobalExceptionHandler / UserContext
+│       │   └── config/                   ⚙️ JwtUtil / JwtInterceptor / WebMvcConfig / RestTemplateConfig
+│       │       ├── MilvusConfig / MinioConfig / RagProperties(@ConfigurationProperties)
+│       │       └── MybatisPlusConfig / MyMetaObjectHandler / CorsConfig
+│       ├── main/resources/application.yml
+│       └── test/java/com/liushuwen/rag/eval/
+│           └── EvalRunnerTest.java       评估测试（读 docs/eval/questions.json）
 │
 ├── frontend/                             Vue3 前端
-│   ├── package.json
-│   ├── vite.config.js                    API代理→localhost:18080
+│   ├── vite.config.js                    /api 代理 → localhost:18080
 │   └── src/
-│       ├── main.js
-│       ├── App.vue                       导航+用户信息+退出
-│       ├── router/index.js               路由+登录守卫
-│       ├── api/
-│       │   ├── index.js                   Axios实例+token拦截器
-│       │   ├── auth.js                    注册/登录/获取用户
-│       │   ├── document.js               上传/列表/删除/向量化
-│       │   └── chat.js                   会话/问答/历史
-│       ├── stores/
-│       │   ├── auth.js                   token+用户状态
-│       │   └── chat.js                   会话列表状态
-│       └── views/
-│           ├── LoginView.vue             登录/注册页
-│           ├── DocumentView.vue          文档管理+分类
-│           └── ChatView.vue              对话页+Markdown渲染
+│       ├── main.js / App.vue
+│       ├── router/index.js               路由 + 登录守卫
+│       ├── api/                          index.js(Axios+token拦截器) / auth.js / document.js / chat.js
+│       ├── stores/                       auth.js / chat.js (Pinia)
+│       └── views/                        LoginView / DocumentView / ChatView
 │
-├── docker/
-│   └── mysql/
-│       ├── init/init.sql                 建表脚本（自动执行）
-│       └── migration_week6.sql          已有库迁移脚本
-│
-├── docs/
-│   ├── README.md                          文档导航（按场景选文档）
-│   ├── 项目技术架构说明.md                架构图+三条链路+技术决策+性能实测
-│   ├── 核心功能模块说明.md                6大模块职责+关键实现+实测边界
-│   ├── 项目亮点与难点总结.md              9大亮点+8个真实踩坑攻克（面试讲坑素材）
-│   ├── AgenticRAG面试速记卡.md            面试前30分钟速记（链路图+10话术+手撕清单）
-│   ├── 测试报告与验收结论.md              实测数据（274 req/s）+8个问题修复记录
-│   ├── 学习笔记.md                       13章完整记录
-│   ├── 面试复习提纲.md                    面试速查卡
-│   └── eval/questions.json                检索评估集（配合 EvalRunnerTest）
-│
-├── docker-compose.yml                    Docker编排
+├── docker/mysql/
+│   ├── init/init.sql                     建表脚本（容器首次启动自动执行）
+│   └── migration_week6.sql               Week6 前旧库迁移脚本（加 category 列）
+├── docs/eval/questions.json              检索评估集（20 题，配合 EvalRunnerTest）
+├── docker-compose.yml                    一键编排 MySQL + MinIO + etcd + Milvus
 ├── .env.example                          环境变量模板
-├── .gitignore
-└── README.md                             本文档
+└── README.md
 ```
 
-## 数据库表结构
+## 数据模型
 
-MySQL 启动时自动执行 `docker/mysql/init/init.sql`：
+**MySQL**（`docker/mysql/init/init.sql` 自动建表）：
 
 | 表名 | 说明 |
 |------|------|
-| `user` | 用户表（用户名/BCrypt密码/昵称/邮箱/创建时间） |
-| `document` | 文档表（标题/文件名/类型/大小/MinIO路径/分块数/向量化状态/分类/userId） |
-| `document_chunk` | 分块表（文档ID/序号/内容/字符数） |
-| `chat_session` | 会话表（userId/标题/创建时间/更新时间） |
-| `chat_message` | 消息表（会话ID/角色/内容/来源引用JSON） |
+| `user` | 用户（用户名 / BCrypt 密码 / 昵称 / 邮箱） |
+| `document` | 文档（标题 / 文件名 / 类型 / 大小 / MinIO 路径 / 分块数 / 向量化状态 / 分类 / userId） |
+| `document_chunk` | 分块（文档 ID / 序号 / 内容 / 字符数） |
+| `chat_session` | 会话（userId / 标题 / 时间） |
+| `chat_message` | 消息（会话 ID / 角色 / 内容 / 来源引用 JSON） |
+
+**Milvus collections**：
+
+| Collection | 说明 |
+|------------|------|
+| `rag_document_chunks` | 文档分块向量（稠密 2048 维 + `bm25_vector` 稀疏字段 + BM25 Function） |
+| `qa_memory` | 长期记忆问答对 |
 
 > 密码使用 BCrypt 加密存储，无明文测试用户，需通过注册接口创建账号。
 
-## API 接口
+## API 一览
 
 | 方法 | 路径 | 说明 | 认证 |
 |------|------|------|------|
 | POST | `/api/auth/register` | 用户注册 | 否 |
-| POST | `/api/auth/login` | 用户登录（返回 JWT） | 否 |
+| POST | `/api/auth/login` | 用户登录（返回 user + token） | 否 |
 | GET | `/api/auth/me` | 获取当前用户信息 | 是 |
-| POST | `/api/document/upload` | 上传文档（MinIO + 解析分块 + 入库） | 是 |
-| GET | `/api/document/list` | 文档列表（按用户+分类过滤） | 是 |
-| DELETE | `/api/document/{id}` | 删除文档 | 是 |
+| POST | `/api/document/upload` | 上传文档（`file` + 可选 `category`，自动解析分块入库） | 是 |
+| GET | `/api/document/list` | 文档列表（按用户隔离） | 是 |
+| DELETE | `/api/document/{id}` | 删除文档（级联清理 MinIO/MySQL/Milvus） | 是 |
 | POST | `/api/document/embed/{id}` | 触发向量化入库 | 是 |
+| POST | `/api/document/rebuild-index` | 重建混合检索索引（升级 BM25 结构，自动回放已向量化文档） | 是 |
 | POST | `/api/chat/session` | 创建对话会话 | 是 |
 | GET | `/api/chat/sessions` | 会话列表 | 是 |
-| DELETE | `/api/chat/session/{id}` | 删除会话（级联删除消息） | 是 |
-| POST | `/api/chat/ask` | 智能问答 | 是 |
-| GET | `/api/chat/history/{sessionId}` | 获取对话历史 | 是 |
-| POST | `/api/agent/ask` | Agent 单轮问答（ReAct + 工具调用，骨架直通 LLM） | 是 |
-| POST | `/api/agent/orchestrate` | 多 Agent 编排问答（主管分派） | 是 |
-| GET | `/api/metrics/today` | 今日 Agent 指标（问答数/耗时/LLM/工具调用） | 是 |
+| PUT | `/api/chat/session/{sessionId}/title` | 修改会话标题 | 是 |
+| DELETE | `/api/chat/session/{sessionId}` | 删除会话（级联删除消息） | 是 |
+| POST | `/api/chat/ask/{sessionId}` | 智能问答（body：`{"question":"..."}`） | 是 |
+| GET | `/api/chat/history/{sessionId}` | 获取会话历史消息 | 是 |
+| POST | `/api/agent/ask` | 单 Agent 问答（ReAct + 工具调用） | 是 |
+| POST | `/api/agent/orchestrate` | 多 Agent 编排问答（主管分派 + 反思重写） | 是 |
+| GET | `/api/metrics/today` | 今日指标（问答量 / 平均耗时 / LLM / 工具调用） | 是 |
 
-> 完整接口文档：http://localhost:18080/doc.html
->
-> 认证接口需在请求头添加 `Authorization: Bearer <token>`，Knife4j 中可在「Authorize」按钮统一配置。
->
-> Agent 接口已实现 Function Calling + ReAct 循环（AgentExecutor，≤5 轮），配套意图路由与多 Agent 编排，详见 `agent` 模块代码。
+> 完整接口文档：http://localhost:18080/doc.html （Knife4j）。认证接口在页面右上角「Authorize」输入 `Bearer <token>` 统一配置。
 
-## 开发进度
+## 开发里程碑
 
-| 周 | 内容 | 状态 |
-|----|------|------|
-| 第1周 | 项目搭建 + 环境配置 + Docker 编排 | ✅ |
-| 第2周 | 文档上传 + 解析分块 + MinIO 存储 | ✅ |
-| 第3周 | Embedding 向量化 + Milvus 检索 | ✅ |
-| 第4周 | 大模型生成 + RAG 在线流程 | ✅ |
-| 第5周 | 前端对话交互（Markdown/路由/Pinia） | ✅ |
-| 第6周 | JWT 认证 + 数据隔离 + 文档分类 | ✅ |
-| 第7周 | 项目文档 + 面试复习材料 | ✅ |
-| 第8周 | Agentic RAG 演进 5 阶段全部完成（检索优化/Agentic核心/多Agent/记忆反思/评估缓存） | ✅ |
-
-### 第 8 周演进 TODO 清单（骨架已落地，标准答案见文档）
-
-| 优先级 | TODO | 状态 |
-|--------|------|------|
-| ⭐ | 1-1 增量更新 / 1-1b 删向量 | 🔄 已实现（reparseDocument+deleteByDocumentId） |
-| ⭐⭐ | 2-1 混合检索（路线A：Milvus 2.5 BM25 Function） | ✅ 已实现 |
-| ⭐⭐ | 2-2 Rerank / 2-3 查询改写 | ✅ 已实现 |
-| ⭐⭐⭐ | 3-2 Function Calling / 3-3 ReAct 循环 / 3-4 意图路由 | ✅ 已实现 |
-| ⭐⭐⭐ | 4-1 多 Agent / 4-2 长期记忆 / 4-3 反思 | ✅ 已实现 |
-| ⭐⭐ | 5-1 评估集 / 5-2 观测 / 5-3 缓存 / 5-4 容错 | ✅ 已实现 |
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| 第 1-2 周 | 项目搭建、Docker 编排、文档上传解析、MinIO 存储 | ✅ |
+| 第 3-4 周 | Embedding 向量化、Milvus 检索、RAG 在线问答 | ✅ |
+| 第 5-6 周 | 前端交互、JWT 认证、数据隔离、文档分类 | ✅ |
+| 第 7 周 | 项目文档与评估 | ✅ |
+| 第 8 周 | Agentic RAG 演进：混合检索 / Rerank / 查询改写 / ReAct / 意图路由 / 多 Agent / 长期记忆 / 降级熔断 / 评估 | ✅ |
 
 ## 常见问题
 
-### Q: Docker 拉取镜像超时？
+### Docker 拉取镜像超时？
 
-在 Docker Desktop 设置中配置镜像加速器（Settings → Docker Engine）：
+Docker Desktop → Settings → Docker Engine 配置镜像加速器：
 
 ```json
 {
@@ -432,7 +408,7 @@ MySQL 启动时自动执行 `docker/mysql/init/init.sql`：
 
 > quay.io 镜像（etcd）如拉取慢，可在 Git Bash 中设置 `DOCKER_CONFIG=/tmp/docker-config docker pull`。
 
-### Q: Maven 下载依赖很慢？
+### Maven 下载依赖很慢？
 
 在 `~/.m2/settings.xml` 配置阿里云镜像：
 
@@ -444,7 +420,7 @@ MySQL 启动时自动执行 `docker/mysql/init/init.sql`：
 </mirror>
 ```
 
-### Q: 端口被占用？
+### 端口被占用？
 
 | 端口 | 服务 | 修改位置 |
 |------|------|----------|
@@ -452,34 +428,20 @@ MySQL 启动时自动执行 `docker/mysql/init/init.sql`：
 | 5173 | Vue3 前端 | `vite.config.js` → `server.port` |
 | 3307 | MySQL | `docker-compose.yml` 端口映射 |
 | 9000/9002 | MinIO | `docker-compose.yml` 端口映射 |
-| 19530 | Milvus | `docker-compose.yml` 端口映射 |
+| 19530/9091 | Milvus | `docker-compose.yml` 端口映射 |
 
-### Q: Git Bash 中 mvn 报错？
+### Milvus 从 2.4 升级到 2.5（启用混合检索）？
 
-Git Bash 中使用 `mvn.cmd` 代替 `mvn`，这是 Windows 路径格式兼容问题。
+| 项 | 2.4（旧） | 2.5（新） | 说明 |
+|----|-----------|-----------|------|
+| 服务端镜像 | `milvusdb/milvus:v2.4.10` | `v2.5.16` | `docker-compose up -d` 重拉镜像 |
+| Java SDK | `milvus-sdk-java 2.4.1` | `2.5.14` | SDK 改用 Gson，项目已显式声明 fastjson 并适配 |
+| BM25 Function | 不支持 | 支持 | 旧 collection 需重建（调用 `POST /api/document/rebuild-index`，自动回放已向量化文档） |
 
-### Q: 已有数据库需要升级（加 category 列）？
+> v1 gRPC 协议向后兼容，不重建 collection 也能继续用（混合检索自动降级为纯稠密）。
 
-如果数据库在 Week 6 之前创建，需执行迁移脚本：
+### Week6 之前的数据库需要迁移（加 category 列）？
 
 ```bash
-docker exec -i rag-mysql mysql -uroot -prag123456 rag_kb < docker/mysql/migration_week6.sql
+docker exec -i rag-mysql mysql -uroot -p<你的密码> rag_kb < docker/mysql/migration_week6.sql
 ```
-
-### Q: Milvus 从 2.4 升级到 2.5（本次路线 A 改动）？
-
-| 项 | 2.4（旧） | 2.5（新） | 需要改什么 |
-|----|-----------|-----------|-----------|
-| 服务端镜像 | `milvusdb/milvus:v2.4.10` | `v2.5.16` | `docker-compose.yml` 已更新，`docker-compose up -d` 重拉镜像 |
-| Java SDK | `milvus-sdk-java 2.4.1` | `2.5.14` | `pom.xml` 已更新 |
-| JSON 库 | SDK 传递 fastjson | SDK 改用 **Gson** | ① `pom.xml` 显式声明 fastjson 1.2.83（项目代码直接用）② `MilvusService.insertVectors` 已从 fastjson 改 Gson `JsonObject` |
-| v1 API | — | 兼容保留 | `MilvusServiceClient` / `DeleteParam` / `SearchParam` 均无需改动（已编译验证） |
-| BM25 Function | 不支持 | 支持 | TODO 2-1：重建 collection，新增 `bm25_vector`（SparseFloatVector）+ `FunctionType.BM25`，详见 `MilvusService.hybridSearch` 注释 |
-
-> 旧 collection 数据不迁移也能继续查询（协议向后兼容）；启用混合检索才需要重建 collection。
-
-### Q: Knife4j 测试需要认证的接口？
-
-1. 先调用 `/api/auth/register` 注册账号
-2. 调用 `/api/auth/login` 登录，复制返回的 `token`
-3. 在 Knife4j 页面右上角点击「Authorize」，输入 `Bearer <token>`
