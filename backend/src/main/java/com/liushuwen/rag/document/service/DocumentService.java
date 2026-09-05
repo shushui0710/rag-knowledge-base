@@ -22,4 +22,15 @@ public interface DocumentService {
      * @param id 文档ID
      */
     void reparseDocument(Long id);
+
+    /**
+     * 重建混合检索索引：把旧结构 collection 升级为 BM25 混合结构。
+     * 流程：删旧 collection → 按 BM25 结构重建 → 回放所有"已向量化"文档
+     * （分块文本还在 MySQL，重新 Embedding 后插入新结构）。
+     *
+     * 触发场景：从 Milvus 2.4 旧结构升级、或 collection schema 变更。
+     *
+     * @return 回放的文档数
+     */
+    int rebuildHybridIndex();
 }

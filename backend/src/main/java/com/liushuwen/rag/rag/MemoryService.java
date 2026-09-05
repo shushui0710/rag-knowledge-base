@@ -17,16 +17,18 @@ public interface MemoryService {
     /**
      * 保存一次问答交换到长期记忆
      *
+     * @param userId   当前用户（记忆按用户隔离）
      * @param question 用户问题
      * @param answer   助手回答（截断存储）
      */
-    void saveExchange(String question, String answer);
+    void saveExchange(Long userId, String question, String answer);
 
     /**
-     * 召回与当前问题相关的历史问答
+     * 召回与当前问题相关的历史问答（只召回当前用户的记忆）
      *
+     * @param userId   当前用户
      * @param question 当前问题
      * @return 历史问答文本列表（Q:...\nA:...），空列表表示无相关记忆
      */
-    List<String> recall(String question);
+    List<String> recall(Long userId, String question);
 }

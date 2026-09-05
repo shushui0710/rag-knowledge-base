@@ -45,4 +45,10 @@ public class DocumentController {
         documentService.embed(id);
         return Result.success();
     }
+
+    @Operation(summary = "重建混合检索索引（旧collection升级为BM25结构，自动回放已向量化文档）")
+    @PostMapping("/rebuild-index")
+    public Result<Integer> rebuildIndex() {
+        return Result.success(documentService.rebuildHybridIndex());
+    }
 }

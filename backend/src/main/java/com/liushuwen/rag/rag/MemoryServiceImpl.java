@@ -13,6 +13,7 @@ import java.util.stream.Collectors;
  * 长期记忆实现（阶段4 ✅ 已实现）
  *
  * 链路：高质量问答对 → 向量化 → 存入 qa_memory（独立 collection，见 MilvusService）。
+ * 记忆按 user_id 隔离：写入带 user_id，召回 expr 过滤，跨用户记忆互不可见。
  * 记忆是旁路增强：保存失败只记日志、召回失败返回空列表，绝不影响问答主流程。
  */
 @Slf4j
@@ -30,7 +31,7 @@ public class MemoryServiceImpl implements MemoryService {
     private static final int ANSWER_MAX_LEN = 200;
 
     @Override
-    public void saveExchange(String question, String answer) {
+    public void saveExchange(Long userId, String question, String answer) {
         try {
             if (question == null || answer == null) {
                 return;                                   // 空值防御
@@ -41,7 +42,7 @@ public class MemoryServiceImpl implements MemoryService {
             if (vecs == null || vecs.isEmpty()) {
                 return;
             }
-            milvusService.insertMemory(vecs.get(0), question, answer);
+            milvusService.insertMemory(vecs.get(0), userId, question, answer);
         } catch (Exception e) {
             // ⚠️ 记忆保存失败绝不能阻断问答主流程：只记日志（面试亮点：容错降级）
             log.warn("长期记忆保存失败（不影响本次回答）: {}", e.getMessage());
@@ -49,7 +50,7 @@ public class MemoryServiceImpl implements MemoryService {
     }
 
     @Override
-    public List<String> recall(String question) {
+    public List<String> recall(Long userId, String question) {
         try {
             if (question == null) {
                 return List.of();                         // 空值防御
@@ -58,7 +59,7 @@ public class MemoryServiceImpl implements MemoryService {
             if (vecs == null || vecs.isEmpty()) {
                 return List.of();
             }
-            return milvusService.searchMemory(vecs.get(0), 3).stream()
+            return milvusService.searchMemory(vecs.get(0), 3, userId).stream()
                     .filter(h -> h.getScore() > MEMORY_MIN_SCORE)       // 阈值防低相关
                     .map(h -> {
                         // content 存的是 "问题\n回答"，拆成可读格式

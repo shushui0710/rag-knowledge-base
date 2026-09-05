@@ -251,13 +251,22 @@ public class MilvusService {
     }
 
     /**
-     * 向量搜索（下周问答功能会用到）
+     * 向量搜索（不过滤文档，评估等系统级调用用）
+     */
+    public List<SearchResult> search(float[] queryVector, int topK) {
+        // 兼容旧签名：不按文档过滤
+        return search(queryVector, topK, null);
+    }
+
+    /**
+     * 向量搜索（支持按文档ID过滤 —— 检索层用户隔离）
      *
      * @param queryVector 查询向量（2048维）
      * @param topK        返回最相似的K条结果
+     * @param documentIds 只在该文档集合内检索（当前用户的文档ID列表）；null = 不过滤
      * @return 搜索结果列表
      */
-    public List<SearchResult> search(float[] queryVector, int topK) {
+    public List<SearchResult> search(float[] queryVector, int topK, List<Long> documentIds) {
         try {
             // ============================================================
             // TODO 5（⭐⭐ 难度）：构建搜索参数
@@ -277,15 +286,23 @@ public class MilvusService {
 
             // ⚠️ Milvus 2.5 SDK 要求 FloatVector 查询向量为 List<Float>，传 float[] 会报
             //    "Search target vector type is illegal"（2.4 时代可传 float[]，升级后必须转）
-            SearchParam searchParam = SearchParam.newBuilder()
+            SearchParam.Builder paramBuilder = SearchParam.newBuilder()
                     .withCollectionName(collectionName)
                     .withVectorFieldName("embedding")
                     .withVectors(List.of(toVectorList(queryVector)))
                     .withTopK(topK)
                     .withOutFields(List.of("id", "content", "document_id"))
                     .withMetricType(MetricType.COSINE)
-                    .withParams("{\"nprobe\":10}")
-                    .build();
+                    .withParams("{\"nprobe\":10}");
+            // ⚠️ 检索层用户隔离：expr 按 document_id 过滤（旧 collection 已有该字段，无需重建即生效）
+            if (documentIds != null) {
+                if (documentIds.isEmpty()) {
+                    return List.of();   // 用户没有任何文档 → 无需检索，直接走兜底
+                }
+                paramBuilder.withExpr("document_id in [" + documentIds.stream()
+                        .map(String::valueOf).collect(Collectors.joining(",")) + "]");
+            }
+            SearchParam searchParam = paramBuilder.build();
 
 
             R<SearchResults> response = milvusServiceClient.search(searchParam);
@@ -345,7 +362,9 @@ public class MilvusService {
 
     /**
      * 创建记忆 collection（启动时 init() 调用；幂等：已存在则跳过）
-     * 字段：id(主键) / content(问题\n回答) / embedding(向量)
+     * 字段：id(主键) / user_id(所属用户，记忆也按用户隔离) / content(问题\n回答) / embedding(向量)
+     * ⚠️ 旧版 qa_memory 无 user_id 字段：旧库上插入/召回会失败并静默降级（记忆自动停用），
+     *    删除旧 collection 后重启应用即自动重建新结构
      */
     public void ensureMemoryCollection() {
         try {
@@ -359,6 +378,9 @@ public class MilvusService {
             FieldType idField = FieldType.newBuilder()
                     .withName("id").withDataType(DataType.Int64)
                     .withPrimaryKey(true).withAutoID(false).build();
+            FieldType userIdField = FieldType.newBuilder()
+                    .withName("user_id").withDataType(DataType.Int64)
+                    .build();
             FieldType contentField = FieldType.newBuilder()
                     .withName("content").withDataType(DataType.VarChar)
                     .withMaxLength(2048).build();
@@ -368,7 +390,7 @@ public class MilvusService {
             milvusServiceClient.createCollection(CreateCollectionParam.newBuilder()
                     .withCollectionName(MEMORY_COLLECTION)
                     .withSchema(CollectionSchemaParam.newBuilder()
-                            .withFieldTypes(List.of(idField, contentField, embeddingField))
+                            .withFieldTypes(List.of(idField, userIdField, contentField, embeddingField))
                             .build())
                     .build());
             milvusServiceClient.createIndex(CreateIndexParam.newBuilder()
@@ -388,12 +410,14 @@ public class MilvusService {
 
     /**
      * 保存一条记忆（问答对，content 存 "问题\n回答"）
+     * @param userId 所属用户（记忆按用户隔离，召回时同用户才可见）
      * ⚠️ 记忆是旁路增强：失败只记日志，绝不影响问答主流程
      */
-    public void insertMemory(float[] vector, String question, String answer) {
+    public void insertMemory(float[] vector, Long userId, String question, String answer) {
         try {
             JsonObject row = new JsonObject();
             row.addProperty("id", memoryIdSeq.incrementAndGet());
+            row.addProperty("user_id", userId);
             row.addProperty("content", question + "\n" + answer);
             JsonArray arr = new JsonArray();
             for (float v : vector) {
@@ -411,20 +435,25 @@ public class MilvusService {
     }
 
     /**
-     * 召回相关记忆（按向量相似度）
+     * 召回相关记忆（按向量相似度，expr 按 user_id 过滤实现记忆隔离）
+     * @param userId 当前用户（跨用户的记忆不可见）
      * ⚠️ 失败返回空列表（等同"没有记忆"），不抛异常
      */
-    public List<SearchResult> searchMemory(float[] vector, int topK) {
+    public List<SearchResult> searchMemory(float[] vector, int topK, Long userId) {
         try {
-            SearchParam param = SearchParam.newBuilder()
+            SearchParam.Builder paramBuilder = SearchParam.newBuilder()
                     .withCollectionName(MEMORY_COLLECTION)
                     .withVectorFieldName("embedding")
                     .withVectors(List.of(toVectorList(vector)))   // 2.5 SDK 要求 List<Float>
                     .withTopK(topK)
                     .withOutFields(List.of("id", "content"))
                     .withMetricType(MetricType.COSINE)
-                    .withParams("{\"nprobe\":10}")
-                    .build();
+                    .withParams("{\"nprobe\":10}");
+            // 记忆按用户隔离：只召回当前用户的历史问答
+            if (userId != null) {
+                paramBuilder.withExpr("user_id == " + userId);
+            }
+            SearchParam param = paramBuilder.build();
             R<SearchResults> response = milvusServiceClient.search(param);
             SearchResultsWrapper wrapper = new SearchResultsWrapper(response.getData().getResults());
             List<SearchResult> results = new ArrayList<>();
@@ -505,6 +534,22 @@ public class MilvusService {
 
 
     /**
+     * 删除主 collection（重建混合索引第 1 步：旧结构无法原地升级 BM25，只能删了重建）
+     * ⚠️ 危险操作：删除后向量数据清空，必须紧接着 createHybridCollection() + 重新向量化
+     *    （完整流程见 DocumentServiceImpl.rebuildHybridIndex）
+     */
+    public void dropMainCollection() {
+        try {
+            milvusServiceClient.dropCollection(DropCollectionParam.newBuilder()
+                    .withCollectionName(collectionName).build());
+            log.warn("Milvus collection 已删除: {}（待按 BM25 结构重建并重新向量化）", collectionName);
+        } catch (Exception e) {
+            log.error("删除 Milvus collection 失败: {}", e.getMessage());
+            throw new BusinessException("删除 Milvus collection 失败: " + e.getMessage());
+        }
+    }
+
+    /**
      * TODO 2-1（路线A）建表：创建含 BM25 Function 的混合检索 collection（v2 API）
      *
      * 服务端自动行为：
@@ -537,6 +582,8 @@ public class MilvusService {
             schema.addField(AddFieldReq.builder()
                     .fieldName("content").dataType(io.milvus.v2.common.DataType.VarChar)
                     .maxLength(4096).enableAnalyzer(true).build());   // ⚠️ 文本字段必须开 analyzer
+            schema.addField(AddFieldReq.builder()
+                    .fieldName("document_id").dataType(io.milvus.v2.common.DataType.Int64).build());   // ⚠️ 必须有：现有 v1 insertVectors 会写 document_id，schema 缺该字段插入直接报错；同时是检索层用户隔离（expr 过滤）的过滤字段
             schema.addField(AddFieldReq.builder()
                     .fieldName("embedding").dataType(io.milvus.v2.common.DataType.FloatVector)
                     .dimension(dimension).build());                  // 稠密向量（沿用现有）
@@ -575,21 +622,35 @@ public class MilvusService {
      * @param queryText   用户问题原文（稀疏路直接传文本，服务端自动 BM25 分词）
      * @param queryVector 用户问题稠密向量（稠密路用）
      * @param topK        返回条数
+     * @param documentIds 只在当前用户文档内检索（检索层用户隔离）；null = 不过滤
      * @return 融合排序后的检索结果（content 取自稠密路，v1 SearchResult）
      */
     public List<SearchResult> hybridSearch(String queryText, float[] queryVector, int topK) {
-        try {
-            // ---- 稠密路（v1 现有方法，复用）----
-            List<SearchResult> dense = search(queryVector, topK);
+        // 兼容旧签名：不按文档过滤
+        return hybridSearch(queryText, queryVector, topK, null);
+    }
 
-            // ---- 稀疏路（v2：EmbeddedText 传文本，服务端自动 BM25 分词）----
-            SearchResp sparseResp = milvusClientV2.search(SearchReq.builder()
+    public List<SearchResult> hybridSearch(String queryText, float[] queryVector, int topK, List<Long> documentIds) {
+        try {
+            // 用户没有任何文档 → 无需双路检索，直接返回空（走兜底文案）
+            if (documentIds != null && documentIds.isEmpty()) {
+                return List.of();
+            }
+            // ---- 稠密路（v1 现有方法，复用；documentIds 过滤实现检索层用户隔离）----
+            List<SearchResult> dense = search(queryVector, topK, documentIds);
+
+            // ---- 稀疏路（v2：EmbeddedText 传文本，服务端自动 BM25 分词；filter 同步按用户隔离）----
+            var sparseBuilder = SearchReq.builder()
                     .collectionName(collectionName)
                     .data(List.of(new EmbeddedText(queryText)))
                     .annsField("bm25_vector")
                     .topK(topK)
-                    .outputFields(List.of("id", "content"))
-                    .build());
+                    .outputFields(List.of("id", "content"));
+            if (documentIds != null) {
+                sparseBuilder.filter("document_id in [" + documentIds.stream()
+                        .map(String::valueOf).collect(Collectors.joining(",")) + "]");
+            }
+            SearchResp sparseResp = milvusClientV2.search(sparseBuilder.build());
             List<SearchResp.SearchResult> sparseHits = sparseResp.getSearchResults().isEmpty()
                     ? List.of()
                     : sparseResp.getSearchResults().get(0);   // 判空防御

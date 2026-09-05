@@ -11,8 +11,11 @@ import com.liushuwen.rag.chat.mapper.ChatMessageMapper;
 import com.liushuwen.rag.chat.mapper.ChatSessionMapper;
 import com.liushuwen.rag.chat.service.ChatService;
 import com.liushuwen.rag.chat.service.LlmService;
+import com.liushuwen.rag.document.entity.Document;
+import com.liushuwen.rag.document.mapper.DocumentMapper;
 import com.liushuwen.rag.document.service.EmbeddingService;
 import com.liushuwen.rag.document.service.MilvusService;
+import com.liushuwen.rag.rag.MemoryService;
 import com.liushuwen.rag.rag.QueryRewriterService;
 import com.liushuwen.rag.rag.RerankService;
 import lombok.RequiredArgsConstructor;
@@ -50,6 +53,13 @@ public class ChatServiceImpl implements ChatService {
     private final QueryRewriterService queryRewriterService;
     /** 阶段2：Rerank 精排（召回 → 精排） */
     private final RerankService rerankService;
+    /** 阶段4：长期记忆（旁路增强：召回历史问答 + 保存高质量问答对） */
+    private final MemoryService memoryService;
+    /** 检索层用户隔离：查出当前用户已向量化文档的 ID 列表 */
+    private final DocumentMapper documentMapper;
+
+    /** 记忆入库质量门槛：检索最高分达到该值才把问答对存入长期记忆（防低质记忆污染） */
+    private static final float MEMORY_SAVE_MIN_SCORE = 0.6f;
 
     @Value("${rag.top-k}")
     private int topK;
@@ -147,6 +157,26 @@ public class ChatServiceImpl implements ChatService {
         float[] queryVector = vectors.get(0);
 
         // ============================================================
+        // 检索层用户隔离：Milvus 检索按 document_id in [当前用户已向量化文档] 过滤。
+        // 业务层 eq(userId) 只能管 MySQL；向量库必须靠 expr 过滤，
+        // 否则 A 用户的提问可能检索到 B 用户文档的向量（信息泄露）。
+        // ============================================================
+        Long userId = UserContext.getUserId();
+        List<Long> documentIds = null;
+        if (userId != null) {
+            documentIds = documentMapper.selectList(new LambdaQueryWrapper<Document>()
+                            .eq(Document::getUserId, userId)
+                            .eq(Document::getEmbeddingStatus, 1)
+                            .select(Document::getId))
+                    .stream().map(Document::getId).toList();
+        }
+
+        // ============================================================
+        // 阶段4 长期记忆召回（旁路增强：只召回当前用户的记忆，失败内部返回空列表）
+        // ============================================================
+        List<String> memories = memoryService.recall(userId, question);
+
+        // ============================================================
         // 阶段2 检索链（✅ 已实现）：
         //   查询改写 → 混合检索（稠密+BM25稀疏，召回 recallTopK=20）→ Rerank 精排 → topN=5
         //
@@ -155,12 +185,13 @@ public class ChatServiceImpl implements ChatService {
         // - 混合检索：collection 未重建（无 bm25_vector）时自动降级纯稠密（hybridSearch 内部）
         // - Rerank：API 失败自动降级按原分数排序（rerankService 内部）
         // - 参数从 rag.retrieval.* 读（RagProperties）
+        // - documentIds：检索只在当前用户文档内进行（检索层用户隔离）
         // ============================================================
         String rewriteQuery = queryRewriterService.rewrite(question);
         int recallTopK = ragProperties.getRetrieval().getRecallTopK();
         int rerankTopN = ragProperties.getRetrieval().getRerankTopN();
         List<MilvusService.SearchResult> results = rerankService.rerank(question,
-                milvusService.hybridSearch(rewriteQuery, queryVector, recallTopK),
+                milvusService.hybridSearch(rewriteQuery, queryVector, recallTopK, documentIds),
                 rerankTopN);
 
         // ============================================================
@@ -225,6 +256,12 @@ public class ChatServiceImpl implements ChatService {
             sb.append("【参考").append(i + 1).append("】")
                     .append(results.get(i).getContent()).append("\n\n");
         }
+        // 阶段4：召回的长期记忆注入 Prompt（标注为历史问答，与文档片段区分；
+        // 召回为空则不注入，Prompt 与原版完全一致）
+        if (memories != null && !memories.isEmpty()) {
+            sb.append("【历史问答记录】\n")
+                    .append(String.join("\n---\n", memories)).append("\n\n");
+        }
         String context = sb.toString();
         String prompt = promptTemplate.replace("{context}", context)
                 .replace("{question}", question);
@@ -287,6 +324,16 @@ public class ChatServiceImpl implements ChatService {
         assistantMsg.setContent(answer);
         assistantMsg.setSources(sources);
         chatMessageMapper.insert(assistantMsg);
+
+        // 阶段4：高质量问答对存入长期记忆（旁路增强，失败只记日志不阻断）。
+        // 质量门槛：检索最高分 ≥ 0.6 才存——只有"答案有可信来源支撑"的问答才值得记忆，
+        // 防止兜底/低相关回答污染记忆库（跨会话复用的前提是记忆本身可靠）
+        float topScore = results.stream()
+                .map(MilvusService.SearchResult::getScore)
+                .max(Float::compare).orElse(0f);
+        if (topScore >= MEMORY_SAVE_MIN_SCORE) {
+            memoryService.saveExchange(userId, question, answer);
+        }
 
 
         return assistantMsg;

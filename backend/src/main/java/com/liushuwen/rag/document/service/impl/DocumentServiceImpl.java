@@ -459,4 +459,54 @@ public class DocumentServiceImpl implements DocumentService {
         }
 
     }
+
+    /**
+     * 重建混合检索索引（阶段2-路线A 收尾：解决"collection 未重建导致稀疏路降级"的遗留项）
+     *
+     * 为什么需要重建：旧 collection（2.4 结构）没有 bm25_vector 字段和 BM25 Function，
+     * 无法原地升级，只能删了按新结构重建。分块文本一直存放在 MySQL（document_chunk 表），
+     * 所以不需要重新解析 MinIO 里的文件——直接重新 Embedding + 插入即可。
+     *
+     * 面试考点：
+     * - 元数据（MySQL）与向量（Milvus）双存储的一致性：MySQL 是 source of truth，
+     *   Milvus 可随时由 MySQL 重建（可重建性是缓存型存储的安全设计）
+     * - 只回放"已向量化完成"（状态1）的文档；其他文档走正常 embed 流程即可
+     * - 生产环境应改为异步任务（避免长事务阻塞请求），本项目为演示保留同步实现
+     */
+    @Override
+    public int rebuildHybridIndex() {
+        log.info("开始重建混合检索索引（BM25 结构）");
+        // 待回放清单：所有已向量化完成的文档（分块在 MySQL，无需重新解析）
+        List<Document> embeddedDocs = documentMapper.selectList(
+                new LambdaQueryWrapper<Document>()
+                        .eq(Document::getEmbeddingStatus, 1)
+                        .orderByAsc(Document::getId));
+
+        // 1) 删旧 collection（旧结构无 BM25 Function，无法原地升级）
+        milvusService.dropMainCollection();
+        try {
+            // 2) 按混合结构重建（content 开 analyzer + BM25 Function + document_id 字段）
+            milvusService.createHybridCollection();
+            // 3) 逐文档回放：重新 Embedding 分块并插入新结构
+            for (Document doc : embeddedDocs) {
+                LambdaQueryWrapper<DocumentChunk> w = new LambdaQueryWrapper<>();
+                w.eq(DocumentChunk::getDocumentId, doc.getId())
+                        .orderByAsc(DocumentChunk::getChunkIndex);
+                List<DocumentChunk> chunks = documentChunkMapper.selectList(w);
+                if (chunks.isEmpty()) {
+                    continue;
+                }
+                List<String> texts = chunks.stream().map(DocumentChunk::getContent).toList();
+                List<float[]> vectors = embeddingService.embed(texts);
+                List<Long> chunkIds = chunks.stream().map(DocumentChunk::getId).toList();
+                milvusService.insertVectors(chunkIds, doc.getId(), texts, vectors);
+            }
+            log.info("混合检索索引重建完成: 回放文档数={}", embeddedDocs.size());
+            return embeddedDocs.size();
+        } catch (Exception e) {
+            log.error("混合索引重建失败: {}", e.getMessage(), e);
+            throw new BusinessException("混合索引重建失败: " + e.getMessage()
+                    + "（可重试本接口；回放失败不会丢数据，分块仍在 MySQL）");
+        }
+    }
 }
