@@ -12,16 +12,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Agent 执行器（阶段3核心：ReAct 循环）
- *
- * 负责把"思考→行动→观察→再思考"循环跑起来：
- *   1. 调 LLM（带工具定义）
- *   2. LLM 返回 ANSWER → 直接返回最终答案
- *   3. LLM 返回 TOOL_CALL → 执行工具，结果回填，继续循环
- *   4. 超过 maxIterations 轮 → 返回降级提示
- *
- * 骨架说明：当前实现为"直通"（直接调 LLM 返回，保证可运行），
- * 填充后成为完整 ReAct 循环（阶段3-3）。
+ * ReAct 循环执行器：驱动"思考→调工具→观察→再思考"直到产出最终答案或达轮数上限。
+ * 【设计要点】ReAct 范式与 Function Calling 的关系：FC 是能力、ReAct 是编排循环；maxIterations=5 防死循环
+ * 【常见问题】为什么要轮数上限？——防 LLM 重复调用死循环、控制成本与延迟；超限降级返回提示
  */
 @Slf4j
 @Service
@@ -35,10 +28,12 @@ public class AgentExecutor {
     private final AgentMetrics metrics;
 
     /**
-     * 执行一次 Agent 问答
+     * 执行一次 Agent 问答：熔断前置 + ReAct 循环 + 兜底。
+     * 【设计要点】tryAcquire 熔断前置：调用前先问熔断器防雪崩；循环内 onSuccess/onFailure 闭环
+     * 【常见问题】工具调用失败为何不抛异常？——回填错误文案让 LLM 自我修正，而非中断循环
      *
      * @param userQuestion 用户问题
-     * @return 最终回答
+     * @return 最终回答（或降级/兜底文案）
      */
     public String execute(String userQuestion) {
         long start = System.currentTimeMillis();
@@ -48,11 +43,11 @@ public class AgentExecutor {
         }
 
         try {
-            // ============================================================
-            // 阶段3 ✅ 已实现：ReAct 循环（思考→行动→观察→再思考）
-            // ============================================================
+            // 功能：ReAct 循环（思考→行动→观察→再思考）｜要点：maxIterations 上限防 LLM 死循环
+            // 常见问题：为什么需要轮数上限？→ 防止重复调用工具死循环，控制成本与延迟
             List<Map<String, Object>> messages = new ArrayList<>();
-            // ⚠️ deepseek-v4-flash 要求每条消息带 type 字段（message/tool），2026-08 验收实测
+            // 功能：每条消息带 type 字段（message/tool）｜要点：兼容 OpenAI 的 type 必填，漏填返回 400
+            // 常见问题：tool 消息为何要 tool_call_id？→ 必须匹配前置 assistant 的 tool_calls，否则 400
             Map<String, Object> userMsg = new java.util.LinkedHashMap<>();
             userMsg.put("type", "message");
             userMsg.put("role", "user");
@@ -72,11 +67,10 @@ public class AgentExecutor {
                     return resp.getContent();
                 }
 
-                // ① 关键：先把模型返回的 assistant 消息（含 tool_calls）原样回填，
-                //    漏了必报 400（tool 消息必须匹配前置 assistant 的 tool_calls）
+                // 功能：回填含 tool_calls 的 assistant 消息｜要点：OpenAI 要求 tool 消息前必有对应 assistant 消息，漏填 400
                 messages.add(resp.getRawAssistantMsg());
 
-                // ② 逐个执行工具，结果作为 role=tool 消息回填
+                // 功能：逐个执行工具，结果以 role=tool 消息回填｜要点：tool_call_id 配对使 LLM 读到执行结果
                 for (LlmService.ToolCall call : resp.getToolCalls()) {
                     String result;
                     try {
@@ -88,13 +82,13 @@ public class AgentExecutor {
                             result = tool.execute(JSONObject.parseObject(call.getFunction().getArguments()));
                         }
                     } catch (Exception e) {
-                        // 工具失败也回填错误信息，让 LLM 换个方式继续
+                        // 功能：工具失败回填错误文案｜要点：让 LLM 自我修正而非中断 ReAct 循环
                         result = "工具执行失败：" + e.getMessage() + "，请调整参数或换一种方式";
                     }
                     metrics.recordToolCall(call.getFunction().getName());
                     toolCount++;
                     Map<String, Object> toolMsg = new java.util.LinkedHashMap<>();
-                    toolMsg.put("type", "tool");              // ⚠️ 必须带 type（deepseek-v4-flash）
+                    toolMsg.put("type", "tool");              // 必须带 type 字段（deepseek 兼容层要求）
                     toolMsg.put("role", "tool");
                     toolMsg.put("tool_call_id", call.getId());
                     toolMsg.put("content", result);

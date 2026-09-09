@@ -9,10 +9,9 @@ import org.springframework.stereotype.Service;
 import java.util.List;
 
 /**
- * 回答质量评审实现（阶段4 ✅ 已实现：LLM 评判）
- *
- * 链路：生成回答 → LLM 评判（pass/reason JSON）→ 不合格则带意见重写（由编排层调用）。
- * 评审是旁路增强：调用失败/解析失败默认放行，绝不影响主流程。
+ * 回答质量评审实现：调 LLM 输出 pass/reason 的 JSON 评判，解析失败或异常则默认放行。
+ * 【设计要点】LLM-as-Judge 容错：评委只是增强信号，解析失败/调用异常都放行，绝不阻塞主流程
+ * 【常见问题】为什么评审失败要放行而非拦截？——评委本身不可靠，错误拦截会让正确答案被丢弃，宁可放行；常见问题：重写次数在哪控制？→ 由编排层按上限(本设计 1 次)循环调用本 judge
  */
 @Slf4j
 @Service
@@ -35,7 +34,7 @@ public class CriticServiceImpl implements CriticService {
                             + "只输出 JSON：{\"pass\": true/false, \"reason\": \"...\"}",
                     user, 0.2);
 
-            // 模型可能输出多余文字，提取第一个 { 到最后一个 } 之间的内容
+            // 功能：从模型可能夹带的冗余文字中提取纯 JSON（首个 { 到最后一个 }）｜要点：LLM 输出鲁棒解析
             int start = raw.indexOf('{');
             int end = raw.lastIndexOf('}');
             if (start < 0 || end <= start) {
@@ -45,7 +44,7 @@ public class CriticServiceImpl implements CriticService {
             boolean pass = obj.getBooleanValue("pass");
             return pass ? Critique.pass() : Critique.fail(obj.getString("reason"));
         } catch (Exception e) {
-            // 评审挂了不能让主流程挂：默认放行
+            // 功能：评审异常时默认放行｜要点：旁路增强 fail-open（评委不可靠，宁错放不误拦）
             log.warn("评审调用失败，默认放行: {}", e.getMessage());
             return Critique.pass();
         }

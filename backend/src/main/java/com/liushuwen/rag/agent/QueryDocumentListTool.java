@@ -12,11 +12,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 工具2：文档列表查询（阶段3 TODO）
- *
- * 骨架说明：当前为占位实现（execute 返回提示文本），
- * 填充后支持按分类过滤 + 数据隔离（UserContext）+ 分页（TODO 3-1b），
- * 可继续扩展：按标题模糊搜索、按向量化状态过滤、返回条数控制等。
+ * 工具：文档列表查询，按分类（可选）过滤、仅查当前用户文档、最多返回 10 条，失败返回错误文案。
+ * 【设计要点】数据隔离 + 上限防护：eq(userId) 隔离，last("limit 10") 控返回量，避免超长上下文
+ * 【常见问题】工具内 DB 失败为何返回文案不抛异常？——错误回填 LLM 让其重试，而非炸掉 ReAct 循环
  */
 @Slf4j
 @Component
@@ -53,7 +51,7 @@ public class QueryDocumentListTool implements Tool {
     public String execute(Map<String, Object> arguments) {
         String category = arguments.get("category") == null ? null : String.valueOf(arguments.get("category"));
 
-        // 阶段3 ✅ 已实现：文档列表查询（数据隔离 + 失败返回错误文案不抛异常）
+        // 功能：文档列表查询（数据隔离 + 失败返回错误文案不抛异常）｜要点：limit 10 控返回量
         try {
             LambdaQueryWrapper<Document> wrapper = new LambdaQueryWrapper<>();
             wrapper.eq(Document::getUserId, UserContext.getUserId());      // 数据隔离，必加！
@@ -75,7 +73,7 @@ public class QueryDocumentListTool implements Tool {
             }
             return sb.toString().trim();
         } catch (Exception e) {
-            // ⚠️ 工具内 DB 查询失败：返回错误文案（Agent 会回填给 LLM），不抛异常
+            // 功能：工具内 DB 失败返回错误文案（回填 LLM 让其重试）｜要点：不抛异常避免炸掉 ReAct 循环
             log.error("查询文档列表失败: category={}, error={}", category, e.getMessage(), e);
             return "查询文档列表失败：" + e.getMessage() + "，请稍后重试。";
         }

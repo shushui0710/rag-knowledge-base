@@ -60,7 +60,7 @@ const chatStore = useChatStore()
 const authStore = useAuthStore()
 
 onMounted(async () => {
-  // 先恢复用户信息
+  // 功能：有 token 但无 user 信息时拉取用户信息，补全刷新后的全局状态｜要点：localStorage 持久化后的状态恢复
   if (authStore.token && !authStore.user) {
     await authStore.fetchUser()
   }

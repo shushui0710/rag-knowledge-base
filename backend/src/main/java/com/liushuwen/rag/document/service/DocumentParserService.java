@@ -16,33 +16,21 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 /**
- * 文档解析服务 - 从PDF/Word/TXT/MD文件中提取纯文本
- *
- * 讲解要点：
- * 1. 为什么每种格式需要不同的解析方式？
- *    - PDF 是排版格式，文字藏在复杂的布局结构里，需要PDFBox"挖"出来
- *    - Word (.docx) 是XML格式，文字在<XWPFParagraph>标签里，需要POI读出来
- *    - TXT/MD 是纯文本，直接读取就行
- *
- * 2. @Service 标注 = "我是业务服务，Spring会自动创建和管理我"
- *    其他类需要解析文档时，只需注入 DocumentParserService
- *
- * 3. PDFBox 和 POI 都是Apache基金会开源项目
- *    - PDFBox: 专门处理PDF的Java库
- *    - POI: 专门处理Office文档(Word/Excel/PPT)的Java库
- *    这两个库在pom.xml里已经添加了依赖
+ * 文档解析服务：按文件类型（PDF/Word/TXT/MD）提取纯文本。
+ * 位于上传与向量化之间，产出的文本是后续分块与 Embedding 的输入。
+ * 【设计要点】解析库选型：PDF 用 PDFBox（轻量纯 Java、专注 PDF），Word 用 POI（XWPF 处理 OOXML），TXT/MD 直接按 UTF-8 读取
+ * 【常见问题】扫描版 PDF 怎么办？——页面是图片无文本层，PDFBox 抽不出字，需先 OCR；复杂排版为何可能乱序？——PDF 是排版格式、文字按坐标散落，setSortByPosition(true) 按位置重排可缓解
  */
 @Slf4j
 @Service
 public class DocumentParserService {
 
     /**
-     * 解析文档，提取纯文本
+     * 解析文档，按 fileType 路由到对应解析策略，提取纯文本。
+     * 【设计要点】策略路由：switch 分发到 parsePdf/parseDocx/parseText，不支持的格式抛 BusinessException 快速失败
+     * 【常见问题】解析异常怎么传播？——统一包装为 BusinessException 上抛，由全局异常处理器转成友好响应，避免底层 IOException 泄露到接口层
      *
-     * 根据文件类型选择不同的解析策略（策略模式）
-     * 白话：看是什么格式的文件，选对应的"解压工具"
-     *
-     * @param file 上传的文件
+     * @param file     上传的文件
      * @param fileType 文件类型（pdf/docx/md/txt）
      * @return 提取出的纯文本内容
      */
@@ -70,50 +58,31 @@ public class DocumentParserService {
     }
 
     /**
-     * 解析PDF文件
-     *
-     * PDFBox的解析流程：
-     * 1. Loader.loadPDF() → 加载PDF文件，创建PDDocument对象
-     *    PDDocument = PDF文件在Java里的"代言人"，有了它就能操作PDF
-     * 2. PDFTextStripper → 把PDF里的文字"刮"出来
-     *    stripper.getText() = 逐页扫描，提取所有可见文字
-     * 3. 最后关闭PDDocument释放资源
-     *
-     * 面试考点：
-     * - PDF是排版格式，不是文本格式。同一句话可能被拆成多个"块"散落在页面上
-     * - PDFBox的getText()会尝试按阅读顺序重组文字，但复杂排版可能不完美
-     * - 实际项目中可能需要处理：扫描版PDF（需要OCR）、表格PDF、图片PDF
+     * 解析 PDF：PDFBox 加载文档后抽取全部文本。
+     * 【设计要点】PDDocument 生命周期：必须 close 释放内存与文件句柄，try-finally 兜底保证异常路径也不泄漏
+     * 【常见问题】setSortByPosition(true) 解决什么？——PDF 文字按坐标存储，不排序可能输出乱序；Loader.loadPDF 为什么传字节数组？——PDFBox 3.x 新 API，随机访问需要完整字节
      */
     private String parsePdf(InputStream inputStream) throws IOException {
-        // PDFBox 3.x 使用 Loader.loadPDF() 加载
-        // 注意：PDDocument用完必须关闭，否则内存泄漏
+        // 功能：PDFBox 3.x 用 Loader.loadPDF() 加载字节流｜要点：PDF 是排版格式，需专用库还原文本流
         PDDocument document = Loader.loadPDF(inputStream.readAllBytes());
         try {
             PDFTextStripper stripper = new PDFTextStripper();
-            // 设置按页提取，每页之间用换行分隔
-            stripper.setSortByPosition(true);  // 按文字位置排序（改善乱序问题）
+            stripper.setSortByPosition(true);  // 功能：按文字坐标排序输出｜要点：缓解 PDF 乱序问题
             String text = stripper.getText(document);
 
             log.info("PDF解析完成: pages={}, textLength={}",
                     document.getNumberOfPages(), text.length());
             return text.trim();
         } finally {
-            // finally块：无论是否出错都会执行，确保关闭资源
-            // 这是Java资源管理的基本模式：try-finally
+            // 功能：finally 兜底关闭 PDDocument｜要点：不关闭会泄漏内存与文件句柄
             document.close();
         }
     }
 
     /**
-     * 解析Word (.docx) 文件
-     *
-     * POI的解析流程：
-     * 1. XWPFDocument → 加载docx文件
-     *    XWPF = XML Word Processing Format，docx本质是XML文件
-     * 2. getParagraphs() → 获取所有段落
-     *    Word文档由段落(Paragraph)组成，每个段落是一行或一段文字
-     * 3. 遍历每个段落，提取文字getText()
-     * 4. 拼接所有段落的文字，用换行分隔
+     * 解析 Word（.docx）：POI XWPF 读取 OOXML 段落并按换行拼接。
+     * 【设计要点】docx 本质是 ZIP 包裹的 XML：XWPFDocument 解包后按 Paragraph 粒度遍历取 getText()
+     * 【常见问题】POI 与 PDFBox 怎么分工？——POI 主攻 Office 系（Word/Excel/PPT），PDFBox 专注 PDF；表格文字能取到吗？——getParagraphs 不含表格，需另遍历 XWPFTable
      */
     private String parseDocx(InputStream inputStream) throws IOException {
         XWPFDocument docx = new XWPFDocument(inputStream);
@@ -137,28 +106,20 @@ public class DocumentParserService {
     }
 
     /**
-     * 解析纯文本文件（TXT/MD）
-     *
-     * 最简单的解析——直接读取文件内容
-     * MD（Markdown）本质也是纯文本，只是有格式标记（#标题、**加粗等）
-     * 暂时直接读取原文，保留格式标记（后续可以优化去掉标记）
+     * 解析纯文本（TXT/MD）：直接按 UTF-8 读取全部字节。
+     * 【设计要点】编码处理：显式指定 StandardCharsets.UTF_8，避免平台默认编码差异导致中文乱码
+     * 【常见问题】MD 的格式标记（#、**）要不要去掉？——当前保留原文，标记对语义检索影响有限，需要更干净时可加预处理
      */
     private String parseText(InputStream inputStream) throws IOException {
         String text = new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
         log.info("文本解析完成: textLength={}", text.length());
         return text.trim();
     }
-            // 前置②：DocumentParserService 新增 parse(InputStream, String) 重载：
-        //   public String parse(InputStream in, String fileType) {
-        //       switch (fileType) {
-        //           case "pdf":  return parsePdf(in);
-        //           case "docx": return parseDocx(in);
-        //           case "txt":
-        //           case "md":   return parseText(in);
-        //           default:     throw new BusinessException("不支持的文件格式: " + fileType);
-        //       }
-        //   }
-    
+    /**
+     * 解析已加载的输入流（重传/重解析场景：文件已从 MinIO 读出，不再经 MultipartFile）。
+     * 【设计要点】方法重载：与 parse(MultipartFile, String) 共用同一套路由逻辑，入参形态不同、行为一致
+     * 【常见问题】为什么入参用 InputStream 而不是 byte[]？——流式接口对调用方更通用，实现内部按需 readAllBytes
+     */
     public String parse(InputStream in, String fileType)throws IOException {
         switch (fileType) {
             case "pdf":  return parsePdf(in);

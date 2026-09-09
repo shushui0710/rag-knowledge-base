@@ -7,12 +7,8 @@ const request = axios.create({
   timeout: 60000,
 })
 
-/**
- * 请求拦截器 - 自动添加 JWT Token
- *
- * 每次发请求前，从 localStorage 取 token，加到 Authorization 头里。
- * 后端 JwtInterceptor 会从这个头解析 userId。
- */
+// 功能：请求拦截器统一注入 Authorization: Bearer <token>｜要点：无状态认证（JWT）的客户端配合
+// 常见问题：token 存 localStorage 有什么风险？—— XSS 可读，需配合输出转义/CSP；httpOnly cookie 可防 XSS 但需防 CSRF
 request.interceptors.request.use(
   (config) => {
     const token = localStorage.getItem('token')
@@ -24,14 +20,8 @@ request.interceptors.request.use(
   (error) => Promise.reject(error)
 )
 
-/**
- * 响应拦截器 - 统一处理响应和错误
- *
- * - 业务成功（code=200）：返回 res
- * - 业务失败（code≠200）：弹错误提示
- * - HTTP 401（token无效/过期）：清理 token + 跳转登录页
- * - 网络错误：弹错误提示
- */
+// 功能：响应拦截器统一拆包（code=200 返回 data）并集中处理错误｜要点：Axios 拦截器 + 401 统一登出
+// 常见问题：401 为何集中处理？—— token 失效/过期时统一清 token 并跳登录，避免每个请求散落重复逻辑
 request.interceptors.response.use(
   (response) => {
     const res = response.data
@@ -43,7 +33,7 @@ request.interceptors.response.use(
   },
   (error) => {
     if (error.response && error.response.status === 401) {
-      // token 无效或过期，清理并跳转登录
+      // 功能：401 时清除过期 token 并跳转登录页｜要点：统一鉴权失效处理
       localStorage.removeItem('token')
       ElMessage.warning('登录已过期，请重新登录')
       router.push('/login')

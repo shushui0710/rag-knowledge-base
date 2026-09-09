@@ -1,25 +1,25 @@
 <template>
   <div class="chat-container">
-    <!-- 消息列表（可滚动区域） -->
+    <!-- 功能：可滚动消息列表容器，ref 绑定供自动滚动到底部｜要点：ref 获取 DOM -->
     <div ref="messageContainer" class="message-list">
-      <!-- 空状态 -->
+      <!-- 功能：无历史时的空状态引导文案｜要点：v-if 条件渲染 -->
       <div v-if="messages.length === 0" class="empty-state">
         <el-icon style="font-size: 48px; color: #dcdfe6;"><ChatDotRound /></el-icon>
         <h3 style="font-size: 20px; color: #909399; margin: 16px 0 8px;">RAG 智能知识库问答</h3>
         <p style="font-size: 14px; color: #c0c4cc;">上传文档并向量化后，即可开始智能问答</p>
       </div>
 
-      <!-- 消息气泡 -->
+      <!-- 功能：按角色渲染用户/AI 消息气泡｜要点：v-for 列表渲染 + :class 动态类名 -->
       <div v-for="(msg, idx) in messages" :key="idx" :class="['message', msg.role]">
         <div class="message-role">{{ msg.role === 'user' ? '你' : 'AI助手' }}</div>
 
-        <!-- 用户消息：纯文本 -->
+        <!-- 功能：用户消息按纯文本渲染，避免内容被当 HTML 执行｜要点：v-html 仅用于已过滤的 AI 内容 -->
         <div v-if="msg.role === 'user'" class="message-content">{{ msg.content }}</div>
 
-        <!-- AI消息：Markdown渲染（TODO 1完成后生效） -->
+        <!-- 功能：AI 消息经 markdown-it 渲染 HTML 后由 v-html 注入｜要点：v-html + html:false 防 XSS -->
         <div v-else class="message-content markdown-body" v-html="renderMarkdown(msg.content)"></div>
 
-        <!-- 来源引用（可折叠） -->
+        <!-- 功能：展示 AI 参考来源（相似度+片段），可折叠｜要点：RAG 来源引用 + el-collapse -->
         <div v-if="msg.sources" class="message-sources">
           <el-collapse>
             <el-collapse-item title="参考来源">
@@ -36,7 +36,7 @@
         </div>
       </div>
 
-      <!-- 加载中提示（AI正在思考） -->
+      <!-- 功能：AI 生成回答时的加载动画占位｜要点：loading 状态驱动 v-if -->
       <div v-if="loading" class="message assistant">
         <div class="message-role">AI助手</div>
         <div class="message-content loading-dots">
@@ -47,7 +47,7 @@
       </div>
     </div>
 
-    <!-- 输入区域 -->
+    <!-- 功能：问题输入框 + 发送按钮，回车提交｜要点：v-model 双向绑定本质 -->
     <div class="input-area">
       <el-input
         v-model="question"
@@ -82,31 +82,12 @@ const sessionId = computed(() =>
   route.params.sessionId ? Number(route.params.sessionId) : null
 )
 
-// ============================================================
-// TODO 1（⭐⭐ 难度）：初始化 markdown-it 实例 + renderMarkdown 函数
-//
-// 背景：DeepSeek 的回答是 Markdown 格式（含 ## 标题、- 列表、``` 代码块），
-// 直接用 {{ }} 显示是一坨纯文本。需要用 markdown-it 渲染成 HTML。
-//
-// 提示：
-//   const md = new MarkdownIt({
-//     html: false,        // 禁止原始HTML标签（防XSS）
-//     breaks: true,       // 换行符 → <br>
-//     linkify: true,      // 自动识别URL
-//   })
-//
-//   function renderMarkdown(content) {
-//     return md.render(content || '')
-//   }
-//
-// 面试考点：
-//   - 为什么 html: false？—— 防止大模型输出 <script> 等恶意标签（XSS）
-//   - v-html 的安全风险？—— v-html 会执行HTML，所以渲染前必须过滤（html:false）
-// ============================================================
+// 功能：初始化 markdown-it 实例，将大模型返回的 Markdown 渲染为 HTML｜要点：Markdown 渲染 + XSS 防护
+// 常见问题：为什么 html: false？—— 大模型输出可能含 <script>/onerror 等恶意标签，禁用原始 HTML 可防 XSS；v-html 会执行 HTML，渲染前必须过滤
 const md = new MarkdownIt({
-  html: false,        // 禁止原始HTML标签（防XSS）
-  breaks: true,       // 换行符 → <br>
-  linkify: true,      // 自动识别URL
+  html: false,        // 功能：禁用原始 HTML 标签防 XSS｜要点：v-html 安全
+  breaks: true,       // 功能：换行符转 <br>｜要点：markdown-it 配置
+  linkify: true,      // 功能：自动识别并链接 URL｜要点：markdown-it 配置
 })
 
 function renderMarkdown(content) {
@@ -115,23 +96,9 @@ function renderMarkdown(content) {
 
 
 
-// ============================================================
-// TODO 2（⭐⭐ 难度）：消息列表自动滚动到底部
-//
-// 背景：AI 回答很长，新消息会超出可视区域。不自动滚动，用户看不到最新回答。
-//
-// 提示：
-//   watch(messages, () => {
-//     nextTick(() => {
-//       const el = messageContainer.value
-//       if (el) el.scrollTop = el.scrollHeight
-//     })
-//   }, { deep: true })
-//
-// 面试考点：
-//   - 为什么用 nextTick？—— Vue 更新 DOM 是异步的，直接操作拿到的是旧高度
-//   - deep: true？—— messages 是数组，push 不会触发浅层 watch，需要 deep
-// ============================================================
+// 功能：消息列表变化后自动滚动到底部｜要点：nextTick 时机 + watch 深度监听数组
+// 常见问题：为什么用 nextTick？—— Vue DOM 更新异步，需在 nextTick 回调里才拿到最新 scrollHeight
+// 常见问题：为什么 deep: true？—— messages 为数组，push 不改变引用，浅层 watch 不触发，需深度监听
 watch(messages, () => {
   nextTick(() => {
     const el = messageContainer.value
@@ -141,31 +108,8 @@ watch(messages, () => {
 
 
 
-// ============================================================
-// TODO 3（⭐⭐ 难度）：监听路由参数变化，切换会话时重新加载历史
-//
-// 背景：onMounted 只在组件首次创建时执行。用户在侧边栏点击另一个会话时，
-// URL 从 /chat/3 变成 /chat/5，但 ChatView 组件没有销毁重建（同一路由复用），
-// onMounted 不会再次触发，导致历史不刷新。
-//
-// 提示：
-//   watch(() => route.params.sessionId, async (newId) => {
-//     if (newId) {
-//       try {
-//         const res = await getHistory(newId)
-//         messages.value = res.data || []
-//       } catch (e) {
-//         console.warn('加载历史失败', e)
-//       }
-//     } else {
-//       messages.value = []
-//     }
-//   })
-//
-// 面试考点：
-//   - 为什么 onMounted 不够？—— Vue Router 同组件复用，不触发 onMounted
-//   - watch 的第一个参数为什么是函数？—— 监听响应式数据的变化
-// ============================================================
+// 功能：监听路由参数 sessionId，切换会话时重新加载历史｜要点：同组件复用不触发 onMounted + watch 响应式源
+// 常见问题：为什么 onMounted 不够？—— Vue Router 复用同一组件实例时不销毁重建，onMounted 只执行一次，需 watch 路由参数
 
 watch(() => route.params.sessionId, async (newId) =>{
   if(newId){
@@ -202,23 +146,8 @@ async function sendQuestion() {
     const res = await askQuestion(sessionId.value, q)
     messages.value.push(res.data)
 
-    // ============================================================
-    // TODO 4（⭐⭐ 难度）：如果是第一条消息，自动更新会话标题
-    //
-    // 背景：新会话标题都是"新对话"，侧边栏分不清。第一条消息后，
-    // 用问题前20字作为标题，调用 Pinia store 的 updateTitle 方法。
-    //
-    // 提示：
-    //   if (messages.value.length === 2) {  // 1条用户 + 1条AI = 2条
-    //     const title = q.length > 20 ? q.substring(0, 20) + '...' : q
-    //     await chatStore.updateTitle(sessionId.value, title)
-    //   }
-    //
-    // 面试考点：
-    //   - 为什么前端管标题？—— UI 逻辑在前端，后端只管存储
-    //   - 为什么截断20字？—— 侧边栏宽度有限
-    //   - 为什么用 Store 而不是 emit？—— Store 是全局状态，任何组件都能同步
-    // ============================================================
+    // 功能：首条消息后自动用问题前 20 字生成会话标题并同步全局 Store｜要点：全局状态共享 + 标题截断策略
+    // 常见问题：为什么用 Store 而不是 emit？—— 标题在侧边栏（App.vue）展示，Store 全局共享可跨组件同步
     if (messages.value.length === 2) {
       const title = q.length > 20 ? q.substring(0, 20) + '...' : q
       await chatStore.updateTitle(sessionId.value, title)
@@ -299,7 +228,7 @@ function parseSources(sources) {
   color: #303133;
 }
 
-/* Markdown 渲染样式 */
+/* 功能：AI 回复的 Markdown 渲染样式（由 markdown-it 生成 HTML）｜要点：v-html 渲染需配合 html:false 防 XSS */
 .markdown-body h1,
 .markdown-body h2,
 .markdown-body h3 {
@@ -366,7 +295,7 @@ function parseSources(sources) {
   padding: 6px 12px;
 }
 
-/* 来源引用 */
+/* 功能：AI 参考来源引用区块样式｜要点：RAG 来源展示 */
 .message-sources {
   margin-top: 8px;
 }
@@ -388,7 +317,7 @@ function parseSources(sources) {
   line-height: 1.5;
 }
 
-/* 加载动画（三个跳动的点） */
+/* 功能：AI 思考中的三点加载动画样式｜要点：CSS 动画 */
 .loading-dots {
   display: flex;
   gap: 4px;

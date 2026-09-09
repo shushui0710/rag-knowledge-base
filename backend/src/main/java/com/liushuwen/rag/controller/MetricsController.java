@@ -12,12 +12,9 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.Map;
 
 /**
- * 指标接口（阶段5-生产化：观测性）
- *
- * GET /api/metrics/today → 今日问答量、平均耗时、LLM 调用次数、工具调用次数
- *
- * 面试考点：可观测性——面试时演示"今天处理了多少问答、调了几次 LLM"，
- *          说明你有生产思维（指标 + 日志 + 链路追踪）。
+ * 指标观测接口：暴露今日 Agent 运行指标（问答量/平均耗时/LLM 与工具调用次数）。
+ * 【设计要点】可观测性：指标 + 日志 + 链路追踪是生产化三件套，能回答"今天处理多少问答、调几次 LLM"
+ * 【常见问题】为何做成接口而非埋点上报？——演示项目直接快照返回，真实环境应推 Prometheus / Grafana 由服务端拉取
  */
 @Tag(name = "指标观测")
 @RestController

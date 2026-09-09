@@ -36,20 +36,11 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
- * Milvus向量数据库操作服务
- *
- * Milvus是什么？
- * 专门存"向量"的数据库。MySQL存的是文字数字，Milvus存的是向量（2048个浮点数）。
- * 它的核心能力是"向量相似度搜索"——给一个查询向量，找出最相似的K个向量。
- *
- * 本类提供三个核心操作：
- * 1. ensureCollection() - 建表（如果不存在的话）
- * 2. insertVectors() - 插入向量数据
- * 3. search() - 向量搜索（下周问答功能用）
- *
- * ⚠️ v1 / v2 双 API 说明（SDK 2.5.14，两个客户端 Bean 见 MilvusConfig）：
- * - v1（milvusServiceClient）：稠密路（search/insertVectors/deleteByDocumentId/ensureCollection）
- * - v2（milvusClientV2）：BM25 稀疏路（TODO 2-1 路线A：createHybridCollection/hybridSearch）
+ * Milvus 向量库操作服务：封装建集合、批量入库、稠密检索、按文档删除，以及混合检索（稠密+BM25 稀疏）双路召回。
+ * 在知识库链路中作为向量存储与检索层，下游被 DocumentService（入库/删除）与问答检索（hybridSearch）调用。
+ * 【设计要点】v1/v2 双 SDK 共存：v1(MilvusServiceClient) 稳定用于稠密路，v2(MilvusClientV2) 才支持 BM25 Function 查询，各取所长
+ * 【常见问题】向量库为什么单独存？——Milvus 专为 ANN 相似度检索优化，MySQL 不适合高维向量检索；
+ *   embedding 维度是多少？——embedding-3 稠密向量 2048 维
  */
 @Slf4j
 @Service
@@ -58,10 +49,10 @@ public class MilvusService {
 
     private final MilvusServiceClient milvusServiceClient;
 
-    /** v2 API 客户端（TODO 2-1 路线A：BM25 Function 建表 + EmbeddedText 稀疏检索） */
+    /** v2 客户端：BM25 Function 建表 + EmbeddedText 稀疏检索（v1 不支持） */
     private final MilvusClientV2 milvusClientV2;
 
-    /** RAG 配置（alpha 融合权重等） */
+    /** RAG 配置：混合检索 alpha 加权融合权重等 */
     private final RagProperties ragProperties;
 
     @Value("${milvus.collection-name}")
@@ -71,32 +62,33 @@ public class MilvusService {
     private int dimension;
 
     /**
-     * 启动时自动建表
-     * @PostConstruct = "这个Bean创建后自动执行这个方法"
+     * 应用启动时自动初始化 Milvus collection：主检索库与记忆库不存在则创建。
+     * 在建库链路最前端执行，保证服务就绪即可入库检索，无需手工建表。
+     * 【设计要点】@PostConstruct 生命周期：Bean 依赖注入完成后回调，适合启动期资源准备
+     * 【常见问题】Milvus 未启动导致初始化失败怎么办？——catch 后仅 log.warn 不阻断应用启动（可用性优先），
+     *   待 Milvus 恢复后重启即可补建；为何启动期不重试？——阻塞式重试会拖慢甚至卡死应用上线
      */
     @PostConstruct
     public void init() {
         try {
             ensureCollection();
-            ensureMemoryCollection();   // 阶段4：记忆专用 collection
+            ensureMemoryCollection();   // 记忆专用 collection：与文档向量物理隔离，避免记忆混入检索结果
         } catch (Exception e) {
             log.warn("Milvus初始化失败（可能Milvus还没启动）: {}", e.getMessage());
         }
     }
 
     /**
-     * 创建Collection（相当于MySQL的CREATE TABLE）
-     *
-     * Milvus的Collection需要定义"字段"（Schema），就像MySQL建表要定义列。
-     * 我们需要4个字段：
-     * - id: 主键（对应MySQL document_chunk.id）
-     * - document_id: 文档ID（用于按文档过滤）
-     * - content: 文本内容（搜索时直接返回，不用再查MySQL）
-     * - embedding: 向量字段（2048维浮点数组，核心字段）
+     * 创建主检索 collection：定义 4 字段 Schema（id/document_id/content/embedding）+ IVF_FLAT 索引并加载。
+     * 在建库链路中作为 v1 稠密路的结构基础，启动时由 init() 幂等调用。
+     * 【设计要点】Schema 设计：id 对齐 MySQL document_chunk.id（autoID=false）便于回查关联，
+     * content 直接存原文使检索免回 MySQL，embedding 为 2048 维 FloatVector
+     * 【常见问题】为什么主键用 MySQL 的 chunkId？——两库主键对齐，融合排序后可直接定位分块；
+     *   为什么建索引选 IVF_FLAT？——nlist=1024 聚类倒排 + COSINE 度量，中小规模数据集性价比高
      */
     public void ensureCollection() {
         try {
-            // 先检查collection是否已存在
+            // 功能：幂等检查——已存在直接跳过｜要点：重启安全（重复建表会报错，先 showCollections 判断）
             R<ShowCollectionsResponse> showResp = milvusServiceClient.showCollections(
                     ShowCollectionsParam.newBuilder().build());
             for (String name : showResp.getData().getCollectionNamesList()) {
@@ -107,45 +99,9 @@ public class MilvusService {
             }
 
             // ============================================================
-            // TODO 4（⭐⭐⭐ 难度）：定义Collection的Schema（字段列表）
-            //
-            // 需要定义4个字段，每个字段用 FieldType 描述：
-            //
-            // 字段1 - id（主键）：
-            //   FieldType.newBuilder()
-            //       .withName("id")              // 字段名
-            //       .withDataType(DataType.Int64) // 数据类型：64位整数
-            //       .withPrimaryKey(true)         // 是主键
-            //       .withAutoID(false)            // 不自动生成ID（用MySQL的chunk id）
-            //       .build()
-            //
-            // 字段2 - document_id（文档ID）：
-            //   FieldType.newBuilder()
-            //       .withName("document_id")
-            //       .withDataType(DataType.Int64)
-            //       .build()
-            //
-            // 字段3 - content（文本内容）：
-            //   FieldType.newBuilder()
-            //       .withName("content")
-            //       .withDataType(DataType.VarChar) // 变长字符串
-            //       .withMaxLength(2048)            // 最大长度
-            //       .build()
-            //
-            // 字段4 - embedding（向量，核心字段）：
-            //   FieldType.newBuilder()
-            //       .withName("embedding")
-            //       .withDataType(DataType.FloatVector) // 浮点向量
-            //       .withDimension(dimension)           // 维度2048
-            //       .build()
-            //
-            // 然后创建 CreateCollectionParam：
-            //   CreateCollectionParam.newBuilder()
-            //       .withCollectionName(collectionName)
-            //       .withFieldTypes(List.of(idField, documentIdField, contentField, embeddingField))
-            //       .build()
-            //
-            // 把下面这段替换成你的实现：
+            // 功能：定义 Collection Schema（4 个字段，FieldType 逐个声明名称/类型/主键/维度）
+            // 考点：Schema 设计对齐 MySQL document_chunk 表
+            // 常见问题：id 为什么 autoID(false)？→ 显式传 MySQL 的 chunkId 作主键，两库主键对齐可回查关联
             // ============================================================
             FieldType idField = FieldType.newBuilder()
                     .withName("id")
@@ -183,7 +139,8 @@ public class MilvusService {
             milvusServiceClient.createCollection(createParam);
             log.info("Milvus collection创建成功: {}", collectionName);
 
-            // 创建向量索引（加速能搜索）
+            // 功能：为 embedding 建向量索引（IVF_FLAT + COSINE，nlist=1024）
+            // 考点：ANN 索引选型——IVF_FLAT 聚类倒排加速近似检索，暴力遍历扛不住生产规模
             CreateIndexParam createIndexParam = CreateIndexParam.newBuilder()
                     .withCollectionName(collectionName)           // 集合名称
                     .withFieldName("embedding")                    // 向量字段名
@@ -193,7 +150,7 @@ public class MilvusService {
                     .build();
             milvusServiceClient.createIndex(createIndexParam);
 
-            // 加载到内存（搜索前必须先load）
+            // 功能：load collection 到内存｜要点：Milvus 检索前必须 load，数据从对象存储载入查询节点后才可查
             milvusServiceClient.loadCollection(
                     LoadCollectionParam.newBuilder()
                             .withCollectionName(collectionName)
@@ -217,8 +174,7 @@ public class MilvusService {
     public void insertVectors(List<Long> chunkIds, Long documentId,
                               List<String> contents, List<float[]> vectors) {
         try {
-            // 构建插入数据（Milvus 2.5+ SDK 用 Gson 的 JsonObject 表示一行数据；
-            // ⚠️ 2.4.x 曾是 FastJSON，SDK 升级后必须同步改，否则编译报"不兼容的类型"）
+            // 功能：构建插入数据，一行用 Gson JsonObject 表示｜要点：v1 SDK 行模型——2.5 起用 Gson，2.4.x 是 FastJSON，升级 SDK 须同步替换否则编译报"不兼容的类型"
             List<JsonObject> rows = new ArrayList<>();
             for (int i = 0; i < chunkIds.size(); i++) {
                 JsonObject row = new JsonObject();
@@ -251,16 +207,22 @@ public class MilvusService {
     }
 
     /**
-     * 向量搜索（不过滤文档，评估等系统级调用用）
+     * 纯稠密检索便捷入口：不按文档过滤，供评估等系统级调用使用。
+     * 内部委托三参 search() 传 null 跳过 expr 过滤。
+     * 【设计要点】方法重载分层：带过滤/不带过滤两个入口共用一套检索实现
      */
     public List<SearchResult> search(float[] queryVector, int topK) {
-        // 兼容旧签名：不按文档过滤
+        // 功能：委托重载方法，documentIds 传 null 即不过滤
         return search(queryVector, topK, null);
     }
 
     /**
-     * 向量搜索（支持按文档ID过滤 —— 检索层用户隔离）
-     *
+     * 稠密向量检索：支持按 documentIds 过滤，实现检索层的用户数据隔离。
+     * 在问答链路中作为稠密召回主力，被 hybridSearch 稠密路复用。
+     * 【设计要点】expr 布尔表达式过滤："document_id in [...]" 由服务端谓词下推过滤，
+     * 避免全库检索后应用层再过滤的浪费
+     * 【常见问题】documentIds 为空集合怎么办？——直接返回空列表，无需发起一次注定为空的 RPC；
+     *   过滤为何放检索层而非查完再筛？——服务端过滤减少扫描量与传输量
      * @param queryVector 查询向量（2048维）
      * @param topK        返回最相似的K条结果
      * @param documentIds 只在该文档集合内检索（当前用户的文档ID列表）；null = 不过滤
@@ -269,23 +231,10 @@ public class MilvusService {
     public List<SearchResult> search(float[] queryVector, int topK, List<Long> documentIds) {
         try {
             // ============================================================
-            // TODO 5（⭐⭐ 难度）：构建搜索参数
-            //
-            // 需要用 SearchParam.newBuilder() 构建，需要设置：
-            //   .withCollectionName(collectionName)    // 搜哪个表
-            //   .withVectorFieldName("embedding")     // 搜哪个字段
-            //   .withVectors(List.of(queryVector))    // 查询向量
-            //   .withVectorValues(queryVector)        // 或者用这个
-            //   .withTopK(topK)                       // 返回前K条
-            //   .withOutFields(List.of("id", "content", "document_id"))  // 返回哪些字段
-            //   .withMetricType(MetricType.COSINE)    // 余弦相似度
-            //   .withParams("{\"nprobe\":10}")        // 搜索参数
-            //
-            // 提示：查询向量要用 List.of(new float[][]{queryVector}) 或
-            //       .withVectors(List.of(queryVector))
-
-            // ⚠️ Milvus 2.5 SDK 要求 FloatVector 查询向量为 List<Float>，传 float[] 会报
-            //    "Search target vector type is illegal"（2.4 时代可传 float[]，升级后必须转）
+            // 功能：构建 SearchParam（collection/向量字段/查询向量/topK/返回字段/COSINE/{"nprobe":10}）
+            // 考点：v2.5 SDK 类型坑——FloatVector 查询向量必须传 List<Float>，
+            //   传 float[] 会报 "Search target vector type is illegal"（2.4 时代可传 float[]）
+            // ============================================================
             SearchParam.Builder paramBuilder = SearchParam.newBuilder()
                     .withCollectionName(collectionName)
                     .withVectorFieldName("embedding")
@@ -338,9 +287,9 @@ public class MilvusService {
     }
 
     /**
-     * float[] → List&lt;Float&gt;
-     * ⚠️ Milvus 2.5 SDK 要求 FloatVector 查询向量必须是 List&lt;Float&gt;，
-     *    传 float[] 会报 "Search target vector type is illegal"（2.4 时代可传 float[]）
+     * float[] 转 List&lt;Float&gt; 的适配方法。
+     * 【设计要点】SDK 版本兼容：Milvus 2.5 SDK 要求 FloatVector 查询向量必须是 List&lt;Float&gt;，
+     * 传 float[] 会报 "Search target vector type is illegal"（2.4 时代可传 float[]）
      */
     private List<Float> toVectorList(float[] vector) {
         List<Float> list = new ArrayList<>(vector.length);
@@ -351,7 +300,7 @@ public class MilvusService {
     }
 
     // ============================================================
-    // 阶段4 ✅ 已实现：长期记忆（独立 qa_memory collection，与文档向量完全隔离）
+    // 长期记忆：独立 qa_memory collection，与文档向量完全隔离
     // ============================================================
 
     /** 记忆专用 collection（避免记忆混入文档检索结果） */
@@ -472,33 +421,18 @@ public class MilvusService {
     }
 
     // ============================================================
-    // 阶段1/2 新增：按文档删除向量 + 混合检索（骨架）
+    // 按文档删除向量 + 混合检索
     // ============================================================
 
     /**
-     * 按文档ID删除向量（阶段1-增量更新 TODO）
-     *
-     * @param documentId 文档ID
+     * 按文档 ID 删除 Milvus 向量：文档删除/增量重解析时的向量级联清理入口。
+     * 与 MySQL 删除配套，保证检索层不再召回已删除文档的内容。
+     * 【设计要点】按非主键字段删除：expr 布尔表达式 "document_id in [x]"，语法与官方 delete 文档一致
+     * 【常见问题】如何确认删除生效？——v1 返回 R&lt;MutationResult&gt;，getDeleteCnt() 应大于 0，防止旧向量残留；
+     *   v2 则是 DeleteReq → DeleteResp（io.milvus.v2...response.DeleteResp），两套 API 勿混用；
+     *   若担心非主键字段删除的兼容性，兜底可先查 MySQL 拿 chunkIds，再按主键 "id in [...]" 删除
      */
     public void deleteByDocumentId(Long documentId) {
-        // ============================================================
-        // TODO 1-1b（⭐ 难度）：Milvus 按字段删除
-        //
-        // 【思路提示】
-        //   DeleteParam 构造 → milvusServiceClient.delete(param) → 确认 deleteCount > 0
-        //
-
-        //
-        // 面试考点：
-        // - 布尔表达式语法 in [x]（Milvus 官方 delete 文档示例一致）
-        // - 删除后确认 deleteCount>0，防止旧向量残留（搜到已删除文档）
-        // - v1/v2 API 差异坑：v1 = DeleteParam → R<MutationResult>.getDeleteCnt()；
-        //   v2 = DeleteReq → DeleteResp（io.milvus.v2...response.DeleteResp），别混用
-        // - 兜底方案：若对非主键字段删除有兼容疑虑，可先用 MySQL 查该文档
-        //   的 chunkIds，再按主键 "id in [chunkIds]" 删除
-        // - 异常处理规范：与 search()/insertVectors() 一致——catch(Exception) → log.error
-        //   → throw BusinessException（异常体系见 common/BusinessException + GlobalExceptionHandler）
-        // ============================================================
 
         try {
             DeleteParam param = DeleteParam.newBuilder()
@@ -516,17 +450,12 @@ public class MilvusService {
     }
 
     /**
-     * 混合检索（阶段2 TODO）：稠密向量 + BM25 稀疏向量双路召回 + 分数融合
-     *
-     * 骨架实现：退化为纯稠密检索（保证可运行）。
-     *
-     * @param queryVector 稠密查询向量
-     * @param topK        返回条数
-     * @return 检索结果
+     * 混合检索旧签名重载：只有查询向量、没有查询原文，无法走 BM25 稀疏路，退化为纯稠密检索。
+     * 【设计要点】BM25 的输入是文本：稀疏向量由服务端对原文分词生成，仅有 queryVector 时稀疏路无从发起
+     * 【常见问题】完整双路实现在哪？——见 hybridSearch(String queryText, float[] queryVector, int topK) 重载
      */
     public List<SearchResult> hybridSearch(float[] queryVector, int topK) {
-        // 兼容旧签名：只走稠密路（TODO 2-1 完整实现请看下方
-        // hybridSearch(String queryText, float[] queryVector, int topK)）
+        // 功能：无查询原文只能走稠密路｜要点：BM25 稀疏检索的输入是文本（EmbeddedText）而非向量
         return search(queryVector, topK);
     }
 
@@ -550,15 +479,12 @@ public class MilvusService {
     }
 
     /**
-     * TODO 2-1（路线A）建表：创建含 BM25 Function 的混合检索 collection（v2 API）
-     *
-     * 服务端自动行为：
-     * - content 字段开启 analyzer（分词器）
-     * - 插入数据时，服务端自动按 BM25 Function 把 content 转成 bm25_vector 稀疏向量
-     *   （插入代码无需改！现有 v1 insertVectors 只要 row 里有 content 字段即可）
-     *
-     * 调用方式：项目启动后手动调用一次（或加个接口触发），例如在 DocumentController
-     * 或测试中调用 milvusService.createHybridCollection()
+     * 创建含 BM25 Function 的混合检索 collection（v2 API）：稠密 + 稀疏双路召回的结构基础。
+     * 在 rebuildHybridIndex 索引重建流程中调用，替代无稀疏字段的旧结构。
+     * 【设计要点】BM25 Function：注册 FunctionType.BM25（输入 content、输出 bm25_vector），
+     * 插入时服务端自动对 content 分词生成稀疏向量，现有 v1 insertVectors 无需任何改动
+     * 【常见问题】content 为什么必须 enableAnalyzer？——BM25 分词依赖 analyzer，不开则 Function 失效；
+     *   稀疏向量是什么？——SparseFloatVector，按词项存储非零权重，与稠密语义向量互补
      */
     public void createHybridCollection() {
         try {
@@ -617,8 +543,12 @@ public class MilvusService {
     }
 
     /**
-     * TODO 2-1（路线A）混合检索：稠密（v1）+ 稀疏（v2 BM25）双路召回 + 加权融合
-     *
+     * 混合检索核心实现：稠密（v1）+ 稀疏（v2 BM25）双路召回 + alpha 加权分数融合。
+     * 问答链路的最终召回入口，兼顾语义相似（稠密）与关键词精确匹配（稀疏）。
+     * 【设计要点】加权融合：score = alpha*稠密分 + (1-alpha)*稀疏分（alpha 默认 0.7，偏重语义路），
+     * 按 chunkId 用 Map.merge 累加两路分数，降序取 TopK
+     * 【常见问题】两路分数能直接相加吗？——COSINE 与 BM25 分数量纲不同，加权归一是工程近似，更严谨可用 RRF；
+     *   content 为何只取稠密路？——两路 chunkId 一致，稠密路结果已带 content，免回查 MySQL
      * @param queryText   用户问题原文（稀疏路直接传文本，服务端自动 BM25 分词）
      * @param queryVector 用户问题稠密向量（稠密路用）
      * @param topK        返回条数
@@ -626,7 +556,7 @@ public class MilvusService {
      * @return 融合排序后的检索结果（content 取自稠密路，v1 SearchResult）
      */
     public List<SearchResult> hybridSearch(String queryText, float[] queryVector, int topK) {
-        // 兼容旧签名：不按文档过滤
+        // 功能：委托四参重载，documentIds 传 null 即不过滤
         return hybridSearch(queryText, queryVector, topK, null);
     }
 

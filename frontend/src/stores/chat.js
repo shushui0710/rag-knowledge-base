@@ -6,17 +6,8 @@ import {
   updateSessionTitle as apiUpdateTitle,
 } from '../api/chat'
 
-/**
- * 会话状态管理（Pinia Store）
- *
- * 为什么用 Pinia 而不是组件内 ref？
- *   App.vue 管理侧边栏的会话列表，ChatView.vue 负责发消息和更新标题。
- *   两个组件都需要读写 sessions，如果各自维护 ref 会导致数据不同步。
- *   Pinia 把共享状态提到 Store 层，任何组件都能直接读写同一个数据源。
- *
- * 面试考点：Pinia vs Vuex？
- *   Pinia 是 Vue3 官方推荐，API更简洁（没有mutation），TypeScript支持更好
- */
+// 功能：会话列表全局 Store，App.vue 侧边栏与 ChatView 共享同一数据源｜要点：Pinia 跨组件共享状态（替代组件内重复 ref）
+// 常见问题：Pinia 相比 Vuex 强在哪？—— 无 mutation、API 更简洁、天生 TS 支持、组合式写法灵活
 export const useChatStore = defineStore('chat', {
   state: () => ({
     sessions: [],

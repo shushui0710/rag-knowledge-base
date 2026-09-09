@@ -8,39 +8,23 @@ import org.springframework.web.client.RestTemplate;
 import java.time.Duration;
 
 /**
- * RestTemplate配置类 - 统一创建RestTemplate实例，由Spring容器管理
- *
- * 为什么要用@Bean而不是 new RestTemplate()？
- *
- * 1. 超时控制：裸 new RestTemplate() 没有超时设置，调第三方API时如果对方不响应，
- *    线程会一直阻塞直到Tomcat默认超时（可能几分钟），生产环境这很危险。
- *    通过@Bean统一设置连接超时10s + 读取超时60s。
- *
- * 2. 可测试性：@Bean创建的对象在单元测试时可以用@MockBean替换，
- *    而 new 出来的对象无法被Spring替换，测试时只能用Mockito.mockConstruction（很麻烦）。
- *
- * 3. 统一管理：如果以后需要加拦截器（如请求日志、链路追踪）、统一加Header，
- *    只需要改这一个地方，所有Service自动生效。
- *
- * 面试考点：Spring Bean的生命周期管理 vs 直接new的区别
+ * RestTemplate 配置：以 @Bean 统一管理 RestTemplate 并设置超时。
+ * 【设计要点】@Bean 托管 vs 直接 new：由容器管理可统一超时、便于 @MockBean 测试、可集中加拦截器
+ * 【常见问题】为什么必须设超时？——裸 new 无超时，第三方不响应会一直阻塞线程直至容器超时；连接/读取超时为啥分开？——建连慢与响应慢是两类故障，分别控制
  */
 @Configuration
 public class RestTemplateConfig {
 
     /**
-     * 创建RestTemplate并设置超时时间
-     *
-     * RestTemplateBuilder是Spring Boot提供的构建器，
-     * 比直接 new RestTemplate() 多了自动配置消息转换器、拦截器等能力。
-     *
-     * @param builder Spring Boot自动注入的RestTemplateBuilder
-     * @return 配置好超时的RestTemplate实例
+     * 创建 RestTemplate 并设置超时。
+     * 【设计要点】RestTemplateBuilder：Spring Boot 提供的构建器，已预置消息转换器/拦截器，优于裸 new RestTemplate()
+     * 【常见问题】为何注入 builder 而非 new？——Builder 承接 Boot 自动配置，超时等定制在其上追加，避免遗漏默认能力
      */
     @Bean
     public RestTemplate restTemplate(RestTemplateBuilder builder) {
         return builder
-                .setConnectTimeout(Duration.ofSeconds(10))   // 连接超时：10秒（连不上API服务器就放弃）
-                .setReadTimeout(Duration.ofSeconds(60))      // 读取超时：60秒（AI API生成回答可能较慢）
+                .setConnectTimeout(Duration.ofSeconds(10))   // 功能：连接超时 10s｜要点：连不上立即放弃，释放线程
+                .setReadTimeout(Duration.ofSeconds(60))      // 功能：读取超时 60s｜要点：AI 生成慢，给足时间又封顶
                 .build();
     }
 }

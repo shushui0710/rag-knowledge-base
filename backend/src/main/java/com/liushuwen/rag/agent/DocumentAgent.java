@@ -19,10 +19,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 文档问答 Agent（阶段4）——专注 RAG 检索问答
- *
- * 已接入阶段2检索链：查询改写 → 混合检索 → Rerank（与 ChatServiceImpl 一致）；
- * 检索层按当前用户文档隔离；阶段4长期记忆：召回注入 + 高质量问答对回存（与 ChatServiceImpl 一致）。
+ * 文档问答 Agent：专注 RAG 检索问答，复用查询改写→混合检索→Rerank 检索链，并接入长期记忆。
+ * 【设计要点】检索增强生成（RAG）：改写降歧 + 混合检索召回 + Rerank 精排，提升答案相关性
+ * 【常见问题】长期记忆如何回存？——topScore≥0.6 的高质量问答对回存，跨会话按用户隔离召回
  */
 @Slf4j
 @Component
@@ -32,13 +31,13 @@ public class DocumentAgent implements Agent {
     private final EmbeddingService embeddingService;
     private final MilvusService milvusService;
     private final LlmService llmService;
-    /** 阶段2：查询改写 + Rerank（与 ChatServiceImpl 检索链一致） */
+    /** 查询改写 + Rerank（与 ChatServiceImpl 检索链一致，复用成熟链路） */
     private final QueryRewriterService queryRewriterService;
     private final RerankService rerankService;
     private final RagProperties ragProperties;
     /** 检索层用户隔离 */
     private final DocumentMapper documentMapper;
-    /** 阶段4：长期记忆 */
+    /** 长期记忆：跨会话召回与回存 */
     private final MemoryService memoryService;
 
     /** 记忆入库质量门槛（与 ChatServiceImpl 保持一致） */
@@ -51,9 +50,8 @@ public class DocumentAgent implements Agent {
 
     @Override
     public String execute(String task, List<Map<String, Object>> history) {
-        // 参数说明：history 是会话历史（多轮记忆）；
-        // 跨会话长期记忆走 MemoryService.recall()（按用户隔离），本轮历史可注入 Prompt
-        // 阶段2 检索链（✅ 已实现）：改写 → 混合检索 → Rerank，与 ChatServiceImpl 一致
+        // 功能：本轮 history 多轮记忆 + 跨会话长期记忆 recall（按用户隔离）｜要点：双入口记忆设计
+        // 常见问题：为什么分两轮历史？→ 当前轮多轮上下文 + 跨会话长期记忆，召回注入 Prompt 增强连贯性
         List<float[]> vectors = embeddingService.embed(List.of(task));
         if (vectors == null || vectors.isEmpty()) {
             return "文档向量化失败，请稍后重试。";
@@ -70,7 +68,7 @@ public class DocumentAgent implements Agent {
                     .stream().map(Document::getId).toList();
         }
 
-        // 阶段4：长期记忆召回（旁路，失败返回空列表）
+        // 长期记忆召回（旁路设计，失败返回空列表，不影响主链路）
         List<String> memories = memoryService.recall(userId, task);
 
         String rewriteQuery = queryRewriterService.rewrite(task);
@@ -98,7 +96,7 @@ public class DocumentAgent implements Agent {
                 + "用户问题：" + task;
         String answer = llmService.chat(prompt);
 
-        // 阶段4：高质量问答对回存长期记忆（与 ChatServiceImpl 同一质量门槛）
+        // 高质量问答对回存长期记忆（topScore≥门槛才存，与 ChatServiceImpl 同一质量线）
         float topScore = results.stream()
                 .map(MilvusService.SearchResult::getScore)
                 .max(Float::compare).orElse(0f);

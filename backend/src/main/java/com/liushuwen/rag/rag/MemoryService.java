@@ -3,19 +3,14 @@ package com.liushuwen.rag.rag;
 import java.util.List;
 
 /**
- * 长期记忆服务（阶段4）
- *
- * 把"高质量问答对"向量化存进 Milvus（qa_memory collection），
- * 新问题进来先检索历史问答，命中则作为记忆注入 Prompt。
- *
- * 面试考点：
- * - 为什么需要长期记忆？跨会话复用，让 Agent "记得"上次答过什么
- * - 记忆污染的防治：入库前质量筛选 + 召回分数阈值 + 时间衰减
+ * 长期记忆服务：把问答对按用户隔离存入 qa_memory 向量集合，跨会话召回历史注入上下文。
+ * 【设计要点】记忆召回-回存闭环：读时相似度过滤、写时按质量门槛防噪声入库，避免"记忆污染"
+ * 【常见问题】为什么不能把所有问答都存？——低质量问答入库会越积越差，需回存质量门槛；常见问题：多用户如何隔离？→ 写入带 user_id，召回 expr 过滤，跨用户互不可见
  */
 public interface MemoryService {
 
     /**
-     * 保存一次问答交换到长期记忆
+     * 保存一次问答交换到长期记忆（写入带 user_id，便于按用户隔离）。
      *
      * @param userId   当前用户（记忆按用户隔离）
      * @param question 用户问题
@@ -24,7 +19,7 @@ public interface MemoryService {
     void saveExchange(Long userId, String question, String answer);
 
     /**
-     * 召回与当前问题相关的历史问答（只召回当前用户的记忆）
+     * 召回与当前问题相关的历史问答（仅当前用户、仅超相似度阈值的 Top 片段）。
      *
      * @param userId   当前用户
      * @param question 当前问题

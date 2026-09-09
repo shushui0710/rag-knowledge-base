@@ -19,14 +19,10 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
- * LLM大模型服务 - 调用DeepSeek API生成回答
- *
- * DeepSeek API是OpenAI兼容格式，调用流程和EmbeddingService调用智谱API几乎一样：
- * 1. 构建HTTP请求（Bearer Token认证 + JSON请求体）
- * 2. 发送POST请求
- * 3. 解析JSON响应，提取回答文本
- *
- * 面试考点：调用第三方AI API的标准流程（认证→请求→解析→异常处理）
+ * LLM 调用服务（封装 DeepSeek，OpenAI 兼容 /chat/completions 协议）。
+ * 在 Agentic RAG 链路中提供三种能力：纯问答 chat、带 Function Calling 的 chatWithTools、可定制 system 的 chatWithSystem。
+ * 【设计要点】第三方 AI API 标准调用范式（Bearer 认证 → 构造 messages → RestTemplate 发请求 → POJO/JsonNode 解析 → 异常降级），以及思考模型 messages 协议的字段兼容
+ * 【常见问题】为什么用 LinkedHashMap 构造请求体？——保证 JSON 字段顺序与协议一致（模型参数顺序敏感场景）；为什么 Function Calling 的 assistant 消息必须原样回填？——思维链/工具调用原始字段（reasoning_content/tool_calls）缺失会被 API 拒绝
  */
 @Slf4j
 @Service
@@ -48,46 +44,23 @@ public class LlmService {
     @Value("${llm.deepseek.temperature}")
     private double temperature;
 
-    // 由Spring容器注入（RestTemplateConfig中定义的@Bean + Spring Boot自动配置的ObjectMapper）
+    // 功能：由 Spring 容器注入 RestTemplate 与 ObjectMapper｜要点：@Bean 装配 + Spring Boot 自动配置统一 Jackson（日期/命名策略一致）
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
 
     /**
-     * 调用DeepSeek生成回答
-     *
-     * @param prompt 拼接好的完整提示词（包含上下文+用户问题）
-     * @return 大模型生成的回答文本
+     * 纯问答调用：构造 system+user 双消息的 OpenAI 兼容请求，调 DeepSeek 取回答文本。
+     * 【设计要点】OpenAI 兼容协议形态（model + messages + max_tokens/temperature），RestTemplate 同步调用与 POJO 绑定解析
+     * 【常见问题】为什么 messages 用 List<Map> 而非强类型？——协议字段少且固定，Map 构造最轻；异常如何降级？——catch 后转 BusinessException，不把底层错误暴露给前端
      */
     public String chat(String prompt) {
         try {
-            // 1. 构建请求头
+            // 功能：构造请求头（JSON + Bearer Token 认证）｜要点：HttpHeaders.setBearerAuth 注入 API Key，Content-Type 声明 application/json
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
             headers.setBearerAuth(apiKey);
 
-            // ============================================================
-            // TODO 1（⭐⭐ 难度）：构建DeepSeek API请求体
-            //
-            // DeepSeek API是OpenAI兼容格式，请求体结构：
-            // {
-            //   "model": "deepseek-chat",
-            //   "messages": [
-            //     {"role": "system", "content": "你是一个专业的知识库问答助手..."},
-            //     {"role": "user", "content": "拼接好的prompt"}
-            //   ],
-            //   "max_tokens": 2048,
-            //   "temperature": 0.7
-            // }
-            //
-            // 提示：
-            // - 用 LinkedHashMap 保证JSON字段顺序（你在EmbeddingService用过的技巧）
-            // - messages 是一个 List<Map<String,String>>，包含2个元素：system和user
-            // - system消息内容可以是简单的"你是一个专业的知识库问答助手"
-            // - user消息内容就是传入的prompt参数
-            // - 最后用 objectMapper.writeValueAsString(body) 转成JSON字符串
-            //
-            // 面试考点：OpenAI兼容API的请求体格式（model + messages + 参数）
-            // ============================================================
+            // 功能：构造 OpenAI 兼容请求体（model + messages[system,user] + max_tokens/temperature），用 LinkedHashMap 保序后写 JSON｜要点：LinkedHashMap 保证字段顺序与协议一致；messages 用 Map 列表贴合协议、不引入多余 POJO
             Map<String,Object> body=new LinkedHashMap<>();
             List<Map<String,String>> messages=new ArrayList<>();
             Map<String,String>systemMsg=new LinkedHashMap<>();
@@ -108,37 +81,13 @@ public class LlmService {
 
 
 
-            // 2. 发送HTTP请求
+            // 功能：向 /v1/chat/completions 发 POST 请求｜要点：RestTemplate.exchange 同步调用，HttpEntity 封装请求体+头，String.class 收原始响应
             String apiUrl = baseUrl + "/v1/chat/completions";
             HttpEntity<String> entity = new HttpEntity<>(requestBody, headers);
             ResponseEntity<String> response = restTemplate.exchange(
                     apiUrl, HttpMethod.POST, entity, String.class);
 
-            // ============================================================
-            // TODO 2（⭐⭐ 难度）：解析响应，提取回答文本
-            //
-            // DeepSeek API响应结构：
-            // {
-            //   "id": "chatcmpl-xxx",
-            //   "choices": [
-            //     {
-            //       "index": 0,
-            //       "message": { "role": "assistant", "content": "大模型生成的回答" },
-            //       "finish_reason": "stop"
-            //     }
-            //   ],
-            //   "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
-            // }
-            //
-            // 提示：用POJO绑定（你在EmbeddingService用过的优化方案）
-            // - 定义 DeepSeekResponse 类（@JsonIgnoreProperties(ignoreUnknown = true)）
-            // - 内部有 List<Choice> choices
-            // - Choice 内部有 Message message
-            // - Message 内部有 String content
-            // - 最终取 choices.get(0).getMessage().getContent()
-            //
-            // 面试亮点：和EmbeddingService一样的POJO绑定，不手动遍历JsonNode
-            // ============================================================
+            // 功能：把响应体反序列化为 DeepSeekResponse（@JsonIgnoreProperties 忽略未知字段），取 choices[0].message.content｜要点：POJO 绑定比手动遍历 JsonNode 更稳健，字段缺失由 Jackson 容错；choices 是数组须先 get(0)
             DeepSeekResponse resp = objectMapper.readValue(response.getBody(), DeepSeekResponse.class);
             String answer = resp.getChoices().get(0).getMessage().getContent();
 
@@ -153,11 +102,7 @@ public class LlmService {
         }
     }
 
-    // ============================================================
-    // 在这里定义你的DTO类（参考EmbeddingService的EmbeddingResponse）
-    // 记得加 @Data + @JsonIgnoreProperties(ignoreUnknown = true)
-    // 需要三个类：DeepSeekResponse → Choice → Message
-    // ============================================================
+    // 响应体 POJO：DeepSeekResponse → Choice → Message，统一加 @Data + @JsonIgnoreProperties(ignoreUnknown=true) 容错未知字段
     @Data
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class DeepSeekResponse {
@@ -184,9 +129,7 @@ public class LlmService {
         private String reasoningContent;
     }
 
-    // ============================================================
-    // 阶段3新增：Function Calling 支持（Agentic RAG）
-    // ============================================================
+    // Function Calling（Agentic RAG 工具调用）支持：模型可在回答中返回要执行的工具调用
 
     /**
      * 工具调用（Function Calling）结果 DTO
@@ -211,20 +154,18 @@ public class LlmService {
     }
 
     /**
-     * 带工具定义的对话调用（阶段3 ✅ 已实现：Function Calling）
-     *
-     * @param messages 对话历史（List of Map：{"role":..,"content":..}，ReAct 循环逐轮追加）
-     * @param tools    可用工具列表（转成 OpenAI tools 参数）
-     * @return LlmResponse（ANSWER=最终回答 / TOOL_CALL=需要调用工具）
+     * 带 Function Calling 的对话调用：把工具定义注入 tools 参数，驱动 ReAct 循环逐轮决策（ANSWER 或 TOOL_CALL）。
+     * 【设计要点】OpenAI Function Calling 消息协议：tools 描述工具签名、tool_choice=auto 让模型自选、返回带 tool_calls 的 assistant 消息
+     * 【常见问题】assistant 消息为何必须原样回填？——思考模型的 reasoning_content / tool_calls 原始字段缺失会被 API 拒绝；为什么用 readTree 透传而不用 Java 对象映射？——协议字段非固定，readTree 保序保字段最稳
      */
     public LlmResponse chatWithTools(List<Map<String, Object>> messages, List<Tool> tools) {
         try {
-            // 1. 请求头（与 chat() 一致）
+            // 功能：构造请求头（与 chat() 一致：JSON + Bearer 认证）｜要点：复用同一套 OpenAI 兼容认证头
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
             headers.setBearerAuth(apiKey);
 
-            // 2. 请求体：messages + tools 定义
+            // 功能：构造请求体——messages + tools（type=function + name/description/parameters 的 JSON Schema）｜要点：用 LinkedHashMap 逐字段拼装工具定义，parameters 由 readTree 解析 schema 保结构
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("model", model);                        // deepseek-v4-flash
             body.put("messages", messages);
@@ -234,8 +175,7 @@ public class LlmService {
                 Map<String, Object> fn = new LinkedHashMap<>();
                 fn.put("name", t.name());
                 fn.put("description", t.description());
-                // ⚠️ readTree 抛受检异常 JsonProcessingException——lambda 内无法被外层 try-catch
-                //    捕获，必须就地转成 RuntimeException（外层 catch(Exception) 统一处理）
+                // 功能：解析工具参数 JSON Schema 放入请求体｜要点：readTree 抛受检异常，lambda 内无法被外层 try 捕获，须就地转 RuntimeException 交统一 catch 处理
                 try {
                     fn.put("parameters", objectMapper.readTree(t.parametersJsonSchema()));
                 } catch (Exception ex) {
@@ -247,7 +187,7 @@ public class LlmService {
             body.put("tool_choice", "auto");
             body.put("temperature", 0.3);
 
-            // 3. 发送请求
+            // 功能：向 /v1/chat/completions 发 POST（含 tools）｜要点：RestTemplate.exchange 同步调用，String 收响应后反序列化
             String apiUrl = baseUrl + "/v1/chat/completions";
             HttpEntity<String> entity = new HttpEntity<>(
                     objectMapper.writeValueAsString(body), headers);
@@ -255,18 +195,15 @@ public class LlmService {
                     apiUrl, HttpMethod.POST, entity, String.class);
             DeepSeekResponse resp = objectMapper.readValue(response.getBody(), DeepSeekResponse.class);
 
-            // 4. 解析（⚠️ choices 是数组，先 get(0) 再取 message）
+            // 功能：取 choices[0].message 判断是否有 tool_calls｜要点：choices 是数组须先 get(0)；有 tool_calls 进入工具调用分支，否则直接返回回答
             Message msg = resp.getChoices().get(0).getMessage();
             if (msg.getToolCalls() != null && !msg.getToolCalls().isEmpty()) {
-                // 把模型返回的 assistant 消息【完整原样】保存（含 role/content/reasoning_content/tool_calls），
-                // ReAct 循环后续要原样回填：⚠️ 思考型模型缺 reasoning_content 必报错；
-                // tool_calls 缺 index/type 也会报 "missing field type"（2026-08 验收实测）
-                // ⚠️ 必须从原始 JSON 取（JsonNode→Map 保持 JSON 字段名 reasoning_content/tool_calls；
-                //    convertValue(POJO→Map) 会退化成 Java 字段名 reasoningContent/toolCalls，API 不认）
+                // 功能：把模型返回的 assistant 消息完整原样保存（含 role/content/reasoning_content/tool_calls），供 ReAct 循环回填｜要点：思考模型缺 reasoning_content 必报错、tool_calls 缺 index/type 报 "missing field type"，须从原始 JSON 取
+                // 常见问题：为什么用 readTree→Map 而非 convertValue(POJO→Map)？→ convertValue 会把字段名退化成 Java 的 reasoningContent/toolCalls，API 不认，故必须用 JsonNode 保留原始 JSON 字段名
                 com.fasterxml.jackson.databind.JsonNode rawNode = objectMapper.readTree(response.getBody())
                         .path("choices").get(0).path("message");
                 Map<String, Object> raw = objectMapper.convertValue(rawNode, Map.class);
-                raw.put("type", "message");   // ⚠️ deepseek-v4-flash 要求每条消息带 type 字段
+                raw.put("type", "message");   // 思考模型要求每条消息带 type 字段
                 return LlmResponse.toolCalls(msg.getToolCalls(), raw);
             }
             return LlmResponse.answer(msg.getContent() == null ? "" : msg.getContent());
@@ -308,27 +245,21 @@ public class LlmService {
     }
 
     /**
-     * 带 system 指令的对话生成（阶段2/3/4 共用前置方法）
-     *
-     * 用途：TODO 2-3 查询改写 / TODO 3-4 意图路由 / TODO 4-3 反思评审——
-     * 都需要"自定义 system + 可控 temperature"的 LLM 调用。
-     * 与 chat(prompt) 的区别：chat() 的 system 固定为知识库问答助手，且 temperature 走配置。
-     *
-     * @param system      system 指令（角色设定/输出格式约束）
-     * @param user        用户内容
-     * @param temperature 温度（改写/路由用 0.1~0.2，生成用 0.7）
-     * @return 大模型生成的文本
+     * 可定制 system + temperature 的对话生成，供查询改写/意图路由/反思评审等子任务复用。
+     * 与 chat(prompt) 的区别：chat() 的 system 固定为知识库问答助手、temperature 走配置；本方法二者均可控。
+     * 【设计要点】同一 LLM 封装按"系统提示 + 温度"参数化复用，避免每类子任务重复造 HTTP 调用
+     * 【常见问题】为什么改写/路由用低温度（0.1~0.2）而生成用 0.7？——确定性任务要稳定输出、创意生成才要高随机
      */
     public String chatWithSystem(String system, String user, double temperature) {
         try {
-            // 1. 请求头（与 chat() 一致）
+            // 功能：构造请求头（与 chat() 一致：JSON + Bearer 认证）｜要点：复用同一套 OpenAI 兼容认证头
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
             headers.setBearerAuth(apiKey);
 
-            // 2. 请求体：messages = [system, user]，temperature 参数化
+            // 功能：构造请求体 messages=[system,user]，temperature 参数化（改写/路由用低值）｜要点：用 Map.of 快速拼装 system/user 双消息
             Map<String, Object> body = new LinkedHashMap<>();
-            body.put("model", model);                       // yml 已改 deepseek-v4-flash
+            body.put("model", model);                       // 当前模型 deepseek-v4-flash
             List<Map<String, String>> msgs = new ArrayList<>();
             msgs.add(Map.of("role", "system", "content", system));
             msgs.add(Map.of("role", "user", "content", user));
@@ -336,7 +267,7 @@ public class LlmService {
             body.put("max_tokens", maxTokens);
             body.put("temperature", temperature);
 
-            // 3. 发送 + 解析（复用 chat() 的 POJO 绑定）
+            // 功能：发请求并复用 POJO 绑定取 choices[0].message.content｜要点：DeepSeekResponse 反序列化复用，降低重复代码
             String apiUrl = baseUrl + "/v1/chat/completions";
             HttpEntity<String> entity = new HttpEntity<>(
                     objectMapper.writeValueAsString(body), headers);

@@ -6,10 +6,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 /**
- * 意图路由实现（阶段3 ✅ 已实现：LLM 分类）
- *
- * 链路：LLM 判断用户问题需要的能力（DOCUMENT/STATS/HYBRID），
- * 失败默认回落 DOCUMENT（宁可多检索，别让问题没人答）。
+ * 意图路由实现：调 LLM 做结构化分类，把用户问题映射到 DOCUMENT/STATS/HYBRID 三条链路。
+ * 【设计要点】LLM 结构化输出 + 低温度求稳：temperature=0.1 压低随机性，让分类稳定可复现；解析容错把非法输出降级为 DOCUMENT
+ * 【常见问题】为什么非法输出也归 DOCUMENT？——宁可多检索也不漏答，路由失败兜底 DOCUMENT 保证主流程永远有结果
  */
 @Slf4j
 @Service
@@ -35,7 +34,7 @@ public class RouterServiceImpl implements RouterService {
             }
             return Route.DOCUMENT;
         } catch (Exception e) {
-            // 路由失败默认回落 DOCUMENT，保证可用性
+            // 功能：路由调用失败时兜底返回 DOCUMENT｜要点：旁路降级（fail-safe 保证主流程可用）
             log.warn("路由调用失败，默认回落 DOCUMENT: {}", e.getMessage());
             return Route.DOCUMENT;
         }

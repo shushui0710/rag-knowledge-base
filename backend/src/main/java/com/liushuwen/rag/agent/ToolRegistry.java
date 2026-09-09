@@ -11,15 +11,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
- * 工具注册表（阶段3）
- *
- * Spring 启动时自动收集所有 Tool 类型的 Bean，按 name 索引。
- * AgentExecutor 通过它把 LLM 返回的工具名映射到实际执行器。
- *
- * 面试考点：
- * - 依赖收集：构造器注入 List<Tool>，Spring 会把所有 Tool 实现 Bean 注入进来
- *   ——这就是"策略模式"的 Spring 化实现
- * - 新工具上线只需新增一个 @Component 实现类，注册表自动感知（开闭原则）
+ * 工具注册表：Spring 启动时收集所有 Tool Bean，按 name 建 Map 索引，供 AgentExecutor 按名映射执行器。
+ * 【设计要点】注册表模式 + 依赖收集：构造器注入 List<Tool>，Spring 自动注入全部实现（开闭原则）
+ * 【常见问题】新增一个工具要改注册表吗？——不用，新增 @Component 实现类即自动注册，零侵入扩展
  */
 @Slf4j
 @Component

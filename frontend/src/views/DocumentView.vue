@@ -85,7 +85,7 @@ const documents = ref([])
 const selectedCategory = ref('')
 const uploadCategory = ref('技术文档')
 
-// el-upload 需要的配置
+// 功能：el-upload 的 action 与动态 headers 配置（手动注入 Bearer token）｜要点：el-upload 自定义上传 + 鉴权
 const uploadUrl = '/api/document/upload'
 const uploadHeaders = computed(() => {
   const token = localStorage.getItem('token')

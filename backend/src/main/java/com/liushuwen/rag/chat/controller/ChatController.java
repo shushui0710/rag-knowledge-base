@@ -11,6 +11,12 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 
+/**
+ * 智能问答 REST 控制器，承接前端问答与会话管理请求。
+ * 在链路中处于入口层：DTO 接收与字段校验、JWT 用户隔离（userId 取自 ThreadLocal），再委托 ChatService。
+ * 【设计要点】@RequestBody DTO 绑定与字段校验、会话增删改查的 REST 语义、基于 ThreadLocal 的用户隔离防越权
+ * 【常见问题】为什么提问用 DTO 而非裸 String？——String 只能接原文无法按字段校验，DTO 走 Jackson 反序列化可做空值/格式校验；userId 从哪来？——JWT 拦截器解析后存入 UserContext（ThreadLocal），全链路可拿
+ */
 @Tag(name = "智能问答")
 @RestController
 @RequestMapping("/api/chat")
@@ -31,18 +37,22 @@ public class ChatController {
         return Result.success(chatService.listSessions());
     }
 
+    /**
+     * 问答入口：DTO 接收提问 → 空值校验 → 委托 ChatService.ask 执行 RAG 链路。
+     * 【设计要点】@RequestBody DTO 绑定与字段校验、入口层只做参数合法性，业务逻辑沉降到 Service
+     * 【常见问题】为什么用 DTO 而非 @RequestBody String？——DTO 经 Jackson 反序列化可逐字段校验，裸 String 只能拿到原文；会话归属由哪层校验？——Service 内做归属校验，保证任何入口调用都安全
+     */
     @Operation(summary = "发送问题并获取回答")
     @PostMapping("/ask/{sessionId}")
     public Result<ChatMessage> ask(@PathVariable Long sessionId, @RequestBody AskRequest req) {
-        // 验收修复：空问题直接 400（之前用 @RequestBody String 接整个 JSON 无法校验，
-        //   且 /api/auth/me 类接口也存在同类问题；DTO 化后可按字段校验）
+        // 功能：空问题直接返回 400，DTO 接收 JSON 才能按字段校验｜要点：@RequestBody 绑定原理（String 只能接原文，DTO 走 Jackson 反序列化）
         if (req == null || req.getQuestion() == null || req.getQuestion().isBlank()) {
             return Result.error(400, "问题不能为空");
         }
         return Result.success(chatService.ask(sessionId, req.getQuestion()));
     }
 
-    /** 提问请求体（DTO 化，2026-08 验收修复：String 裸 JSON 无法做字段校验） */
+    /** 提问请求体 DTO：以对象收 JSON，借助 Jackson 反序列化按字段校验（裸 String 无法做字段级校验） */
     @lombok.Data
     public static class AskRequest {
         private String question;

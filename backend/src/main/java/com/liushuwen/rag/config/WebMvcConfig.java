@@ -6,25 +6,9 @@ import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
 /**
- * Web MVC 配置 - 注册 JWT 拦截器
- *
- * 拦截规则：
- *   /api/**          → 拦截（需要认证）
- *   /api/auth/**     → 排除（登录注册不需要token）
- *   /doc.html        → 排除（Knife4j 接口文档页面）
- *   /webjars/**      → 排除（Knife4j 静态资源）
- *   /v3/api-docs/**  → 排除（OpenAPI 规范文档）
- *
- * 面试考点：
- *   Q: WebMvcConfigurer 和 @Bean CorsFilter 的区别？
- *   A: WebMvcConfigurer 是 Spring MVC 配置回调，用于注册拦截器、视图解析器等。
- *      CorsFilter 是 Servlet Filter，在 DispatcherServlet 之前执行。
- *      两者不冲突，各管各的层。
- *
- *   Q: 拦截器(Interceptor)和过滤器(Filter)的区别？
- *   A: Filter 在 Servlet 容器层，Interceptor 在 Spring MVC 层。
- *      Interceptor 可以访问 Controller 方法信息（handler参数），Filter 不能。
- *      执行顺序：Filter → DispatcherServlet → Interceptor → Controller
+ * Web MVC 配置：注册 JWT 拦截器并声明拦截/排除路径。
+ * 【设计要点】拦截器 vs 过滤器：Interceptor 在 Spring MVC 层（能拿到 handler 方法信息），Filter 在 Servlet 容器层；执行顺序 Filter→DispatcherServlet→Interceptor→Controller
+ * 【常见问题】排除路径为何要精确？——错误排除会漏过鉴权（如把 /api/auth/me 也放行），须逐个列清免认证路径
  */
 @Configuration
 @RequiredArgsConstructor
@@ -35,10 +19,9 @@ public class WebMvcConfig implements WebMvcConfigurer {
     @Override
     public void addInterceptors(InterceptorRegistry registry) {
         registry.addInterceptor(jwtInterceptor)
-                .addPathPatterns("/api/**")           // 拦截所有 /api 开头的请求
-                .excludePathPatterns(                  // 排除不需要认证的路径
-                        // ⚠️ 验收修复：原来排除 "/api/auth/**" 把 /api/auth/me 也放行了，
-                        //   导致 me 拿不到 UserContext 恒报"用户未登录"。改为精确排除 login/register
+                .addPathPatterns("/api/**")           // 功能：拦截所有 /api 请求｜要点：统一鉴权入口
+                .excludePathPatterns(                  // 功能：列出免认证路径｜要点：错误排除会漏过鉴权
+                        // 常见问题：为何精确排除而非 "/api/auth/**"？→ 否则连 /api/auth/me 一并放行，导致拿不到 userId 恒报未登录
                         "/api/auth/login",             // 登录（免认证）
                         "/api/auth/register",          // 注册（免认证）
                         "/doc.html",                   // Knife4j 文档页面

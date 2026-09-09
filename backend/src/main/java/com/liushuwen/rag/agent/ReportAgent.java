@@ -11,9 +11,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 报告生成 Agent（阶段4 ✅ 已实现）
- *
- * 链路：RAG 检索主题片段 → "报告结构" Prompt（引言/现状/问题/建议）→ LLM 生成。
+ * 报告生成 Agent：RAG 检索主题片段后，按"引言/现状/问题/建议"结构由 LLM 生成 Markdown 报告。
+ * 【设计要点】生成式工具：RAG 检索 → 结构化 Prompt 约束输出 → LLM 生成，保证报告有据可依
+ * 【常见问题】为什么报告要带结构 Prompt？——约束 LLM 输出格式，避免跑题、保证可阅读性
  */
 @Slf4j
 @Component

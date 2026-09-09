@@ -27,16 +27,10 @@ import com.liushuwen.rag.config.RagProperties;
 import java.util.List;
 
 /**
- * 智能问答服务实现 - RAG在线流程的核心
- *
- * 在线流程：用户提问 → 向量检索 → 拼接Prompt → 大模型生成 → 答案+来源
- *
- * 跨模块调用说明：
- * - EmbeddingService（document模块）：把用户问题转成向量
- * - MilvusService（document模块）：向量搜索相关文档块
- * - LlmService（chat模块）：调用DeepSeek生成回答
- *
- * 面试考点：RAG在线流程编排 — 为什么是这个顺序，每一步的作用
+ * RAG 在线问答链路编排服务（核心难点类）。
+ * 在整条链路中处于"召回 → 精排 → 生成"的串联中枢，把检索、记忆、模型能力编排成一次问答。
+ * 【设计要点】RAG 在线链路编排：每环节为何这样排布（检索前先改写、精排后再过滤、生成前先做会话归属校验）
+ * 【常见问题】各环节如何降级？——改写失败用原句、检索/记忆异常静默、Rerank 失败退回原分数；saveExchange 为何设分数门槛？——检索最高分 ≥ 0.6 才存长期记忆，防低质回答污染记忆库
  */
 @Slf4j
 @Service
@@ -49,16 +43,16 @@ public class ChatServiceImpl implements ChatService {
     private final MilvusService milvusService;
     private final LlmService llmService;
     private final RagProperties ragProperties;
-    /** 阶段2：查询改写（口语 → 检索词） */
+    /** 查询改写服务（口语化提问 → 检索友好词），改写失败内部兜底回退原句 */
     private final QueryRewriterService queryRewriterService;
-    /** 阶段2：Rerank 精排（召回 → 精排） */
+    /** Rerank 精排服务（召回候选 → 精排 TopN），API 失败自动降级按原分数排序 */
     private final RerankService rerankService;
-    /** 阶段4：长期记忆（旁路增强：召回历史问答 + 保存高质量问答对） */
+    /** 长期记忆服务（旁路增强：召回历史问答 + 保存高质量问答对，失败静默） */
     private final MemoryService memoryService;
-    /** 检索层用户隔离：查出当前用户已向量化文档的 ID 列表 */
+    /** 检索层用户隔离：查出当前用户已向量化文档的 ID 列表，传给 Milvus expr 过滤 */
     private final DocumentMapper documentMapper;
 
-    /** 记忆入库质量门槛：检索最高分达到该值才把问答对存入长期记忆（防低质记忆污染） */
+    /** 记忆入库质量门槛（0.6）：检索最高分 ≥ 该值才存问答对，防低质/兜底回答污染长期记忆库 */
     private static final float MEMORY_SAVE_MIN_SCORE = 0.6f;
 
     @Value("${rag.top-k}")
@@ -71,19 +65,7 @@ public class ChatServiceImpl implements ChatService {
     public ChatSession createSession() {
         ChatSession session = new ChatSession();
         session.setTitle("新对话");
-        // ============================================================
-        // TODO 6（⭐ 难度）：设置当前用户ID
-        //
-        // 当前代码：session 没有设置 userId（userId 为 null）
-        // 应该改为：从 UserContext 获取当前登录用户的ID
-        //
-        // 提示：
-        //   session.setUserId(UserContext.getUserId());
-        //
-        // 面试考点：
-        //   - 会话必须关联用户，否则无法实现数据隔离
-        // ============================================================
-        // TODO 6: 在这里添加 session.setUserId(UserContext.getUserId());
+        // 功能：创建会话时把当前登录用户 ID 写入 session，实现会话归属与数据隔离｜要点：JWT 解析出的 userId 经 ThreadLocal 注入 UserContext，避免越权访问他人会话
         session.setUserId(UserContext.getUserId());
         chatSessionMapper.insert(session);
         return session;
@@ -91,45 +73,24 @@ public class ChatServiceImpl implements ChatService {
 
     @Override
     public List<ChatSession> listSessions() {
-        // ============================================================
-        // TODO 7（⭐ 难度）：按当前用户ID过滤会话列表
-        //
-        // 当前代码：return chatSessionMapper.selectList(null);  ← 查所有人的会话！
-        // 应该改为：用 LambdaQueryWrapper 按 userId 过滤
-        //
-        // 提示：
-        //   LambdaQueryWrapper<ChatSession> wrapper = new LambdaQueryWrapper<>();
-        //   wrapper.eq(ChatSession::getUserId, UserContext.getUserId())
-        //          .orderByDesc(ChatSession::getUpdateTime);
-        //   return chatSessionMapper.selectList(wrapper);
-        //
-        // 面试考点：
-        //   - 为什么按 updateTime 排序？最近更新的会话排最前
-        // ============================================================
+        // 功能：按当前用户 ID 过滤会话列表并按更新时间倒序｜要点：多租户数据隔离（MyBatis-Plus LambdaQueryWrapper.eq 拼 WHERE 条件）
         LambdaQueryWrapper<ChatSession> wrapper=new LambdaQueryWrapper<>();
         wrapper.eq(ChatSession::getUserId,UserContext.getUserId())
                 .orderByDesc(ChatSession::getUpdateTime);
 
-        return chatSessionMapper.selectList(wrapper);  // TODO 7: 替换为按 userId 过滤
+        return chatSessionMapper.selectList(wrapper);
     }
 
+    /**
+     * 单次问答主链路：落库提问 → 向量化 → 检索层用户隔离 → 长期记忆召回 → 查询改写 + 混合检索(召回20) → Rerank 精排(5) → minScore 0.35 过滤 → Prompt 拼接 → LLM 生成 → 存 sources/回答/记忆。
+     * 【设计要点】RAG 在线链路编排与逐环节降级：改写失败用原句、检索/记忆异常静默、Rerank 失败退回原分数、空召回走兜底；会话归属校验防越权
+     * 【常见问题】为什么先落库提问再走检索？——即使后续检索/LLM 失败，提问记录也保留，便于排查与续聊；如何防 A 用户检索到 B 用户向量？——Milvus expr 按当前用户文档 ID 列表过滤
+     */
     @Override
     public ChatMessage ask(Long sessionId, String question) {
         log.info("问答请求 - 会话:{}, 问题:{}", sessionId, question);
 
-        // ============================================================
-        // TODO 3（⭐ 难度）：保存用户问题到chat_message
-        //
-        // 提示：
-        //   ChatMessage userMsg = new ChatMessage();
-        //   userMsg.setSessionId(sessionId);
-        //   userMsg.setRole("user");
-        //   userMsg.setContent(question);
-        //   chatMessageMapper.insert(userMsg);
-        //
-        // 面试考点：为什么要先存用户问题？
-        //   即使后续流程失败，用户的问题记录也保留了
-        // ============================================================
+        // 功能：先落库用户提问消息｜要点：失败幂等——即使后续检索/LLM 失败，用户提问记录也保留，便于排查与续聊
         ChatMessage userMsg=new ChatMessage();
         userMsg.setSessionId(sessionId);
         userMsg.setRole("user");
@@ -138,29 +99,11 @@ public class ChatServiceImpl implements ChatService {
 
 
 
-        // ============================================================
-        // TODO 4（⭐⭐ 难度）：将问题向量化 + 检索Top-K
-        //
-        // 步骤1：调用 embeddingService.embed(List.of(question)) 得到向量列表
-        // 步骤2：取第一个向量（因为只有一条文本）：vectors.get(0)
-        // 步骤3：调用 milvusService.search(queryVector, topK) 检索
-        //
-        // 提示：
-        //   List<float[]> vectors = embeddingService.embed(List.of(question));
-        //   float[] queryVector = vectors.get(0);
-        //   List<MilvusService.SearchResult> results = milvusService.search(queryVector, topK);
-        //
-        // 面试考点：为什么用户问题也要向量化？
-        //   Milvus是向量搜索，查询向量和存储向量在同一空间才能比较相似度
-        // ============================================================
+        // 功能：把用户问题转成向量（与库中文档同处一个 embedding 空间）｜要点：向量检索本质是同空间余弦/内积相似度，查询必须向量化才能比对
         List<float[]> vectors=embeddingService.embed(List.of(question));
         float[] queryVector = vectors.get(0);
 
-        // ============================================================
-        // 检索层用户隔离：Milvus 检索按 document_id in [当前用户已向量化文档] 过滤。
-        // 业务层 eq(userId) 只能管 MySQL；向量库必须靠 expr 过滤，
-        // 否则 A 用户的提问可能检索到 B 用户文档的向量（信息泄露）。
-        // ============================================================
+        // 功能：检索层用户隔离——先查出当前用户已向量化文档 ID 列表，作为 Milvus expr 过滤条件｜要点：多租户隔离不能只靠 MySQL 的 eq(userId)，向量库需独立 expr 过滤，否则跨用户向量泄露
         Long userId = UserContext.getUserId();
         List<Long> documentIds = null;
         if (userId != null) {
@@ -171,22 +114,10 @@ public class ChatServiceImpl implements ChatService {
                     .stream().map(Document::getId).toList();
         }
 
-        // ============================================================
-        // 阶段4 长期记忆召回（旁路增强：只召回当前用户的记忆，失败内部返回空列表）
-        // ============================================================
+        // 功能：旁路召回当前用户的长期记忆（只取本用户，异常内部返回空列表，不影响主链路）｜要点：记忆增强属于非阻塞旁路，失败降级为空而非中断
         List<String> memories = memoryService.recall(userId, question);
 
-        // ============================================================
-        // 阶段2 检索链（✅ 已实现）：
-        //   查询改写 → 混合检索（稠密+BM25稀疏，召回 recallTopK=20）→ Rerank 精排 → topN=5
-        //
-        // 说明：
-        // - 改写结果只用于"检索"，回答 Prompt 仍用原问题（queryRewriterService 内部已兜底）
-        // - 混合检索：collection 未重建（无 bm25_vector）时自动降级纯稠密（hybridSearch 内部）
-        // - Rerank：API 失败自动降级按原分数排序（rerankService 内部）
-        // - 参数从 rag.retrieval.* 读（RagProperties）
-        // - documentIds：检索只在当前用户文档内进行（检索层用户隔离）
-        // ============================================================
+        // 功能：检索链编排——查询改写 → 混合检索（稠密+BM25稀疏，召回 recallTopK=20）→ Rerank 精排（topN=5）｜要点：混合检索补语义召回的 lexical 短板；各降级点（无 bm25 退化纯稠密、Rerank 失败退回原分数、改写失败用原句）保证链路不中断
         String rewriteQuery = queryRewriterService.rewrite(question);
         int recallTopK = ragProperties.getRetrieval().getRecallTopK();
         int rerankTopN = ragProperties.getRetrieval().getRerankTopN();
@@ -194,32 +125,7 @@ public class ChatServiceImpl implements ChatService {
                 milvusService.hybridSearch(rewriteQuery, queryVector, recallTopK, documentIds),
                 rerankTopN);
 
-        // ============================================================
-        // TODO 1-2（⭐ 难度）：score 阈值过滤（低分片段不进 Prompt，防幻觉+省钱）
-        //
-        // 【标准答案】完整实现（可直接插入下面这 5 行）
-        //
-        // 前置：给 ChatServiceImpl 增加注入（@RequiredArgsConstructor 自动构造注入）：
-        //   private final RagProperties ragProperties;
-        //   // import com.liushuwen.rag.config.RagProperties;
-        //
-        // 插入代码（在"拼接上下文"之前）：
-        //   double minScore = ragProperties.getAgent().getMinScore();   // yml 默认 0.35
-        //   results.removeIf(h -> h.getScore() < minScore);
-        //   if (results.isEmpty()) {
-        //       ChatMessage fallback = new ChatMessage();
-        //       fallback.setSessionId(sessionId);
-        //       fallback.setRole("assistant");
-        //       fallback.setContent("知识库中没有找到足够相关的内容，请换个问法或先上传相关文档。");
-        //       chatMessageMapper.insert(fallback);
-        //       return fallback;
-        //   }
-        //
-        // 面试考点：
-        // - COSINE 分数 ∈ [-1,1]，中文语义相似度普遍偏低（0.3~0.5 常见），
-        //   阈值要拿你的测试集校准，不要拍脑袋
-        // - 过滤后为空 → 走兜底文案，而不是让 LLM 硬编
-        // ============================================================
+        // 功能：按 minScore 阈值（yml 默认 0.35）过滤低分片段，过滤后为空则走兜底文案直接返回｜要点：COSINE ∈ [-1,1]，中文语义相似度普遍偏低（0.3~0.5 常见），阈值要拿测试集校准；空结果让 LLM 硬编会幻觉，故给兜底而非编造
         double minScore = ragProperties.getAgent().getMinScore();   // yml 默认 0.35
         results.removeIf(h -> h.getScore() < minScore);
         if (results.isEmpty()) {
@@ -233,31 +139,13 @@ public class ChatServiceImpl implements ChatService {
 
 
 
-        // ============================================================
-        // TODO 5（⭐⭐ 难度）：拼接上下文 + 构建Prompt
-        //
-        // 步骤1：把检索到的文本块拼接成一个字符串（用编号格式）
-        //   StringBuilder sb = new StringBuilder();
-        //   for (int i = 0; i < results.size(); i++) {
-        //       sb.append("【参考").append(i + 1).append("】")
-        //         .append(results.get(i).getContent()).append("\n\n");
-        //   }
-        //   String context = sb.toString();
-        //
-        // 步骤2：用promptTemplate拼接最终prompt
-        //   promptTemplate 里有 {context} 和 {question} 两个占位符
-        //   String prompt = promptTemplate.replace("{context}", context)
-        //                                 .replace("{question}", question);
-        //
-        // 面试考点：Prompt工程 — 给大模型明确的上下文和指令，防止幻觉
-        // ============================================================
+        // 功能：拼接检索片段为带编号的 context，再用 promptTemplate 的 {context}/{question} 占位符组装最终 Prompt｜要点：Prompt 工程把结构化上下文喂给模型，约束其"基于参考作答"，降低幻觉
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < results.size(); i++) {
             sb.append("【参考").append(i + 1).append("】")
                     .append(results.get(i).getContent()).append("\n\n");
         }
-        // 阶段4：召回的长期记忆注入 Prompt（标注为历史问答，与文档片段区分；
-        // 召回为空则不注入，Prompt 与原版完全一致）
+        // 功能：把召回的长期记忆以"历史问答记录"标签注入 Prompt，与文档片段区分；为空则不注入，保证 Prompt 与原版一致｜要点：记忆作为旁路增强，仅补充不喧宾夺主
         if (memories != null && !memories.isEmpty()) {
             sb.append("【历史问答记录】\n")
                     .append(String.join("\n---\n", memories)).append("\n\n");
@@ -268,41 +156,7 @@ public class ChatServiceImpl implements ChatService {
 
 
 
-        // ============================================================
-        // TODO 6（⭐⭐ 难度）：调用大模型 + 构建来源 + 保存回答 + 返回
-        //
-        // 步骤1：调用 llmService.chat(prompt) 得到回答
-        //   String answer = llmService.chat(prompt);
-        //
-        // 步骤2：构建sources JSON（用FastJSON，和MilvusService一致）
-        //   JSONArray sourcesArray = new JSONArray();
-        //   for (MilvusService.SearchResult sr : results) {
-        //       JSONObject source = new JSONObject();
-        //       source.put("chunkId", sr.getChunkId());
-        //       source.put("score", sr.getScore());
-        //       String preview = sr.getContent().length() > 100
-        //           ? sr.getContent().substring(0, 100) + "..."
-        //           : sr.getContent();
-        //       source.put("content", preview);
-        //       sourcesArray.add(source);
-        //   }
-        //   String sources = sourcesArray.toJSONString();
-        //
-        // 步骤3：保存助手回答到chat_message
-        //   ChatMessage assistantMsg = new ChatMessage();
-        //   assistantMsg.setSessionId(sessionId);
-        //   assistantMsg.setRole("assistant");
-        //   assistantMsg.setContent(answer);
-        //   assistantMsg.setSources(sources);
-        //   chatMessageMapper.insert(assistantMsg);
-        //
-        // 步骤4：返回助手消息
-        //   return assistantMsg;
-        //
-        // 面试考点：
-        // - 为什么要存sources？—— 可追溯性，用户知道答案从哪来的
-        // - 为什么用FastJSON不用Jackson？—— Milvus SDK依赖FastJSON，项目统一用
-        // ============================================================
+        // 功能：调 LLM 生成回答 → 构建 sources JSON（含 chunkId/score/预览）→ 落库助手消息并返回｜要点：存 sources 实现答案可追溯（用户知来源）；用 FastJSON 与 Milvus SDK 依赖统一，避免双 JSON 库
         String answer=llmService.chat(prompt);
 
         JSONArray sourcesArray = new JSONArray();
@@ -325,9 +179,7 @@ public class ChatServiceImpl implements ChatService {
         assistantMsg.setSources(sources);
         chatMessageMapper.insert(assistantMsg);
 
-        // 阶段4：高质量问答对存入长期记忆（旁路增强，失败只记日志不阻断）。
-        // 质量门槛：检索最高分 ≥ 0.6 才存——只有"答案有可信来源支撑"的问答才值得记忆，
-        // 防止兜底/低相关回答污染记忆库（跨会话复用的前提是记忆本身可靠）
+        // 功能：把本次问答对存入长期记忆（旁路增强，失败只记日志不阻断）｜要点：质量门槛检索最高分 ≥ 0.6（MEMORY_SAVE_MIN_SCORE）才存，确保记忆有可信来源支撑，防低质/兜底回答污染跨会话复用的记忆库
         float topScore = results.stream()
                 .map(MilvusService.SearchResult::getScore)
                 .max(Float::compare).orElse(0f);
@@ -345,20 +197,7 @@ public class ChatServiceImpl implements ChatService {
 
     @Override
     public List<ChatMessage> getHistory(Long sessionId) {
-        // ============================================================
-        // TODO 7（⭐ 难度）：按sessionId查询历史消息
-        //
-        // 当前代码：chatMessageMapper.selectList(null)  ← 查所有会话的消息！
-        // 应该改为：用LambdaQueryWrapper按sessionId过滤，按createTime排序
-        //
-        // 提示：
-        //   LambdaQueryWrapper<ChatMessage> wrapper = new LambdaQueryWrapper<>();
-        //   wrapper.eq(ChatMessage::getSessionId, sessionId)
-        //          .orderByAsc(ChatMessage::getCreateTime);
-        //   return chatMessageMapper.selectList(wrapper);
-        //
-        // 面试考点：LambdaQueryWrapper条件查询 — MyBatis-Plus的核心API
-        // ============================================================
+        // 功能：按 sessionId 过滤历史消息并按创建时间升序｜要点：MyBatis-Plus LambdaQueryWrapper 条件构造，按会话隔离 + 时间排序还原对话顺序
         LambdaQueryWrapper<ChatMessage> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(ChatMessage::getSessionId, sessionId)
                 .orderByAsc(ChatMessage::getCreateTime);
@@ -367,23 +206,7 @@ public class ChatServiceImpl implements ChatService {
 
     @Override
     public void deleteSession(Long sessionId) {
-        // ============================================================
-        // TODO 8（⭐ 难度）：级联删除 — 先删消息，再删会话
-        //
-        // 当前代码：chatMessageMapper.delete(null)  ← 删所有会话的消息！
-        // 应该改为：
-        //   1. 先按sessionId删除该会话的所有消息
-        //   2. 再删除会话本身（逻辑删除）
-        //
-        // 提示：
-        //   LambdaQueryWrapper<ChatMessage> wrapper = new LambdaQueryWrapper<>();
-        //   wrapper.eq(ChatMessage::getSessionId, sessionId);
-        //   chatMessageMapper.delete(wrapper);
-        //   chatSessionMapper.deleteById(sessionId);
-        //
-        // 面试考点：级联删除顺序 — 先删子表（消息）再删父表（会话），
-        //          否则会留下孤儿记录
-        // ============================================================
+        // 功能：级联删除——先删子表（消息）再删父表（会话）｜要点：级联顺序避免孤儿记录；逻辑删除由 MyBatis-Plus 自动改写 SQL 实现软删
         LambdaQueryWrapper<ChatMessage> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(ChatMessage::getSessionId, sessionId);
         chatMessageMapper.delete(wrapper);

@@ -10,24 +10,9 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.HandlerInterceptor;
 
 /**
- * JWT 拦截器 - 拦截所有需要认证的请求
- *
- * 工作流程：
- *   1. preHandle: 请求到达 Controller 之前执行
- *      - 从 Header 提取 Authorization: Bearer <token>
- *      - 解析 token 得到 userId
- *      - 存入 UserContext (ThreadLocal)
- *      - 返回 true 放行，返回 false 拦截
- *   2. afterCompletion: Controller 处理完之后执行
- *      - 清理 UserContext，防止线程池复用导致数据泄漏
- *
- * 面试考点：
- *   Q: HandlerInterceptor 的三个方法？
- *   A: preHandle（Controller前）、postHandle（Controller后视图前）、afterCompletion（完全结束后）
- *
- *   Q: 为什么在 afterCompletion 而不是 postHandle 清理 ThreadLocal？
- *   A: postHandle 在 Controller 抛异常时不会执行，afterCompletion 无论成功失败都执行。
- *      如果在 postHandle 清理，异常情况下 ThreadLocal 不会被清理，导致线程池中下一个请求拿到错误的 userId。
+ * JWT 登录拦截器：校验 token 并把 userId 写入 ThreadLocal（UserContext）。
+ * 【设计要点】拦截器 vs 过滤器：执行时机（DispatcherServlet 前后）与依赖（Servlet 规范 vs Spring 上下文），拦截器能拿到 handler 方法信息
+ * 【常见问题】userId 为何不放方法参数逐层传？——ThreadLocal 对业务代码无侵入，但要防线程池复用脏数据；清理为何放 afterCompletion？——无论成功失败都执行，异常时 postHandle 不跑
  */
 @Slf4j
 @Component
@@ -38,21 +23,21 @@ public class JwtInterceptor implements HandlerInterceptor {
 
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
-        // 1. 从 Header 提取 token
+        // 功能：从 Authorization 头提取 Bearer token｜要点：认证信息传递的标准位置
         String authHeader = request.getHeader("Authorization");
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
             throw new BusinessException("未提供认证令牌，请先登录");
         }
 
-        // 2. 提取 Bearer 后面的 token
+        // 功能：截取 "Bearer " 前缀后的 token 串｜要点：协议约定的令牌前缀
         String token = authHeader.substring(7);
 
-        // 3. 验证 token
+        // 功能：校验 token 签名与过期｜要点：无状态认证——服务端不查库即可鉴权
         if (!jwtUtil.validateToken(token)) {
             throw new BusinessException("认证令牌无效或已过期，请重新登录");
         }
 
-        // 4. 解析 userId，存入 UserContext
+        // 功能：解析 userId 并写入 UserContext(ThreadLocal)｜要点：跨层传参不污染方法签名
         Long userId = jwtUtil.getUserIdFromToken(token);
         if (userId == null) {
             throw new BusinessException("认证令牌解析失败，请重新登录");
@@ -66,7 +51,7 @@ public class JwtInterceptor implements HandlerInterceptor {
     @Override
     public void afterCompletion(HttpServletRequest request, HttpServletResponse response,
                                  Object handler, Exception ex) {
-        // 无论请求成功还是异常，都清理 ThreadLocal
+        // 功能：无论成功或异常都清理 ThreadLocal｜要点：线程池复用须 remove 防脏数据
         UserContext.clear();
     }
 }

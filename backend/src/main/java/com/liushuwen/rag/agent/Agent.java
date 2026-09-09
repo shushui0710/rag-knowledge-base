@@ -4,13 +4,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 多 Agent 抽象（阶段4）
- *
- * 每个专用 Agent 聚焦一类任务，工具少、Prompt 聚焦 → 决策准、成本低。
- *
- * 面试考点：
- * - 多 Agent 相比单 Agent：每 Agent 决策空间小，上下文干净
- * - Spring 会把所有 Agent 实现注入 List<Agent>（策略模式）
+ * 多 Agent 抽象：定义专用 Agent 契约，每 Agent 聚焦一类任务，工具少、Prompt 聚焦，决策准、成本低。
+ * 【设计要点】多 Agent vs 单 Agent：决策空间小、上下文干净；Spring 注入 List<Agent> 收集策略实现
+ * 【常见问题】为什么拆多 Agent 而非一个大 Prompt？——职责隔离降低幻觉与成本，便于路由分派
  */
 public interface Agent {
 

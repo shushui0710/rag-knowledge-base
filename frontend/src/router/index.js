@@ -30,14 +30,8 @@ const router = createRouter({
   routes,
 })
 
-/**
- * 全局路由守卫 - 未登录用户重定向到登录页
- *
- * beforeEach 在每次路由跳转前执行：
- *   - 有 token → 放行
- *   - 无 token + 不是登录页 → 重定向到 /login
- *   - 无 token + 是登录页 → 放行
- */
+// 功能：全局前置守卫 beforeEach 校验登录态，未登录重定向 /login、已登录访问登录页跳回 /chat｜要点：导航守卫 + 白名单机制
+// 常见问题：next() 为何要每个分支显式调用？—— 不调用会卡住导航；Vue Router 4 更推荐直接 return 目标路由名替代 next()
 router.beforeEach((to, from, next) => {
   const token = localStorage.getItem('token')
   if (!token && to.name !== 'login') {

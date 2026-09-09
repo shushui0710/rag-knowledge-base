@@ -14,13 +14,9 @@ import java.nio.file.Files;
 import java.util.List;
 
 /**
- * 检索评估测试（阶段5 ✅ 已实现）
- *
- * 指标：Top5 命中率 = 期望关键词出现在 Top5 片段中的用例数 / 总用例数。
- * 每次改动检索策略（混合检索/改写/重排）后跑一遍，对比命中率。
- *
- * 运行：mvn.cmd test -Dtest=EvalRunnerTest  （或 IDE 里直接跑）
- * 用例文件：docs/eval/questions.json（按需增删，建议 20 题）
+ * 检索评估集成测试：在 Spring 容器中注入各 Service，跑外置用例集计算 Top5 命中率。
+ * 【设计要点】@SpringBootTest 集成测试：真实上下文里验证"改写/重排/混合检索"对召回率的真实影响，而非单测桩
+ * 【常见问题】为什么要先评估再优化？——没有基线指标，任何检索调参都是玄学；本集建议 20 题、用例外置 docs/eval/questions.json，可进 CI 做回归
  */
 @SpringBootTest
 class EvalRunnerTest {
@@ -40,7 +36,7 @@ class EvalRunnerTest {
         }
         int hit = 0;
         for (EvalCase c : cases) {
-            // ⚠️ 单条用例失败不中断评估：catch 记 miss 继续
+            // 功能：单条用例失败不中断整体评估，catch 记 miss 继续｜要点：评估健壮性（一条坏数据不影响全量统计）
             try {
                 if (c.getQuestion() == null || c.getExpectedKeyword() == null) {
                     System.out.println("[SKIP] 用例数据不完整: " + c.getQuestion());
@@ -62,7 +58,7 @@ class EvalRunnerTest {
         System.out.println("Top5 命中率: " + hit + "/" + cases.size());
     }
 
-    /** 读取 docs/eval/questions.json（相对 backend 模块根目录） */
+    // 功能：读取 docs/eval/questions.json 并映射为用例列表｜要点：评估数据与代码解耦（外置便于维护与 CI）
     private List<EvalCase> loadCases() {
         try {
             File f = new File("../docs/eval/questions.json");

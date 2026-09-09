@@ -113,7 +113,7 @@ async function handleLogin() {
     ElMessage.success('登录成功')
     router.push('/chat')
   } catch (e) {
-    // axios 拦截器已处理错误提示
+    // 功能：错误提示已由 Axios 响应拦截器统一弹出，此处无需重复处理｜要点：拦截器集中错误处理
   } finally {
     loading.value = false
   }
@@ -136,7 +136,7 @@ async function handleRegister() {
     loginForm.value.username = registerForm.value.username
     loginForm.value.password = registerForm.value.password
   } catch (e) {
-    // axios 拦截器已处理错误提示
+    // 功能：错误提示已由 Axios 响应拦截器统一弹出，此处无需重复处理｜要点：拦截器集中错误处理
   } finally {
     loading.value = false
   }

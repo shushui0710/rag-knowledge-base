@@ -8,20 +8,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Agent 指标埋点（阶段5-生产化：观测性）
- *
- * 用进程内 ConcurrentHashMap 按天累计指标，暴露给 MetricsController：
- * - queryCount   : 问答次数
- * - totalCostMs  : 累计耗时（毫秒）
- * - llmCalls     : LLM 调用次数
- * - toolCalls    : 工具调用次数
- *
- * 面试考点：
- * - 为什么用 ConcurrentHashMap + AtomicLong？多线程安全累加，无锁
- * - 生产环境会换成 Micrometer + Prometheus，这里演示最小实现
- * - 可观测性三要素：指标（Metrics）、日志（Log）、链路追踪（Trace）
- *
- * ✅ 本文件即【标准答案】（已完整实现，无需再填）：recordQuery/recordLlmCall/recordToolCall/todaySnapshot 全部可用。
+ * Agent 指标埋点：进程内 ConcurrentHashMap 按天累计问答次数、耗时、LLM/工具调用数，供观测接口查询。
+ * 【设计要点】线程安全计数：ConcurrentHashMap + AtomicLong 无锁并发累加，避免 synchronized 开销
+ * 【常见问题】生产环境如何做可观测？——换 Micrometer + Prometheus，指标/日志/链路追踪三件套
  */
 @Slf4j
 @Component

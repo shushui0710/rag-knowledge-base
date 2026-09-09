@@ -14,29 +14,10 @@ import io.minio.GetObjectArgs;
 import java.io.InputStream;
 
 /**
- * MinIO文件存储服务 - 封装MinIO的文件上传/下载等操作
- *
- * 讲解要点：
- * 1. 为什么单独写一个MinioService，而不直接在DocumentServiceImpl里操作MinIO？
- *    - 职责分离：MinioService只管文件存取，DocumentService管文档业务逻辑
- *    - 可复用：以后其他模块也要存文件（比如头像），直接注入MinioService就行
- *    - 好测试：MinioService可以单独测试文件上传逻辑
- *
- * 2. @RequiredArgsConstructor 自动生成构造函数，Spring通过构造函数注入依赖
- *    这行代码相当于帮你写了：
- *    public MinioService(MinioClient minioClient, MinioConfig minioConfig) {
- *        this.minioClient = minioClient;
- *        this.minioConfig = minioConfig;
- *    }
- *    Spring看到构造函数需要MinioClient，就从容器里找MinioClient Bean（MinioConfig里创建的那个）
- *    找到后自动传入——这就是依赖注入的完整闭环！
- *
- * 3. MinIO的概念：
- *    - Bucket（桶） = 文件夹的概念，一个项目一般用一个桶
- *    - Object（对象） = 文件的概念，每个上传的文件是一个Object
- *    - putObject = 上传文件的操作
- *    - bucketExists = 检查桶是否存在的操作
- *    - makeBucket = 创建桶的操作
+ * MinIO 文件存储服务：封装对象上传、下载与桶管理，是文档正文落盘的唯一出口。
+ * 上传链路中由 DocumentServiceImpl 调用，原始文件以对象键形式存入 S3 兼容的对象存储。
+ * 【设计要点】S3 兼容对象存储：MinIO 走 AWS S3 协议，Bucket（桶）+ Object（对象键）两级寻址，可平滑迁移到云上 OSS/COS
+ * 【常见问题】为什么抽独立的 MinioService？——职责分离（存取与业务解耦）、可复用（其他模块直接注入）、可单独 Mock 测试；MinioClient 从哪来？——MinioConfig 里 @Bean 创建，经 @RequiredArgsConstructor 构造器注入 Spring 容器
  */
 @Slf4j
 @Service
@@ -47,34 +28,30 @@ public class MinioService {
     private final MinioConfig minioConfig;
 
     /**
-     * 上传文件到MinIO
-     *
-     * 流程：
-     * 1. 确保存储桶存在（不存在就创建）
-     * 2. 生成唯一的存储路径（用时间戳避免文件名冲突）
-     * 3. 调用MinioClient.putObject上传文件
+     * 上传文件到 MinIO，返回对象键。
+     * 流程：确保桶存在 → putObject 写入 → 异常统一转 BusinessException 向上传播
+     * 【设计要点】MinIO SDK 建造者模式：PutObjectArgs 逐项组装桶/键/流/大小/类型，参数可读且不可变
+     * 【常见问题】stream 的 -1 是什么意思？——partSize=-1 表示大小未知时由 SDK 自动分块上传；失败怎么处理？——统一包装 BusinessException，由全局异常处理器转 Result
      *
      * @param inputStream 文件内容流
-     * @param objectName  存储路径（如 "documents/2024/abc.pdf"）
-     * @param contentType 文件类型（如 "application/pdf"）
-     * @param size        文件大小
-     * @return 实际存储路径
+     * @param objectName  对象键（如 "documents/20260716/abc.pdf"）
+     * @param contentType MIME 类型（如 "application/pdf"）
+     * @param size        文件大小（字节）
+     * @return 对象键（即实际存储路径）
      */
     public String uploadFile(InputStream inputStream, String objectName,
                              String contentType, long size) {
         try {
-            // Step 1: 确保存储桶存在
+            // 功能：先确保桶存在｜要点：惰性初始化，避免首次上传因桶缺失失败
             ensureBucketExists();
 
-            // Step 2: 上传文件到MinIO
-            // PutObjectArgs.builder() 是MinIO客户端提供的构建器模式
-            // 就像点餐一样：你一项一项指定参数（桶名、路径、文件流、大小、类型）
+            // 功能：putObject 写入对象｜要点：SDK 建造者模式组装桶/键/流/大小/类型
             minioClient.putObject(
                     PutObjectArgs.builder()
-                            .bucket(minioConfig.getBucketName())  // 存到哪个桶：rag-documents
-                            .object(objectName)                   // 存的路径：documents/xxx.pdf
-                            .stream(inputStream, size, -1)        // 文件流 + 大小（-1表示未知大小时分块上传）
-                            .contentType(contentType)             // 文件类型：application/pdf
+                            .bucket(minioConfig.getBucketName())  // 目标桶：rag-documents
+                            .object(objectName)                   // 对象键：documents/xxx.pdf
+                            .stream(inputStream, size, -1)        // 文件流 + 大小（-1 表示大小未知时自动分块）
+                            .contentType(contentType)             // MIME 类型：application/pdf
                             .build()
             );
 
@@ -88,13 +65,9 @@ public class MinioService {
     }
 
     /**
-     * 确保存储桶存在 - 如果不存在就创建
-     *
-     * 为什么需要这个？
-     * 第一次启动项目时，MinIO里还没有rag-documents这个桶
-     * 如果直接上传会报错"桶不存在"，所以要先检查并创建
-     *
-     * 这就像你在文件柜里放文件——得先确保抽屉存在，不存在就先造一个
+     * 确保存储桶存在，不存在则创建（首次上传前的惰性初始化）。
+     * 【设计要点】桶是对象存储的顶层命名空间：项目级一个桶即可，桶内靠对象键区分层级
+     * 【常见问题】为什么不放在应用启动时初始化？——惰性创建避免启动强依赖 MinIO 可用性；并发下重复建桶怎么办？——makeBucket 幂等，已存在时抛可识别异常，多实例同时创建也安全
      */
     private void ensureBucketExists() {
         try {
@@ -118,14 +91,12 @@ public class MinioService {
     }
 
     /**
-     * 根据文件名生成MinIO存储路径
-     *
-     * 为什么不直接用原始文件名？
-     * - 两个用户可能上传同名文件 "报告.pdf"，直接用同名会覆盖
-     * - 加时间戳前缀确保唯一性：20260716/报告.pdf
+     * 生成对象键：documents/yyyyMMdd/原始文件名（如 documents/20260716/项目报告.pdf）。
+     * 【设计要点】对象键设计：日期前缀天然按天分区，便于排查与生命周期管理；保留原始文件名便于人工识别
+     * 【常见问题】为什么不直接用原始文件名？——不同用户传同名文件会覆盖，日期前缀只能缓解，强唯一可再加 UUID/用户ID；对象存储里有真目录吗？——没有，"目录"只是键名前缀
      *
      * @param originalFileName 原始文件名
-     * @return MinIO存储路径
+     * @return MinIO 存储路径
      */
     public String generateObjectName(String originalFileName) {
         // 格式：documents/yyyyMMdd/原始文件名
@@ -136,6 +107,11 @@ public class MinioService {
         return "documents/" + datePath + "/" + originalFileName;
     }
 
+    /**
+     * 按对象键读取文件内容为字节数组。
+     * 【设计要点】try-with-resources：getObject 返回的网络流必须关闭，否则连接泄漏；小文件一次 readAllBytes 即可
+     * 【常见问题】大文件怎么办？——应改为返回 InputStream 流式转发，避免整文件载入内存；失败怎么传播？——包装 BusinessException 由全局异常处理器统一处理
+     */
     public byte[] download(String objectName) {
         try (InputStream in = minioClient.getObject(GetObjectArgs.builder()
                 .bucket(minioConfig.getBucketName()).object(objectName).build())) {

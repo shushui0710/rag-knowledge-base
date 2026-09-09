@@ -11,10 +11,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 工具3：报告生成（阶段4 ✅ 已实现）
- *
- * 演示"工具不只是查数据，也可以是生成类动作"。
- * 链路：RAG 检索主题相关片段 → 报告结构 Prompt → LLM 生成 Markdown 报告。
+ * 工具：报告生成，RAG 检索主题片段后由 LLM 按"引言/现状/问题/建议"结构生成 Markdown 报告。
+ * 【设计要点】生成式工具：RAG 检索 → 结构化 Prompt 约束输出 → LLM 生成，结果裁剪后返回
+ * 【常见问题】工具为何失败返回文案而非抛异常？——错误回填 LLM 让其换方式，保 ReAct 循环不中断
  */
 @Slf4j
 @Component
@@ -52,8 +51,7 @@ public class GenerateReportTool implements Tool {
     public String execute(Map<String, Object> arguments) {
         String topic = arguments.get("topic") == null ? "" : String.valueOf(arguments.get("topic"));
 
-        // ⚠️ 工具执行在 Agent 循环内：失败必须"返回错误文案"而不是抛异常
-        //   （错误文案会回填给 LLM 让它换个方式，抛异常会炸掉整个 ReAct 循环）
+        // 功能：工具在 Agent 循环内执行｜要点：失败返回错误文案回填 LLM 使其换方式，抛异常会中断 ReAct 循环
         if (topic.isBlank()) {
             return "缺少报告主题参数 topic。";
         }

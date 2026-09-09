@@ -1,19 +1,8 @@
 import { defineStore } from 'pinia'
 import { login as apiLogin, register as apiRegister, getCurrentUser as apiGetMe } from '../api/auth'
 
-/**
- * 认证状态管理（Pinia Store）
- *
- * 职责：
- *   - 管理 token（存 localStorage）
- *   - 管理 user 信息（存内存，刷新页面时从 localStorage 恢复 token + 重新拉取 user）
- *   - 提供 login / register / logout 方法
- *
- * 为什么 token 存 localStorage 而不是 cookie？
- *   - localStorage 不会被自动发送到服务端，避免 CSRF
- *   - 需要手动在 axios 拦截器里加 Authorization 头，可控性强
- *   - cookie 方案需要配置 httpOnly + Secure，前后端分离时跨域配置更复杂
- */
+// 功能：认证 Store 管理 token（localStorage 持久化）+ user 信息（刷新后凭 token 重新拉取）｜要点：Pinia vs Vuex（去 mutation、TS 友好、组合式）
+// 常见问题：token 为何存 localStorage 而非 cookie？—— 不随请求自动发送，天然规避 CSRF；代价是需手动注入 Authorization 头且要防 XSS
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     token: localStorage.getItem('token') || '',
@@ -43,7 +32,7 @@ export const useAuthStore = defineStore('auth', {
         const res = await apiGetMe()
         this.user = res.data
       } catch (e) {
-        // token 无效，清理
+        // 功能：拉取用户信息失败说明 token 已失效，调用 logout 清理｜要点：token 过期自愈
         this.logout()
       }
     },

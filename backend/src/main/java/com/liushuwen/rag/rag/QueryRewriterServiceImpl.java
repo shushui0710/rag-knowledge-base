@@ -9,10 +9,9 @@ import java.util.Arrays;
 import java.util.stream.Collectors;
 
 /**
- * 查询改写实现（阶段2 ✅ 已实现：LLM 生成检索词）
- *
- * 链路：口语问题 → LLM 改写成 2-3 个关键词短语（| 分隔）→ 空格拼接用于检索。
- * 失败自动降级为原问题，保证问答主流程可用。
+ * 查询改写实现：调 LLM 把口语问题生成 2-3 个关键词短语，拼接后送检索，提升召回。
+ * 【设计要点】LLM 生成检索词 + 失败降级：改写异常时返回原句，主链路无感、可用性不降
+ * 【常见问题】改写会不会引入噪声词反而干扰检索？——用低温度(0.2)控稳定，且降级策略保证最坏情况等价于不改写
  */
 @Slf4j
 @Service
@@ -24,18 +23,18 @@ public class QueryRewriterServiceImpl implements QueryRewriterService {
     @Override
     public String rewrite(String question) {
         try {
-            // 调 LLM 改写（temperature 0.2，输出稳定）
+            // 功能：调 LLM 改写（temperature 0.2 求输出稳定）｜要点：低温度抑制随机性
             String raw = llmService.chatWithSystem(
                     "你是检索关键词改写助手。把用户问题改写成2-3个更适合检索的关键词短语，"
                             + "只输出改写结果，用|分隔，不要解释。",
                     question, 0.2);
-            // 解析：按 | 或中文逗号/顿号分隔 → trim → 去空 → 空格拼接
+            // 功能：按 | 或中文逗号/顿号切分词语 → trim → 去空 → 空格拼接｜要点：健壮解析（兼容多种分隔符）
             return Arrays.stream(raw.split("[|，,；]"))
                     .map(String::trim)
                     .filter(s -> !s.isEmpty())
                     .collect(Collectors.joining(" "));
         } catch (Exception e) {
-            // 改写失败：返回原问题兜底（检索用原问题，效果不至于更差）
+            // 功能：改写失败返回原问题兜底｜要点：fail-soft 降级（对主链路无感）
             log.warn("查询改写失败，返回原问题兜底: {}", e.getMessage());
             return question;
         }
