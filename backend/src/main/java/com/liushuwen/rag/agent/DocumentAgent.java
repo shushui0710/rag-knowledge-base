@@ -44,6 +44,12 @@ public class DocumentAgent implements Agent {
     /** 记忆入库质量门槛（与 ChatServiceImpl 保持一致） */
     private static final float MEMORY_SAVE_MIN_SCORE = 0.6f;
 
+    /** 注入 Prompt 的历史条数上限：只取最近 N 条，控制 token 与噪声 */
+    private static final int HISTORY_MAX_TURNS = 6;
+
+    /** 单条历史内容的截断长度：历史里可能整段塞过很长的回答，超长会挤掉参考资料 */
+    private static final int HISTORY_ITEM_MAX_CHARS = 200;
+
     @Override
     public AgentType type() {
         return AgentType.DOCUMENT;
@@ -96,7 +102,8 @@ public class DocumentAgent implements Agent {
             ctx.append("【历史问答记录】\n")
                     .append(String.join("\n---\n", memories)).append("\n\n");
         }
-        String prompt = "请根据以下参考资料回答用户问题：\n\n" + ctx
+        String prompt = buildHistoryBlock(history)
+                + "请根据以下参考资料回答用户问题：\n\n" + ctx
                 + "用户问题：" + task;
         String answer = llmService.chat(prompt);
 
@@ -108,5 +115,38 @@ public class DocumentAgent implements Agent {
             memoryService.saveExchange(userId, task, answer);
         }
         return AgentResult.of(answer, evidence);
+    }
+
+    /**
+     * 把会话历史拼成 Prompt 前缀块，让多轮追问能指代前文（如"那第二篇呢"）。
+     * 【设计要点】history 为空时返回空串，Prompt 与单轮完全一致——保证不改变无历史调用的既有行为
+     * 【常见问题】为什么不用 LlmService 的多轮 messages 接口？——本 Agent 的 Prompt 是"资料 + 问题"模板，
+     * 历史作为一段可读上下文注入最简单直观；真要严格多轮，应改造 LlmService 支持 system/user/assistant 消息列表
+     *
+     * @param history 会话历史（按时间正序），元素形如 {"role":"user"/"assistant","content":"..."}
+     * @return Prompt 前缀（无历史时为空串）
+     */
+    private String buildHistoryBlock(List<Map<String, Object>> history) {
+        if (history == null || history.isEmpty()) {
+            return "";
+        }
+        StringBuilder block = new StringBuilder();
+        int from = Math.max(0, history.size() - HISTORY_MAX_TURNS);
+        for (int i = from; i < history.size(); i++) {
+            Map<String, Object> msg = history.get(i);
+            if (msg == null || msg.get("content") == null) {
+                continue;
+            }
+            String text = String.valueOf(msg.get("content")).trim();
+            if (text.isEmpty()) {
+                continue;
+            }
+            if (text.length() > HISTORY_ITEM_MAX_CHARS) {
+                text = text.substring(0, HISTORY_ITEM_MAX_CHARS) + "...";
+            }
+            block.append("assistant".equals(msg.get("role")) ? "助手：" : "用户：")
+                    .append(text).append("\n");
+        }
+        return block.length() == 0 ? "" : "【历史对话】\n" + block + "\n";
     }
 }

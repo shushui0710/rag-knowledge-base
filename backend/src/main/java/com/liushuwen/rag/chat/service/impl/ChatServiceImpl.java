@@ -18,13 +18,19 @@ import com.liushuwen.rag.document.service.MilvusService;
 import com.liushuwen.rag.rag.MemoryService;
 import com.liushuwen.rag.rag.QueryRewriterService;
 import com.liushuwen.rag.rag.RerankService;
+import com.liushuwen.rag.agent.AgentMetrics;
+import com.liushuwen.rag.agent.AgentResult;
+import com.liushuwen.rag.agent.OrchestratorAgent;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import com.liushuwen.rag.config.RagProperties;
 
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
@@ -52,9 +58,29 @@ public class ChatServiceImpl implements ChatService {
     private final MemoryService memoryService;
     /** 检索层用户隔离：查出当前用户已向量化文档的 ID 列表，传给 Milvus expr 过滤 */
     private final DocumentMapper documentMapper;
+    /**
+     * 多 Agent 编排（意图路由 + 子 Agent 分派 + 反思评审）。
+     * 【设计要点】对话页「深度思考」模式走这条链路：为什么复用 chat 入口而不是让前端直接调 /api/agent/orchestrate？
+     * 因为直接调裸端点不会落库——回答不进 chat_message 表，会话历史里看不到、刷新即丢，也无法复用会话归属与标题逻辑。
+     */
+    private final OrchestratorAgent orchestratorAgent;
+
+    /**
+     * 指标记账（入口层唯一写者之一，另一个是 AgentController）。
+     * 【设计要点·指标口径】queryCount/avgCostMs 记在"用户入口"，llmCalls/toolCalls 记在"依赖出口"
+     * （LlmService / ToolRegistry.execute）。入口与用户请求一一对应 ⇒ 天然只记一次，
+     * 不会像"记在执行器里"那样因执行器被上层复用而重复计数。详见 AgentMetrics 的「唯一写者口径」。
+     */
+    private final AgentMetrics metrics;
 
     /** 记忆入库质量门槛（0.6）：检索最高分 ≥ 该值才存问答对，防低质/兜底回答污染长期记忆库 */
     private static final float MEMORY_SAVE_MIN_SCORE = 0.6f;
+
+    /** agent 模式注入的历史条数上限：只取最近 N 条消息，控制 token */
+    private static final int AGENT_HISTORY_LIMIT = 10;
+
+    /** 「深度思考」模式的请求参数值 */
+    private static final String MODE_AGENT = "agent";
 
     @Value("${rag.top-k}")
     private int topK;
@@ -83,13 +109,46 @@ public class ChatServiceImpl implements ChatService {
     }
 
     /**
-     * 单次问答主链路：落库提问 → 向量化 → 检索层用户隔离 → 长期记忆召回 → 查询改写 + 混合检索(召回20) → Rerank 精排(5) → minScore 0.35 过滤 → Prompt 拼接 → LLM 生成 → 存 sources/回答/记忆。
-     * 【设计要点】RAG 在线链路编排与逐环节降级：改写失败用原句、检索/记忆异常静默、Rerank 失败退回原分数、空召回走兜底；会话归属校验防越权
-     * 【常见问题】为什么先落库提问再走检索？——即使后续检索/LLM 失败，提问记录也保留，便于排查与续聊；如何防 A 用户检索到 B 用户向量？——Milvus expr 按当前用户文档 ID 列表过滤
+     * 问答入口（默认 RAG 链路）。保留双参签名，供既有调用方与集成用例使用。
      */
     @Override
     public ChatMessage ask(Long sessionId, String question) {
-        log.info("问答请求 - 会话:{}, 问题:{}", sessionId, question);
+        return ask(sessionId, question, null);
+    }
+
+    /**
+     * 带链路模式的问答入口，是对话页「深度思考」开关的落地点。
+     * 【设计要点】用 mode 字段区分链路而不是新增端点：落库、会话历史、标题更新、用户隔离这套逻辑
+     * 全部在 ChatServiceImpl 内且已按会话/用户校验，复用同一入口可让两条链路共享这些约束；
+     * 前端只需多传一个字段，既有 RAG 用例（不传 mode）行为完全不变。
+     * 【常见问题】mode 传错会怎样？——非法值静默回退 RAG 链路，不抛异常：前端拼错一个字段不应把问答打挂
+     * 【常见问题】指标为什么在这里记？——本方法是"用户提问"在对话链路上的唯一入口（两种模式共用），
+     * 在此记账刚好一次；此前在 AgentExecutor 内记账的写法既漏掉 RAG 链路，又因执行器被编排复用而可能重复
+     *
+     * @param mode "agent" = 多 Agent 编排（意图路由 + 子 Agent + 反思评审）；其余/空 = 默认 RAG 链路
+     */
+    @Override
+    public ChatMessage ask(Long sessionId, String question, String mode) {
+        // 功能：入口层记账（问答次数 + 端到端耗时）｜要点：放 try/finally 里——链路异常（如检索/LLM 失败）时
+        // 本次提问同样已被受理，也应统计到，否则指标会低估真实流量
+        long start = System.currentTimeMillis();
+        try {
+            if (MODE_AGENT.equalsIgnoreCase(mode == null ? null : mode.trim())) {
+                return askByAgent(sessionId, question);
+            }
+            return askByRag(sessionId, question);
+        } finally {
+            metrics.recordQuery(System.currentTimeMillis() - start);
+        }
+    }
+
+    /**
+     * 默认 RAG 链路：落库提问 → 向量化 → 检索层用户隔离 → 长期记忆召回 → 查询改写 + 混合检索(召回20) → Rerank 精排(5) → minScore 0.35 过滤 → Prompt 拼接 → LLM 生成 → 存 sources/回答/记忆。
+     * 【设计要点】RAG 在线链路编排与逐环节降级：改写失败用原句、检索/记忆异常静默、Rerank 失败退回原分数、空召回走兜底；会话归属校验防越权
+     * 【常见问题】为什么先落库提问再走检索？——即使后续检索/LLM 失败，提问记录也保留，便于排查与续聊；如何防 A 用户检索到 B 用户向量？——Milvus expr 按当前用户文档 ID 列表过滤
+     */
+    private ChatMessage askByRag(Long sessionId, String question) {
+        log.info("问答请求[RAG] - 会话:{}, 问题:{}", sessionId, question);
 
         // 功能：先落库用户提问消息｜要点：失败幂等——即使后续检索/LLM 失败，用户提问记录也保留，便于排查与续聊
         ChatMessage userMsg=new ChatMessage();
@@ -196,10 +255,82 @@ public class ChatServiceImpl implements ChatService {
 
 
         return assistantMsg;
+    }
 
+    /**
+     * 多 Agent 编排链路（对话页「深度思考」）：取历史 → 编排生成（带依据）→ 回答与依据一并落库。
+     * 【设计要点】与 RAG 链路共享同一套落库与隔离约束，回答照常进 chat_message，刷新后历史可回读
+     * 【常见问题】为什么这里不写长期记忆？——DocumentAgent 内部已按同一质量门槛（topScore≥0.6）回存，
+     * 在这里再存一次会产生重复记忆条目
+     * 【常见问题】为什么依据要落库？——agent 的回答来自检索片段或工具原文，把依据随回答存下来，
+     * 前端「参考来源」才有内容可展示，答案才可追溯（与 RAG 链路 sources 的目的一致）
+     */
+    private ChatMessage askByAgent(Long sessionId, String question) {
+        log.info("问答请求[Agent] - 会话:{}, 问题:{}", sessionId, question);
 
+        // 功能：先取历史再落库提问｜要点：顺序不能反——先落提问会把本轮问题也读进历史，导致 Prompt 里问题出现两次
+        List<Map<String, Object>> history = recentHistory(sessionId);
 
-        
+        ChatMessage userMsg = new ChatMessage();
+        userMsg.setSessionId(sessionId);
+        userMsg.setRole("user");
+        userMsg.setContent(question);
+        chatMessageMapper.insert(userMsg);
+
+        AgentResult result = orchestratorAgent.executeResult(question, history);
+
+        ChatMessage assistantMsg = new ChatMessage();
+        assistantMsg.setSessionId(sessionId);
+        assistantMsg.setRole("assistant");
+        assistantMsg.setContent(result.answer());
+        assistantMsg.setSources(evidenceToSources(result.evidence()));
+        chatMessageMapper.insert(assistantMsg);
+        return assistantMsg;
+    }
+
+    /**
+     * 读取会话最近 N 条消息，转成 Agent 侧约定的 history 结构（按时间正序）。
+     * 【设计要点】只取最近 AGENT_HISTORY_LIMIT 条：多轮上下文要控制 token，越早的轮次对当前提问价值越低
+     */
+    private List<Map<String, Object>> recentHistory(Long sessionId) {
+        List<ChatMessage> all = chatMessageMapper.selectList(new LambdaQueryWrapper<ChatMessage>()
+                .eq(ChatMessage::getSessionId, sessionId)
+                .orderByAsc(ChatMessage::getCreateTime));
+        List<Map<String, Object>> history = new ArrayList<>();
+        int from = Math.max(0, all.size() - AGENT_HISTORY_LIMIT);
+        for (int i = from; i < all.size(); i++) {
+            ChatMessage m = all.get(i);
+            if (m.getContent() == null || m.getContent().isBlank()) {
+                continue;
+            }
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("type", "message");
+            item.put("role", m.getRole());
+            item.put("content", m.getContent());
+            history.add(item);
+        }
+        return history;
+    }
+
+    /**
+     * 把 Agent 依据片段转成前端 sources 结构。
+     * 【设计要点】agent 的依据来自检索片段或工具原文，没有相似度分数，故只给 content 并标 type=evidence，
+     * 不伪造 score（前端据 type 决定渲染「相似度」标签还是「依据片段」标签）
+     */
+    private String evidenceToSources(List<String> evidence) {
+        JSONArray array = new JSONArray();
+        if (evidence != null) {
+            for (String e : evidence) {
+                if (e == null || e.isBlank()) {
+                    continue;
+                }
+                JSONObject source = new JSONObject();
+                source.put("content", e.length() > 100 ? e.substring(0, 100) + "..." : e);
+                source.put("type", "evidence");
+                array.add(source);
+            }
+        }
+        return array.toJSONString();
     }
 
     @Override

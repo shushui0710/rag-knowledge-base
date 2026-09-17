@@ -2,7 +2,6 @@ package com.liushuwen.rag.auth.controller;
 
 import com.liushuwen.rag.auth.entity.User;
 import com.liushuwen.rag.auth.service.UserService;
-import com.liushuwen.rag.common.BusinessException;
 import com.liushuwen.rag.common.Result;
 import com.liushuwen.rag.config.JwtUtil;
 import io.swagger.v3.oas.annotations.Operation;

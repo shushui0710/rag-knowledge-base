@@ -8,9 +8,11 @@ export function createSession() {
   return request.post('/chat/session')
 }
 
-export function askQuestion(sessionId, question) {
+export function askQuestion(sessionId, question, mode) {
   // 后端 @RequestBody AskRequest 期望对象 {"question": "..."}，不能发裸字符串
-  return request.post(`/chat/ask/${sessionId}`, { question })
+  // mode 为 'agent' 时走多 Agent 编排链路（深度思考），不传则后端按默认 RAG 链路处理
+  const body = mode ? { question, mode } : { question }
+  return request.post(`/chat/ask/${sessionId}`, body)
 }
 
 export function getHistory(sessionId) {

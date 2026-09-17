@@ -30,7 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   2. ReAct 单 Agent 问答（真实 LLM + 工具调用）
  *   3. 多 Agent 编排与意图路由（STATS 分支走工具直答）
  *   4. 参数校验与降级文案
- *   5. 指标观测接口与 Agent 计数联动
+ *   5. 指标观测接口与计数口径（入口计数不重不漏：RAG 链 / 编排链 / ReAct 链逐条精确断言）
  *   6. 工具注册表自动收集（开闭原则：新增 @Component 即注册）
  *   7. Agent 证据契约（反思评审可用性的前提）
  *
@@ -47,7 +47,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   - 熔断器：连续 5 次失败后 tryAcquire 返回 false；onSuccess 后失败计数归零
  *   - /api/agent/ask 返回非空回答；空问题被拒（400）
  *   - /api/agent/orchestrate 对统计类问题给出含真实文档数、保留工具计量表述的回答
- *   - /api/metrics/today 结构与 Agent 计数联动正确
+ *   - /api/metrics/today 结构与计数口径正确：入口记 queryCount/avgCostMs，唯一出口记 llmCalls/toolCalls，
+ *     RAG 链（改写 1 次 LLM）、编排 STATS 分支（路由 1 次 LLM + 2 次工具）增量均精确可预测
+ *     （G-08 重复计数 / G-09 覆盖缺口的回归护栏）
  *   - 3 个工具（query_document_stats / query_document_list / generate_report）全部自动注册
  *   - Agent 结果携带非空 evidence（否则反思评审必然误判"无依据"）
  */
@@ -224,28 +226,74 @@ class A5_AgentAndBreakerAcceptanceTest extends AcceptanceSupport {
 
     @Test
     @Order(6)
-    @DisplayName("A5-06 指标接口：结构与 Agent 调用计数联动")
+    @DisplayName("A5-06 指标接口：入口计数不重不漏（RAG 链 / 编排链 / ReAct 链逐条精确断言）")
     void a506_metrics_snapshot_reflects_agent_calls() {
         AuthSession s = newUser();
-        JsonNode before = jsonOf(httpGet("/api/metrics/today", s.token())).path("data");
-        long countBefore = before.path("queryCount").asLong();
 
+        // ---- 0) 结构 + 基线 ----
+        JsonNode before = metricsOf(s.token());
+        assertTrue(before.has("date"), "指标应含 date");
+        assertTrue(before.has("queryCount"), "指标应含 queryCount");
+        assertTrue(before.has("avgCostMs"), "指标应含 avgCostMs");
+        assertTrue(before.has("llmCalls"), "指标应含 llmCalls");
+        assertTrue(before.has("toolCalls"), "指标应含 toolCalls");
+        long q0 = before.path("queryCount").asLong();
+        long l0 = before.path("llmCalls").asLong();
+        long t0 = before.path("toolCalls").asLong();
+
+        // ---- 1) 主 RAG 链路（对话页默认模式，不传 mode）----
+        // 【G-09 回归护栏】修复前埋点只写在 AgentExecutor 里，本链路完全不计数（llmCalls 增量为 0）。
+        // 口径：新用户尚无文档 ⇒ 确定性只发生 1 次 LLM 调用（查询改写），检索为空走兜底文案，
+        // 既无生成调用也无工具调用；端到端耗时则由入口层记录。
+        long sessionId = createSession(s.token());
+        ask(s.token(), sessionId, "这份文档讲了什么？");
+        JsonNode afterRag = metricsOf(s.token());
+        assertEquals(q0 + 1, afterRag.path("queryCount").asLong(),
+                "RAG 链路应使问答次数 +1（修复前该链路 0 计数）");
+        assertEquals(l0 + 1, afterRag.path("llmCalls").asLong(),
+                "RAG 链路应精确计 1 次 LLM 调用（仅查询改写），实际 " + afterRag.path("llmCalls").asLong());
+        assertEquals(t0, afterRag.path("toolCalls").asLong(),
+                "RAG 链路不涉及工具调用，toolCalls 不应变化");
+
+        // ---- 2) 多 Agent 编排链路（STATS 分支）----
+        // 【G-08/G-09 回归护栏】STATS 分支是确定性链路：意图路由 1 次 LLM + StatsAgent 组合调用 2 个工具
+        // （统计 + 列表），工具直答不触发反思重写。精确断言一次锁两件事：
+        //   ① llmCalls 恰好 +1 —— 若沿用修复前"循环内记一次 + recordQuery 按轮数再补一次"的写法，必然翻倍；
+        //   ② toolCalls 恰好 +2 —— 若工具计数只写在 AgentExecutor 里，StatsAgent 直调工具的 2 次要被漏记。
+        // 前提：「有哪些文档」类问题稳定路由到 STATS（与 A5-05 同一前提，路由 prompt 已显式列出该类问法）。
+        ResponseEntity<byte[]> orchestrateResp = httpPostJson("/api/agent/orchestrate",
+                "{\"question\":\"知识库里有哪些文档？\"}", s.token());
+        JsonNode orchestrate = jsonOf(orchestrateResp);
+        assertEquals(200, orchestrate.path("code").asInt(), "编排接口应成功：" + bodyOf(orchestrateResp));
+        JsonNode afterOrch = metricsOf(s.token());
+        assertEquals(q0 + 2, afterOrch.path("queryCount").asLong(),
+                "编排链路口也应计 1 次问答（累计 2）");
+        assertEquals(l0 + 2, afterOrch.path("llmCalls").asLong(),
+                "编排链应精确计 1 次 LLM 调用（仅意图路由；STATS 直答且跳过反思），实际 "
+                        + afterOrch.path("llmCalls").asLong());
+        assertEquals(t0 + 2, afterOrch.path("toolCalls").asLong(),
+                "编排链应精确计 2 次工具调用（统计 + 列表；修复前该链路 0 计数），实际 "
+                        + afterOrch.path("toolCalls").asLong());
+
+        // ---- 3) 单 Agent ReAct 链路 ----
+        // ReAct 轮数由 LLM 自主决策（不可精确断言），但至少 1 轮决策，且问答次数必须 +1
         httpPostJson("/api/agent/ask", "{\"question\":\"知识库里有哪些文档？\"}", s.token());
+        JsonNode afterReAct = metricsOf(s.token());
+        assertEquals(q0 + 3, afterReAct.path("queryCount").asLong(),
+                "/api/agent/ask 应计 1 次问答（累计 3）");
+        assertTrue(afterReAct.path("llmCalls").asLong() >= l0 + 3,
+                "ReAct 每轮都要决策，累计 llmCalls 应 ≥ " + (l0 + 3)
+                        + "，实际 " + afterReAct.path("llmCalls").asLong());
 
-        JsonNode after = jsonOf(httpGet("/api/metrics/today", s.token())).path("data");
-        long countAfter = after.path("queryCount").asLong();
+        step("A5-06 通过：入口计数不重不漏（RAG/编排/ReAct 三链均计入）——queryCount "
+                + q0 + "→" + afterReAct.path("queryCount").asLong()
+                + "，llmCalls " + l0 + "→" + afterReAct.path("llmCalls").asLong()
+                + "，toolCalls " + t0 + "→" + afterReAct.path("toolCalls").asLong());
+    }
 
-        assertTrue(after.has("date"), "指标应含 date");
-        assertTrue(after.has("queryCount"), "指标应含 queryCount");
-        assertTrue(after.has("avgCostMs"), "指标应含 avgCostMs");
-        assertTrue(after.has("llmCalls"), "指标应含 llmCalls");
-        assertTrue(after.has("toolCalls"), "指标应含 toolCalls");
-        assertTrue(countAfter > countBefore,
-                "Agent 调用后 queryCount 应增加，before=" + countBefore + " after=" + countAfter);
-        assertTrue(after.path("llmCalls").asLong() > 0, "Agent 调用应记录 LLM 调用次数");
-        step("A5-06 通过：指标联动正确，queryCount " + countBefore + " → " + countAfter
-                + "，llmCalls=" + after.path("llmCalls").asLong()
-                + "，toolCalls=" + after.path("toolCalls").asLong());
+    /** 读取今日指标 data 节点（供 A5-06 做增量断言） */
+    private JsonNode metricsOf(String token) {
+        return jsonOf(httpGet("/api/metrics/today", token)).path("data");
     }
 
     // ==================== 5. 工具注册表 ====================
@@ -304,5 +352,75 @@ class A5_AgentAndBreakerAcceptanceTest extends AcceptanceSupport {
         } finally {
             com.liushuwen.rag.common.UserContext.clear();   // ThreadLocal 必须清理，防线程复用脏数据
         }
+    }
+
+    // ==================== 7. Agent 接入对话页（mode=agent） ====================
+
+    @Test
+    @Order(10)
+    @DisplayName("A5-10 对话页 agent 模式：mode=agent 经 /api/chat/ask 落库，回答与依据可回读")
+    void a510_agent_mode_via_chat_endpoint_is_persisted() throws Exception {
+        AuthSession s = newUser();
+        long sessionId = createSession(s.token());
+
+        ResponseEntity<byte[]> resp = httpPostJson("/api/chat/ask/" + sessionId,
+                "{\"question\":\"知识库里现在有几篇文档？\",\"mode\":\"agent\"}", s.token());
+        JsonNode node = jsonOf(resp);
+        assertEquals(200, node.path("code").asInt(),
+                "agent 模式提问应成功，实际 HTTP " + resp.getStatusCode() + "：" + bodyOf(resp));
+
+        String answer = node.path("data").path("content").asText();
+        assertFalse(answer.isBlank(), "agent 模式回答不应为空");
+
+        // 依据必须随回答返回并落库：agent 的意见来自检索片段或工具原文，
+        // 只返回文本会让前端「参考来源」区恒为空——等于把 agent 的能力砍掉一半。
+        JsonNode sources = JSON.readTree(node.path("data").path("sources").asText());
+        assertTrue(sources.isArray() && sources.size() > 0,
+                "agent 模式应返回依据片段，实际：" + node.path("data").path("sources").asText());
+        boolean hasEvidenceTag = false;
+        for (JsonNode src : sources) {
+            if ("evidence".equals(src.path("type").asText())) {
+                hasEvidenceTag = true;
+            }
+            assertFalse(src.path("score").isNumber(),
+                    "agent 依据是片段而非打分结果，不应伪造 score 字段：" + src);
+        }
+        assertTrue(hasEvidenceTag, "依据项应带 type=evidence 标记（前端据此渲染「依据片段」而非「相似度」）");
+
+        // 落库与回读——这是"接进产品"与"只挂个裸 API"的分界线：
+        // 直接调 /api/agent/orchestrate 不写 chat_message，会话历史里看不到、刷新即丢。
+        JsonNode history = jsonOf(httpGet("/api/chat/history/" + sessionId, s.token())).path("data");
+        assertTrue(history.isArray(), "历史应为数组");
+        assertEquals(2, history.size(), "一轮问答应落库 2 条消息（提问 + 回答），实际 " + history.size());
+        assertEquals("user", history.get(0).path("role").asText(), "第一条应为用户提问");
+        assertEquals("assistant", history.get(1).path("role").asText(), "第二条应为助手回答");
+        assertEquals(answer, history.get(1).path("content").asText(),
+                "历史里的回答应与本次返回一致（证明真的落库，而非只走内存）");
+
+        step("A5-10 通过：mode=agent 经 chat 入口落库，" + history.size() + " 条历史消息，依据 "
+                + sources.size() + " 条；回答：" + answer.replace("\n", " ").substring(0, Math.min(80, answer.length())));
+    }
+
+    @Test
+    @Order(11)
+    @DisplayName("A5-11 非法 mode 静默回退：前端传错字段不应把问答打挂")
+    void a511_unknown_mode_falls_back_to_rag() {
+        AuthSession s = newUser();
+        long sessionId = createSession(s.token());
+
+        ResponseEntity<byte[]> resp = httpPostJson("/api/chat/ask/" + sessionId,
+                "{\"question\":\"随便问一个知识库里没有的问题\",\"mode\":\"not-a-real-mode\"}", s.token());
+        JsonNode node = jsonOf(resp);
+        assertEquals(200, node.path("code").asInt(),
+                "非法 mode 应回退默认链路而非报错，实际 HTTP " + resp.getStatusCode() + "：" + bodyOf(resp));
+        assertFalse(node.path("data").path("content").asText().isBlank(), "回退后仍应给出回答");
+
+        // 回退链路是 RAG：空知识库必然走兜底文案（同时证明没有误判成 agent 链路）
+        assertTrue(node.path("data").path("content").asText().contains("没有找到足够相关"),
+                "非法 mode 应走默认 RAG 链路（新账号空知识库 → 兜底文案），实际："
+                        + node.path("data").path("content").asText());
+
+        step("A5-11 通过：mode=not-a-real-mode 静默回退 RAG 链路，回答："
+                + node.path("data").path("content").asText().replace("\n", " "));
     }
 }

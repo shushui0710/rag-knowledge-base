@@ -24,7 +24,8 @@ public interface Agent {
 
     enum AgentType {
         DOCUMENT,   // 文档问答（RAG）
-        STATS,      // 数据查询（工具）
-        REPORT      // 报告生成
+        STATS       // 数据查询（工具）
+        // 【为什么没有 REPORT】报告生成能力已由工具 generate_report 承载（ReAct 循环里 LLM 自主调用），
+        // 路由（DOCUMENT/STATS/HYBRID）永远产不出 REPORT，保留该类型只会得到一个"装配了却选不中"的死分支。
     }
 }

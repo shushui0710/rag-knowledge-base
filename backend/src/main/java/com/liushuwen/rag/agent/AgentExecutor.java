@@ -14,6 +14,8 @@ import java.util.Map;
 /**
  * ReAct 循环执行器：驱动"思考→调工具→观察→再思考"直到产出最终答案或达轮数上限。
  * 【设计要点】ReAct 范式与 Function Calling 的关系：FC 是能力、ReAct 是编排循环；maxIterations=5 防死循环
+ * 【设计要点】本类只负责"编排循环"，不承担指标记账：LLM 计数在 LlmService、工具计数在 ToolRegistry.execute、
+ * 问答次数/耗时在入口层（AgentController）。修复前本类既记 LLM 数又按轮数补记，是"重复计数"的根源。
  * 【常见问题】为什么要轮数上限？——防 LLM 重复调用死循环、控制成本与延迟；超限降级返回提示
  */
 @Slf4j
@@ -25,7 +27,6 @@ public class AgentExecutor {
     private final ToolRegistry toolRegistry;
     private final RagProperties ragProperties;
     private final LlmCircuitBreaker circuitBreaker;
-    private final AgentMetrics metrics;
 
     /**
      * 执行一次 Agent 问答：熔断前置 + ReAct 循环 + 兜底。
@@ -36,9 +37,7 @@ public class AgentExecutor {
      * @return 最终回答（或降级/兜底文案）
      */
     public String execute(String userQuestion) {
-        long start = System.currentTimeMillis();
         if (!circuitBreaker.tryAcquire()) {
-            metrics.recordQuery(System.currentTimeMillis() - start, 0, 0);
             return "抱歉，AI 服务暂时不可用，请稍后再试。";
         }
 
@@ -54,15 +53,13 @@ public class AgentExecutor {
             userMsg.put("content", userQuestion);
             messages.add(userMsg);
             int iterations = 0;
-            int toolCount = 0;
 
             while (iterations++ < ragProperties.getAgent().getMaxIterations()) {
+                // 功能：调 LLM 决策（返回 ANSWER 或 TOOL_CALL）｜要点：本类不再记 LLM 计数——LlmService 是唯一出口，在那里记才不漏不重
                 LlmService.LlmResponse resp = llmService.chatWithTools(messages, toolRegistry.all());
-                metrics.recordLlmCall();
 
                 // LLM 认为可以回答了 → 直接返回
                 if (resp.isAnswer()) {
-                    metrics.recordQuery(System.currentTimeMillis() - start, iterations, toolCount);
                     circuitBreaker.onSuccess();
                     return resp.getContent();
                 }
@@ -71,22 +68,17 @@ public class AgentExecutor {
                 messages.add(resp.getRawAssistantMsg());
 
                 // 功能：逐个执行工具，结果以 role=tool 消息回填｜要点：tool_call_id 配对使 LLM 读到执行结果
+                // 【设计要点】工具统一经 toolRegistry.execute 执行（查表+执行+计数唯一出口），本类不再自行记工具数
                 for (LlmService.ToolCall call : resp.getToolCalls()) {
                     String result;
                     try {
-                        Tool tool = toolRegistry.get(call.getFunction().getName());
-                        if (tool == null) {
-                            result = "错误：工具不存在 " + call.getFunction().getName();
-                        } else {
-                            // arguments 是 JSON 字符串，先解析再传给工具
-                            result = tool.execute(JSONObject.parseObject(call.getFunction().getArguments()));
-                        }
+                        // arguments 是 JSON 字符串，先解析再传给工具
+                        result = toolRegistry.execute(call.getFunction().getName(),
+                                JSONObject.parseObject(call.getFunction().getArguments()));
                     } catch (Exception e) {
                         // 功能：工具失败回填错误文案｜要点：让 LLM 自我修正而非中断 ReAct 循环
                         result = "工具执行失败：" + e.getMessage() + "，请调整参数或换一种方式";
                     }
-                    metrics.recordToolCall(call.getFunction().getName());
-                    toolCount++;
                     Map<String, Object> toolMsg = new java.util.LinkedHashMap<>();
                     toolMsg.put("type", "tool");              // 必须带 type 字段（deepseek 兼容层要求）
                     toolMsg.put("role", "tool");
@@ -96,13 +88,11 @@ public class AgentExecutor {
                 }
             }
             // 超过 maxIterations 仍没出答案 → 降级提示
-            metrics.recordQuery(System.currentTimeMillis() - start, iterations, toolCount);
             return "这个问题步骤较多，请拆分成几个小问题再问。";
 
         } catch (Exception e) {
             log.error("[AgentExecutor] 执行失败: {}", e.getMessage(), e);
             circuitBreaker.onFailure();
-            metrics.recordQuery(System.currentTimeMillis() - start, 0, 0);
             return "抱歉，处理你的问题时出了点状况，请稍后重试。";
         }
     }

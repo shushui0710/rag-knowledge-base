@@ -42,13 +42,28 @@ public class OrchestratorAgent {
     }
 
     /**
-     * 多 Agent 编排入口
+     * 多 Agent 编排入口（只取回答文本）。
+     * 【设计要点】保留此签名供 AgentController 等"只要文本"的调用方使用；需要落库带来源时用 executeResult
      *
      * @param question 用户问题
      * @param history  会话历史
      * @return 最终回答
      */
     public String execute(String question, List<Map<String, Object>> history) {
+        return executeResult(question, history).answer();
+    }
+
+    /**
+     * 多 Agent 编排入口（回答 + 依据）。
+     * 【设计要点】对话链路需要把"依据片段"一并落库随回答返回，故不能只给文本——
+     * 这也是把编排接进对话页时必须补的能力：原来只返回 String，落库只能存空 sources，
+     * 前端「参考来源」区就是空的，等于把 agent 的能力阉割掉一半。
+     *
+     * @param question 用户问题
+     * @param history  会话历史（多轮上下文，供子 Agent 注入 Prompt）
+     * @return AgentResult（answer 非空；evidence 为检索到的文档片段或工具原文，可能为空，表示无依据）
+     */
+    public AgentResult executeResult(String question, List<Map<String, Object>> history) {
         Route route = routerService.route(question);
         AgentResult result;
         // 是否为"工具直答"：输出不经过 LLM，是数据库聚合的确定性事实
@@ -86,7 +101,7 @@ public class OrchestratorAgent {
         // 结论：确定性事实不进"评审-重写"闭环，反思只作用于 LLM 生成的回答。
         if (toolGrounded) {
             log.info("[Orchestrator] 路由={} 为工具直答，跳过反思评审（重写只会降质）", route);
-            return result.answer();
+            return result;
         }
         return selfCorrect(question, result);
     }
@@ -104,8 +119,9 @@ public class OrchestratorAgent {
      * 反思与自我修正：评审回答质量，不合格则带评审意见重写，次数硬上限 criticMaxRetry（默认1）。
      * 【设计要点】Critic/自省机制：用独立 LLM 评审主回答，闭环提升质量而非一次性生成
      * 【常见问题】评审失败为何默认放行？——避免评审链路异常阻断主流程，保证可用性优先
+     * 【设计要点】重写只改 answer，evidence 原样透传：依据是"检索到的事实"，不因措辞重写而改变
      */
-    private String selfCorrect(String question, AgentResult result) {
+    private AgentResult selfCorrect(String question, AgentResult result) {
         int maxRetry = ragProperties.getAgent().getCriticMaxRetry();
         String current = result.answer();
         for (int i = 0; i < maxRetry; i++) {
@@ -113,7 +129,7 @@ public class OrchestratorAgent {
             // 传空证据会让任何回答都必判不合格（反思形同虚设还多烧一次 LLM）
             Critique c = criticService.judge(question, current, result.evidence());
             if (c.isPass()) {
-                return current;                     // 合格，直接返回
+                return AgentResult.of(current, result.evidence());   // 合格
             }
             log.info("[Critic] 回答不合格（{}），第{}次重写: {}", c.getReason(), i + 1, question);
             // 带着评审意见重写（把 reason 塞进 system）
@@ -124,10 +140,10 @@ public class OrchestratorAgent {
             // 若直接采用空串，用户会收到 HTTP 200 + 空回答——比"未重写"更糟。故空值即保留原回答，保证可用性优先。
             if (rewritten == null || rewritten.isBlank()) {
                 log.warn("[Critic] 第{}次重写返回空内容，保留原回答", i + 1);
-                return current;
+                return AgentResult.of(current, result.evidence());
             }
             current = rewritten;
         }
-        return current;
+        return AgentResult.of(current, result.evidence());
     }
 }

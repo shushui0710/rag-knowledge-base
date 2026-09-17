@@ -6,7 +6,7 @@
 
 - **混合检索**：Milvus 2.5 内置 BM25 Function，稠密 + 稀疏双路召回，加权融合（alpha=0.7）后经智谱 Rerank 精排（召回 20 → 精排 5），并按最低相似度 0.35 过滤
 - **Agentic 能力**：ReAct 循环（≤5 轮）+ 工具调用 + 意图路由（DOCUMENT / STATS / HYBRID）+ 多 Agent 编排；反思评审（LLM-as-Judge）带证据评审并限 1 次重写，**仅作用于 LLM 生成的回答**（工具直出的确定性事实不重写）
-- **生产化设计**：长期记忆（qa_memory）、三层降级 + LLM 熔断器（5 次/60s，仅 Agent 链路）、指标观测、评估集回归、**58 用例验收套件（A1–A6 + 评估，真实 HTTP 全链路）**
+- **生产化设计**：长期记忆（qa_memory）、三层降级 + LLM 熔断器（5 次/60s，仅 Agent 链路）、指标观测、评估集回归、**60 用例验收套件（A1–A6 + 评估，真实 HTTP 全链路）**
 
 ## 核心功能
 
@@ -21,7 +21,7 @@
 | 指标观测 | 今日问答量、平均耗时、LLM / 工具调用次数 |
 | 数据隔离 | 文档、会话、记忆均按用户隔离；检索支持 documentIds 过滤（含降级路径） |
 | 接口文档 | Knife4j 在线 API 文档（http://localhost:18080/doc.html） |
-| 验收套件 | A1–A6 六个验收域 + 评估回归，共 58 个用例走真实 HTTP（见「测试与验收」） |
+| 验收套件 | A1–A6 六个验收域 + 评估回归，共 60 个用例走真实 HTTP（见「测试与验收」） |
 
 ## 系统架构
 
@@ -76,16 +76,26 @@
 > 对稠密路命中的分块仍是**稠密原分**（仅稀疏路独有的分块才回填融合分）。
 > 这样 `minScore` 阈值始终筛的是量纲一致的 COSINE 语义分，代价是 sources 展示分 ≠ 排序分。
 
-**Agentic 问答**（`AgentController`，两条入口互不相同）：
+**Agentic 问答**（产品入口为对话页「深度思考」开关；`AgentController` 另保留两条裸接口）：
 
 ```
-入口① POST /api/agent/ask  → AgentExecutor  （单 Agent，ReAct 循环）
+★ 产品入口（对话页「深度思考」开关开启时）
+POST /api/chat/ask/{sessionId}  {"question":"...","mode":"agent"}
+   → ChatServiceImpl.askByAgent：读最近 10 条会话历史
+   → OrchestratorAgent.executeResult(question, history)  ← 与入口②同一条编排链路
+   → 回答 + 依据片段（sources[].type = "evidence"）
+   → 按与普通问答**完全相同**的落库路径写入（先存提问 → 存回答），因此历史可回读、指标可跟踪
+   → 前端显示「AI助手 · 多 Agent」标签；依据片段无相似度时按语义降级展示（不伪造 score）
+   → mode 为空 → 走下方 RAG 主链路（行为与改造前完全一致）；mode 非法 → 静默回退 RAG，不把问答打挂
+
+入口① POST /api/agent/ask  → AgentExecutor  （单 Agent，ReAct 循环；裸接口，不落库）
    提问 → [熔断器 tryAcquire] → 思考 → 调工具 → 观察 → 再思考（≤5 轮）
         → 最终回答 / 超轮降级文案 / 熔断兜底文案
 
-入口② POST /api/agent/orchestrate → OrchestratorAgent（多 Agent 编排，主管模式）
+入口② POST /api/agent/orchestrate → OrchestratorAgent（多 Agent 编排，主管模式；裸接口，不落库）
    提问 → [RouterService 意图路由 temperature=0.1]
       ├─ DOCUMENT → DocumentAgent：RAG 检索链（查询改写 → 混合检索 → Rerank → LLM 生成）
+      │               → 支持多轮：注入最近 6 轮历史（单条截断 200 字）
       ├─ STATS    → StatsAgent：工具直答（query_document_stats + query_document_list）
       │               → 跳过反思评审（确定性事实，重写只会降质）
       └─ HYBRID   → StatsAgent + DocumentAgent 组合回答
@@ -94,9 +104,14 @@
       → 不合格则带评审意见 LLM 重写（critic-max-retry=1 硬上限，空重写保留原答案）
 ```
 
-> **注意**：ReAct 循环只在入口①；入口② 的 HYBRID 是"子 Agent 组合"而非 ReAct 循环。
+> **注意**：ReAct 循环只在入口①；产品入口与入口② 的 HYBRID 是"子 Agent 组合"而非 ReAct 循环。
 > 反思评审只对 LLM 生成的回答生效，且必须把 `AgentResult.evidence`（工具输出 / 检索片段）交给评委
 > —— 传空证据会让任何回答都被判"无知识库依据"，触发一次纯 LLM 重写并把准确数字换成模糊复述。
+>
+> **为什么要接产品入口**：入口① / ② 此前只有测试会调用，前端三个页面里没有任何 Agent 入口，
+> 也就意味着「编排、路由直答、反思重写」这些能力用户实际用不上；而且裸接口不落库，问答历史留不下来。
+> 因此没有新增第五个页面，而是把编排链路接到用户已在用的问答入口上（`mode=agent`），
+> 复用同样的落库路径与来源展示——这样既保留了 API 形态，又让能力真正产生用户价值。
 
 > **降级策略**：collection 未重建（无 BM25 字段）时混合检索自动降级为纯稠密（**降级仍保留 documentIds 用户过滤**）；Rerank API 失败时降级按原分数排序；查询改写失败用原句；记忆召回/评审异常静默 fail-open；LLM 连续失败 5 次触发熔断 60 秒（**仅入口①的 ReAct 链路**，主问答链路无熔断保护）。
 
@@ -238,7 +253,13 @@ curl -X POST http://localhost:18080/api/chat/ask/1 \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"question":"产品的保修政策是什么？"}'
 
-# 4. Agentic 问答（ReAct + 工具调用 / 多 Agent 编排）
+# 4. Agentic 问答（对话页「深度思考」开关对应的接口形态）
+#    加 "mode":"agent" 即走多 Agent 编排；不传 mode 则是普通 RAG 问答（行为与改造前一致）
+curl -X POST http://localhost:18080/api/chat/ask/1 \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"question":"目前知识库里有哪些分类的文档？各有多少篇？","mode":"agent"}'
+
+# 4b. 裸接口形态（不走对话页、不落库；供联调与压测使用）
 curl -X POST http://localhost:18080/api/agent/ask \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"question":"目前知识库里有哪些分类的文档？各有多少篇？"}'
@@ -287,7 +308,7 @@ mvn.cmd test -Dtest=A1_AuthAndContractAcceptanceTest,A2_IngestionAcceptanceTest,
 | A2 离线入库 | 12 | 格式白名单/空文件/无扩展名/未登录上传拒绝、上传落库字段、分块算法边界、向量化入库可召回、幂等防重、删除幂等、列表隔离 | 非法输入 400；`chunkCount/embeddingStatus` 与实际一致；向量化后可被检索命中 |
 | A3 检索链路 | 8 | 稠密 TopK/降序/content、BM25 稀疏路词面命中、融合排序差异、`documentIds` 隔离、空集合短路、content 完整性、连续 20 次中文检索稳定性、**降级仍保留隔离** | 分数降序、content 非空；跨用户内容不可见（含降级路径）；Milvus `/healthz` 保持健康 |
 | A4 在线问答全链路 | 8 | 端到端问答+来源引用、sources 结构、空召回兜底（不调 LLM）、历史顺序、会话级联删除、长期记忆闭环（隔离+门槛） | 返回 200 且回答非空；sources 含 chunkId/score/预览；兜底路径不产生 LLM 调用 |
-| A5 Agent 链路与熔断 | 9 | 熔断状态机与降级文案、ReAct 单 Agent（真实工具调用）、编排 STATS 直答、空问题校验、指标联动、工具注册表、**Agent 证据契约** | ReAct 返回非空回答；STATS 回答必须含真实文档数且保留工具计量表述；`AgentResult.evidence` 非空 |
+| A5 Agent 链路与熔断 | 11 | 熔断状态机与降级文案、ReAct 单 Agent（真实工具调用）、编排 STATS 直答、空问题校验、指标联动、工具注册表、**Agent 证据契约**、**对话页 agent 模式落库回读（A5-10）**、**非法 mode 回退 RAG（A5-11）** | ReAct 返回非空回答；STATS 回答必须含真实文档数且保留工具计量表述；`AgentResult.evidence` 非空；`mode=agent` 走对话端点后历史可回读且来源为 `type=evidence` |
 | A6 已知缺口固化 | 7 | 会话归属未校验（读/删）、删文档向量残留、重解析无 HTTP 入口、鉴权返回 400 而非 401、标题引号入库、缓存配置未接线 | **断言"当前真实行为"**：修好即失败，强制同步文档（不计入 P0 门槛） |
 | 评估回归 | 1 | 20 题评估集 Top5 命中率（稠密 vs 混合） | 命中率可复现输出（用于趋势对比，不设硬门槛） |
 
@@ -295,7 +316,7 @@ mvn.cmd test -Dtest=A1_AuthAndContractAcceptanceTest,A2_IngestionAcceptanceTest,
 
 ```
 A1  13/13    A2  12/12    A3   8/8    A4   8/8
-A5   9/9     A6   7/7     Eval 1/1     → Tests run: 58, Failures: 0, Errors: 0
+A5  11/11    A6   7/7     Eval 1/1     → Tests run: 60, Failures: 0, Errors: 0
 ```
 
 关键实测数据：
@@ -318,9 +339,15 @@ A5   9/9     A6   7/7     Eval 1/1     → Tests run: 58, Failures: 0, Errors: 0
 
 | 层 | 规模 | 产物 |
 |----|------|------|
-| 后端集成（JUnit） | 6 域 58 用例，`Tests run: 58, Failures: 0` | 本文件「覆盖范围与通过标准」 |
-| HTTP 全接口黑盒 | 48 用例（A1–A6 实测 + 补充 S-01…S-06），48/48 PASS | `_probe/api_full_suite.mjs` · `api_suite_result.json` |
-| UI 全流程截图 | 27 张（22 条前端交互 + 5 张接口证据页），全程无 5xx | `screenshots/全量功能测试-2026-09-17/` |
+| 后端集成（JUnit） | 6 域 60 用例，`Tests run: 60, Failures: 0` | 本文件「覆盖范围与通过标准」 |
+| HTTP 全接口黑盒 | 50 用例（A1–A6 实测 + 补充 S-01…S-08），50/50 PASS | `_probe/api_full_suite.mjs` · `api_supplement.mjs` · `api_suite_result.json` |
+| UI 全流程截图 | 28 张（23 条前端交互 + 5 张接口证据页），全程无 5xx | `screenshots/全量功能测试-2026-09-17/` |
+
+> 说明：上表「产物」中的 `_probe/` 脚本、`screenshots/` 截图目录与汇总报告 `RAG项目全量功能测试报告-*.html`，均位于**仓库同级的工作区目录**（`../`），因体积较大**未随本仓库提交**；本仓库内保留的是可复跑的验收套件 `backend/src/test/java/com/liushuwen/rag/acceptance/`，按下方 runbook 可重新生成全部证据。
+
+> 三层之外还有一道**交叉核对**（端点清单 × 前端路由 × 前端请求封装三者互查），
+> 它不产出用例，但正是它发现了「Agent 模块实现了却没接进产品」这一问题（详见下方缺陷 G-07）。
+> 用例只能证明「被测对象自身正确」，证明不了「被测对象被产品用到」——这两件事需要不同的检查手段。
 
 **汇总报告**：`RAG项目全量功能测试报告-2026-09-17.html`（自包含单文件，含用例清单、实测明细、截图墙、缺陷复盘）。
 
@@ -349,9 +376,10 @@ A5   9/9     A6   7/7     Eval 1/1     → Tests run: 58, Failures: 0, Errors: 0
 | 混合检索降级时**丢失用户过滤** | catch 分支调用不带 `documentIds` 的 `search()` | 降级统一走 `degradeToDense(...)` 保留隔离 |
 | 文档统计自相矛盾（有内容分块的文档数 > 文档总数） | `QueryDocumentStatsTool` 用 `inSql` 手写原生子查询，MyBatis-Plus 逻辑删除**只改写框架生成的 SQL** → 已删文档的残留分块被计入 | 子查询补 `deleted = 0 and user_id = ...` |
 
-### 第二轮（全量功能黑盒测试）修复的 6 处缺陷（G-01 ~ G-06）
+### 第二轮（全量功能黑盒测试 + 交付前交叉核对）修复的 9 处缺陷（G-01 ~ G-09）
 
-都是在"用例全绿"的前提下**靠跨层对照才暴露**的缺陷：断言只校验了业务码/回答内容，没有校验 HTTP 状态码与语义正确性。
+G-01 ~ G-06 都是在"用例全绿"的前提下**靠跨层对照才暴露**的缺陷：断言只校验了业务码/回答内容，没有校验 HTTP 状态码与语义正确性。
+G-07 更进一步——它不是"行为不对"，而是"功能正确却没接上产品"；G-08 / G-09 则是核查 G-07 时被指标接口反证出来的埋点口径问题（详见本节末尾）。
 
 | # | 严重度 | 缺陷 | 根因 | 修复 |
 |---|--------|------|------|------|
@@ -361,9 +389,61 @@ A5   9/9     A6   7/7     Eval 1/1     → Tests run: 58, Failures: 0, Errors: 0
 | **G-04** | 中 | 超过 50MB 的上传返回 **HTTP 500**「系统内部错误」，把客户端错误报成服务端故障 | `MaxUploadSizeExceededException` 落进 catch-all | `GlobalExceptionHandler` 新增 `MaxUploadSizeExceededException` → **413**、`MultipartException` → **400** |
 | **G-05** | 中 | 不存在的路径返回 **HTTP 500**，把 404 误报成服务端故障 | `@ExceptionHandler(Exception.class)` catch-all 吞掉了 Spring 的 `NoResourceFoundException`（Knife4j 请求 `/favicon.ico` 即触发） | 新增 `NoResourceFoundException` / `NoHandlerFoundException` handler → **404** |
 | **G-06** | 中 | 超限上传时服务端**直接掐断连接**，客户端只拿到不透明网络错误（`Error writing request body to server`），拿不到 413 | Tomcat `max-swallow-size` 默认 2MB < 请求体 → 连接在返回 413 之前就被掐断 | `application.yml` 设 `server.tomcat.max-swallow-size: 64MB`（限量而非无限，避免放任超大 body） |
+| **G-07** | **高（产品级）** | **Agent 模块"实现了但没被产品用上"**：问答主链路 `ChatServiceImpl.ask` 是另一套内联 RAG 实现，编排能力只挂在两个裸 API 上，前端三个页面里 `agent` 出现 **0 次** | 第 8 周交付的 Agent 体系与主问答链路是**两条并行实现**，从未接线；`DocumentAgent` 的 `history` 形参也一直没被使用 | 不新增页面，把编排接进用户已在用的问答入口：`AskRequest` 加 `mode` 字段 → `ChatServiceImpl.askByAgent` 调 `OrchestratorAgent.executeResult()` → 走同样落库路径；`DocumentAgent` 让 history 真正生效（6 轮 / 200 字截断）；前端对话页加「深度思考」开关 |
 
 > **共性（面试可讲的判断力）**：G-01 / G-04 / G-05 都是**"HTTP 状态码语义"**层面的问题——返回体看起来对（业务码正确），但 HTTP 层骗过了网关/监控/第三方集成；G-02 是**"修 bug 修错病因"**（把 DISTINCT 缺失误判为逻辑删除穿透）；G-03 / G-06 是**"层与层之间契约不对齐"**（前端 offer 了什么 vs 后端接受什么，容器 swallow 上限 vs 应用声明的上限）。四类都能在"用例全绿"下存活，说明**只测业务码不测 HTTP 语义**是有盲区的。
+>
+> **G-07 与前六项不同，必须单独说清**：前六项是「某个功能行为不对，一条用例就能复现」；G-07 是「功能本身是对的，但没有任何产品路径会调用它」。
+> 它是靠**交叉核对**（端点清单 × 前端路由 × 前端请求封装三者互查）发现的，不是任何一次测试执行暴露的——
+> 因为三端证据天然共享同一个盲区：API 用例直接打端点、后端用例直接调服务、截图脚本按页面点击，
+> 而页面上**根本没有 Agent 入口**。运行时旁证也很直白：以 `GET /api/metrics/today` 为证人，
+> 连调 3 次 `/api/chat/ask` 指标毫无变化（产品主链路不记指标），调 1 次 `/api/agent/ask` 指标立即变化。
+> **结论**：「用例全绿」只能证明被测对象自身正确，证明不了它被产品使用——这是本次最值得记住的一条方法论。
 
+#### G-08 / G-09：指标埋点口径修正（同一轮交叉核对中一并发现并修掉）
+
+> 这两项是在核查「Agent 是否真的被用上」时，被指标接口**自己反证**出来的：连调 3 次 `/api/chat/ask`（用户真实链路）指标毫无变化。
+> 我一度按"观测层问题、不影响回答正确性"把它们登记为**刻意不修**，随后推翻了这个判断——
+> **G-07 能被发现，靠的正是这个接口"诚实地"暴露了主链路没被埋点**。把一个既漏记、又双计的指标留着，
+> 却继续拿它的读数当对外口径，等于把唯一能发现"模块空转"的报警器自己拆掉。
+
+| # | 问题 | 现象与证据 |
+|---|------|-----------|
+| G-08 | **指标双计**：`AgentExecutor` 循环内已调 `recordLlmCall()`，收尾又调 `recordQuery(cost, iterations, toolCount)`，而后者内部再次 `addAndGet(...)` | 实测 1 次 `POST /api/agent/ask` 指标 **+4 LLM / +2 工具**，真实值是 2 次 LLM / 1 次工具 —— 恰好是 `iterations×2`、`toolCount×2`。盲区成因：A5-06 只断言 `llmCalls > 0` 与 `queryCount` 增长，**不校验数值**——"大于零"这种弱断言能放过"翻倍"这种量级错误 |
+| G-09 | **指标覆盖缺口**：`AgentMetrics` 的唯一写入者是 `AgentExecutor` | 17 个端点里只有 `/api/agent/ask` 被埋点；**产品主链路** `/api/chat/ask`（含 `mode=agent` 走编排的分支）与 `/api/agent/orchestrate` 全都**不计数**；`StatsAgent` 直接调 `tool.execute()` 也绕过了埋点 |
+
+##### 修法：把埋点收敛到「唯一出口」，而不是在各调用点补计数
+
+| 指标 | 唯一写者 | 为什么是它 |
+|------|---------|-----------|
+| `llmCalls` | `LlmService`（3 个方法） | 全站唯一打 `/v1/chat/completions` 的地方。主 RAG 链、单 Agent ReAct、以及编排里的意图路由 / 查询改写 / 反思评审都必然经过它 ⇒ **不重不漏** |
+| `toolCalls` | `ToolRegistry.execute(name, args)`（本轮**新增**的方法） | 全站唯一执行 `Tool` 的地方。`AgentExecutor` 的 ReAct 循环与 `StatsAgent` 的工具直调都收口到这里 ⇒ 修掉"旁路直调不计数"（顺带解除了 `StatsAgent` 对具体 Tool 类型的硬依赖） |
+| `queryCount` / `avgCostMs` | 入口层各记一次（`ChatServiceImpl.ask` 覆盖对话页两种模式；`AgentController` 覆盖两个裸端点） | 入口与"一次用户请求"一一对应，天然只记一次。耗时不再只统计 LLM 段，而是**用户感知的端到端耗时** |
+
+配套的三处结构性调整：
+
+- `AgentMetrics.recordQuery` 的签名**删掉** `llmCalls` / `toolCalls` 两个参数 —— 参数一旦存在，就是在诱导调用方把已知数字再塞一遍（这正是 G-08 的成因）；
+- `AgentExecutor` 不再持有 `AgentMetrics`，回归"只编排循环、不管记账"的纯执行器；
+- 入口记账放进 `try/finally`：即使链路抛异常，本次提问同样已被受理，也应计入流量。
+
+> 一句话原则：**出口唯一 ⇒ 计数不可能漏、也不可能重**。反过来，把计数写进会被上层复用的执行器，就是在制造 G-08 那种隐患。
+
+**回归护栏**：`A5-06` 从"断言 `llmCalls > 0`"升级为**精确增量断言**——实测一次验收会话 `queryCount 2→5`、`llmCalls 3→7`、`toolCalls 3→6`，
+分解正好 = RAG 链 1 次 LLM（仅查询改写）+ 编排 STATS 链 1 次 LLM / 2 次工具（统计 + 列表）+ ReAct 链 2 次 LLM / 1 次工具，无任何倍数偏差。
+数字错了用例立刻变红；后端 60 条、API 50 条同步复测全绿。
+
+### 交付前代码审计：删掉 2 个孤立类 + 4 处冗余 import
+
+功能测试全绿后再做了一遍「孤立代码审计」——统计每个类的被引用次数，并区分「Spring 注解装配」（源码里本就不会出现类名，属正常）与「真无引用」。查出并清掉：
+
+| 清掉的东西 | 为什么是死代码 |
+|-----------|--------------|
+| `agent/ReportAgent.java` + `AgentType.REPORT` | 它 `@Component` 进了 `OrchestratorAgent` 的 `List<Agent>`，但 `RouterService` 只能产出 `DOCUMENT/STATS/HYBRID`、`switch` 里也没有 `case REPORT` ⇒ **装配了却永远选不中**；而它的功能与可达的 `generate_report` 工具几乎逐行相同。报告能力保留在工具里（ReAct 循环中由 LLM 自主调用），删掉重复的那条路 |
+| `eval/EvalRunner.java`（含内部重复的 `EvalCase`） | 无任何引用，`main()` 只往空 `List` 打印「待填充」，真正的 20 题评估早在 `test/eval/EvalRunnerTest` 里跑通；内部 `EvalCase` 还与 test 侧同名类重复定义。删除后 `eval` 包只存在于 test 侧（唯一评估入口） |
+| 4 处未使用 import | `ToolRegistry`（ConcurrentHashMap）、`AuthController`（BusinessException）、`A3_RetrievalAcceptanceTest`（assertEquals）、`AcceptanceSupport`（SourceHttpMessageConverter） |
+
+> 这三项**没有计入上面的缺陷数**：它们不改变任何接口行为，是收尾清理而非功能缺陷。
+> 目的是让「写了却没人调」的代码在仓库里归零——面试官随手点开一个类，都应该能问出「谁在调它」并得到答案。
 
 ## 配置说明
 
@@ -437,7 +517,7 @@ rag-knowledge-base/
 │       │   │   ├── GenerateReportTool.java          工具：报告生成
 │       │   │   ├── AgentExecutor.java               ReAct 循环执行器（≤5 轮）
 │       │   │   ├── Agent.java + AgentResult.java   Agent 契约（回答 + 证据片段）
-│       │   │   ├── DocumentAgent / StatsAgent / ReportAgent   专用子 Agent
+│       │   │   ├── DocumentAgent / StatsAgent       专用子 Agent（DOCUMENT / STATS 两类）
 │       │   │   ├── OrchestratorAgent.java           多 Agent 编排（主管分派 + 反思评审）
 │       │   │   ├── AgentMetrics.java                指标埋点
 │       │   │   └── LlmCircuitBreaker.java           熔断器
@@ -450,23 +530,22 @@ rag-knowledge-base/
 │       │   ├── controller/               🌐 顶层控制器
 │       │   │   ├── AgentController.java             /api/agent/ask + /orchestrate
 │       │   │   └── MetricsController.java           /api/metrics/today
-│       │   ├── eval/                     📊 评估（EvalRunner.java）
 │       │   ├── common/                   🔧 Result / BusinessException / GlobalExceptionHandler / UserContext
 │       │   └── config/                   ⚙️ JwtUtil / JwtInterceptor / WebMvcConfig / RestTemplateConfig
 │       │       ├── MilvusConfig / MinioConfig / RagProperties(@ConfigurationProperties)
 │       │       └── MybatisPlusConfig / MyMetaObjectHandler / CorsConfig
 │       ├── main/resources/application.yml
 │       └── test/java/com/liushuwen/rag/
-│           ├── acceptance/                ✅ 验收套件（真实 HTTP，58 用例）
+│           ├── acceptance/                ✅ 验收套件（真实 HTTP，60 用例）
 │           │   ├── AcceptanceSupport.java        基类：真实 RestTemplate + 环境指纹 + 向量可见性等待
-│           │   ├── A1_AuthAndContractAcceptanceTest.java      认证与统一契约（12）
-│           │   ├── A2_IngestionAcceptanceTest.java            离线入库（11）
+│           │   ├── A1_AuthAndContractAcceptanceTest.java      认证与统一契约（13）
+│           │   ├── A2_IngestionAcceptanceTest.java            离线入库（12）
 │           │   ├── A3_RetrievalAcceptanceTest.java            检索链路与隔离（8）
 │           │   ├── A4_ChatFlowAcceptanceTest.java             在线问答全链路（8）
-│           │   ├── A5_AgentAndBreakerAcceptanceTest.java      Agent 链路与熔断（9）
+│           │   ├── A5_AgentAndBreakerAcceptanceTest.java      Agent 链路与熔断（11）
 │           │   └── A6_KnownGapAcceptanceTest.java             已知缺口固化（7）
 │           └── eval/
-│               └── EvalRunnerTest.java       评估回归（读 docs/eval/questions.json，20 题）
+│               └── EvalRunnerTest.java       唯一评估入口（读 docs/eval/questions.json，20 题）
 │
 ├── frontend/                             Vue3 前端
 │   ├── vite.config.js                    /api 代理 → localhost:18080
@@ -523,7 +602,7 @@ rag-knowledge-base/
 | GET | `/api/chat/sessions` | 会话列表 | 是 |
 | PUT | `/api/chat/session/{sessionId}/title` | 修改会话标题 | 是 |
 | DELETE | `/api/chat/session/{sessionId}` | 删除会话（级联删除消息） | 是 |
-| POST | `/api/chat/ask/{sessionId}` | 智能问答（body：`{"question":"..."}`） | 是 |
+| POST | `/api/chat/ask/{sessionId}` | 智能问答（body：`{"question":"..."}`；可选 `"mode":"agent"` 走多 Agent 编排） | 是 |
 | GET | `/api/chat/history/{sessionId}` | 获取会话历史消息 | 是 |
 | POST | `/api/agent/ask` | 单 Agent 问答（ReAct + 工具调用） | 是 |
 | POST | `/api/agent/orchestrate` | 多 Agent 编排问答（主管分派 + 反思重写） | 是 |
@@ -540,7 +619,7 @@ rag-knowledge-base/
 | 第 5-6 周 | 前端交互、JWT 认证、数据隔离、文档分类 | ✅ |
 | 第 7 周 | 项目文档与评估 | ✅ |
 | 第 8 周 | Agentic RAG 演进：混合检索 / Rerank / 查询改写 / ReAct / 意图路由 / 多 Agent / 长期记忆 / 降级熔断 / 评估 | ✅ |
-| 第 9 周 | 验收测试重写（A1–A6 + 评估，58 用例真实 HTTP）+ 全量功能黑盒测试（48 API 用例 + 27 张 UI 截图，全程无 5xx）+ 修复 12 处缺陷（6 + G-01 ~ G-06）+ 文档与实现对齐 + 已知缺口固化 | ✅ |
+| 第 9 周 | 验收测试重写（A1–A6 + 评估，60 用例真实 HTTP）+ 全量功能黑盒测试（50 API 用例 + 28 张 UI 截图，全程无 5xx）+ 修复 15 处缺陷（6 + G-01 ~ G-09）+ **Agent 模块接入对话页（深度思考开关 → mode=agent 落库回读）** + **指标埋点口径重构（埋点收敛到唯一出口：LlmService / ToolRegistry.execute / 入口层）** + 文档与实现对齐 + 已知缺口固化 | ✅ |
 
 ## 常见问题
 

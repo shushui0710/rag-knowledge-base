@@ -11,7 +11,10 @@
 
       <!-- 功能：按角色渲染用户/AI 消息气泡｜要点：v-for 列表渲染 + :class 动态类名 -->
       <div v-for="(msg, idx) in messages" :key="idx" :class="['message', msg.role]">
-        <div class="message-role">{{ msg.role === 'user' ? '你' : 'AI助手' }}</div>
+        <!-- 功能：角色标签；多 Agent 回答额外标注链路来源，让「深度思考」的效果可见｜要点：条件表达式 -->
+        <div class="message-role">
+          {{ msg.role === 'user' ? '你' : (isAgentMessage(msg) ? 'AI助手 · 多 Agent' : 'AI助手') }}
+        </div>
 
         <!-- 功能：用户消息按纯文本渲染，避免内容被当 HTML 执行｜要点：v-html 仅用于已过滤的 AI 内容 -->
         <div v-if="msg.role === 'user'" class="message-content">{{ msg.content }}</div>
@@ -25,9 +28,11 @@
             <el-collapse-item title="参考来源">
               <div v-for="(src, i) in parseSources(msg.sources)" :key="i" class="source-item">
                 <div class="source-header">
-                  <el-tag size="small" type="info">
+                  <!-- 功能：RAG 来源有相似度分数，Agent 依据没有分数只有片段，按 type 区分渲染｜要点：不伪造 score -->
+                  <el-tag v-if="typeof src.score === 'number'" size="small" type="info">
                     相似度 {{ (src.score * 100).toFixed(1) }}%
                   </el-tag>
+                  <el-tag v-else size="small" type="warning">依据片段</el-tag>
                 </div>
                 <div class="source-content">{{ src.content }}</div>
               </div>
@@ -49,6 +54,13 @@
 
     <!-- 功能：问题输入框 + 发送按钮，回车提交｜要点：v-model 双向绑定本质 -->
     <div class="input-area">
+      <!-- 功能：「深度思考」开关，切换后端链路（默认 RAG / 多 Agent 编排）｜要点：同一端点靠 mode 字段分流，回答照常落库 -->
+      <div class="input-toolbar">
+        <el-switch v-model="deepThink" :disabled="loading" active-text="深度思考" />
+        <span class="toolbar-hint">
+          {{ deepThink ? '多 Agent 编排：意图路由 → 专用 Agent → 反思评审' : '默认 RAG 链路：混合检索 → 精排 → 生成' }}
+        </span>
+      </div>
       <el-input
         v-model="question"
         placeholder="输入你的问题..."
@@ -76,6 +88,8 @@ const chatStore = useChatStore()
 const question = ref('')
 const messages = ref([])
 const loading = ref(false)
+// 功能：「深度思考」开关，决定这次提问走后端哪条链路｜要点：开关状态只影响请求参数，不影响会话与历史（两条链路共用同一落库流程）
+const deepThink = ref(false)
 const messageContainer = ref(null)
 
 const sessionId = computed(() =>
@@ -143,7 +157,12 @@ async function sendQuestion() {
   messages.value.push({ role: 'user', content: q })
   loading.value = true
   try {
-    const res = await askQuestion(sessionId.value, q)
+    // 功能：按开关决定链路——开启传 mode=agent 走后端多 Agent 编排，关闭不传走默认 RAG｜要点：后端同端点分流
+    const res = await askQuestion(sessionId.value, q, deepThink.value ? 'agent' : undefined)
+    // 功能：标记本次回答的链路，供气泡上的「多 Agent」标签使用（历史回读时改由 sources 的 type 推断）
+    if (deepThink.value && res.data) {
+      res.data.agentMode = true
+    }
     messages.value.push(res.data)
 
     // 功能：首条消息后自动用问题前 20 字生成会话标题并同步全局 Store｜要点：全局状态共享 + 标题截断策略
@@ -168,6 +187,14 @@ function parseSources(sources) {
   } catch {
     return [sources]
   }
+}
+
+// 功能：判断一条回答是否来自多 Agent 链路｜要点：实时回答带 agentMode 标记，历史回读时改看 sources 里有没有 type=evidence 的依据项
+// 常见问题：为什么不把 mode 存进数据库？—— 需要加字段与迁移，而「依据片段」本身就是 agent 链路的产物，足以推断
+function isAgentMessage(msg) {
+  if (!msg || msg.role === 'user') return false
+  if (msg.agentMode) return true
+  return parseSources(msg.sources).some((src) => src && src.type === 'evidence')
 }
 </script>
 
@@ -344,5 +371,18 @@ function parseSources(sources) {
 .input-area {
   padding: 16px 20px;
   border-top: 1px solid #e4e7ed;
+}
+
+/* 功能：「深度思考」开关工具条，显示当前链路｜要点：开关 + 说明文案同一行 */
+.input-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.toolbar-hint {
+  font-size: 12px;
+  color: #909399;
 }
 </style>

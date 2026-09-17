@@ -2,6 +2,7 @@ package com.liushuwen.rag.chat.service;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.liushuwen.rag.agent.AgentMetrics;
 import com.liushuwen.rag.agent.Tool;
 import com.liushuwen.rag.common.BusinessException;
 import lombok.Data;
@@ -22,6 +23,8 @@ import java.util.stream.Collectors;
  * LLM 调用服务（封装 DeepSeek，OpenAI 兼容 /chat/completions 协议）。
  * 在 Agentic RAG 链路中提供三种能力：纯问答 chat、带 Function Calling 的 chatWithTools、可定制 system 的 chatWithSystem。
  * 【设计要点】第三方 AI API 标准调用范式（Bearer 认证 → 构造 messages → RestTemplate 发请求 → POJO/JsonNode 解析 → 异常降级），以及思考模型 messages 协议的字段兼容
+ * 【设计要点】本类是**全站 LLM 调用的唯一出口**（3 个方法三条形态：纯问答 / Function Calling / 自定义 system），
+ * 因此指标埋点（llmCalls）放在这里：出口唯一 ⇒ 主 RAG 链、单 Agent、多 Agent 编排一律被覆盖，且不会重复计数。
  * 【常见问题】为什么用 LinkedHashMap 构造请求体？——保证 JSON 字段顺序与协议一致（模型参数顺序敏感场景）；为什么 Function Calling 的 assistant 消息必须原样回填？——思维链/工具调用原始字段（reasoning_content/tool_calls）缺失会被 API 拒绝
  */
 @Slf4j
@@ -47,6 +50,12 @@ public class LlmService {
     // 功能：由 Spring 容器注入 RestTemplate 与 ObjectMapper｜要点：@Bean 装配 + Spring Boot 自动配置统一 Jackson（日期/命名策略一致）
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
+    /**
+     * LLM 调用计数：本类的 3 个方法是全站唯一打 /v1/chat/completions 的出口，
+     * 因此计数放在这里能一次性覆盖主 RAG 链、单 Agent ReAct、多 Agent 编排（含意图路由/改写/评审）所有链路，
+     * 既不漏记也不重记。详见 AgentMetrics 的「唯一写者口径」。
+     */
+    private final AgentMetrics metrics;
 
     /**
      * 纯问答调用：构造 system+user 双消息的 OpenAI 兼容请求，调 DeepSeek 取回答文本。
@@ -86,6 +95,9 @@ public class LlmService {
             HttpEntity<String> entity = new HttpEntity<>(requestBody, headers);
             ResponseEntity<String> response = restTemplate.exchange(
                     apiUrl, HttpMethod.POST, entity, String.class);
+            // 功能：记一次 LLM 调用（全站唯一埋点）｜要点：只统计"真的发出并拿到响应"的调用，
+            // 失败时下方 catch 直接转 BusinessException，不计数——避免把降级路径算成 LLM 消耗
+            metrics.recordLlmCall();
 
             // 功能：把响应体反序列化为 DeepSeekResponse（@JsonIgnoreProperties 忽略未知字段），取 choices[0].message.content｜要点：POJO 绑定比手动遍历 JsonNode 更稳健，字段缺失由 Jackson 容错；choices 是数组须先 get(0)
             DeepSeekResponse resp = objectMapper.readValue(response.getBody(), DeepSeekResponse.class);
@@ -193,6 +205,9 @@ public class LlmService {
                     objectMapper.writeValueAsString(body), headers);
             ResponseEntity<String> response = restTemplate.exchange(
                     apiUrl, HttpMethod.POST, entity, String.class);
+            // 功能：记一次 LLM 调用（全站唯一埋点）｜要点：ReAct 每轮决策都算一次真实调用，
+            // 计数只在此处发生，AgentExecutor 不再自行计数——修复前两处都记，导致整体翻倍
+            metrics.recordLlmCall();
             DeepSeekResponse resp = objectMapper.readValue(response.getBody(), DeepSeekResponse.class);
 
             // 功能：取 choices[0].message 判断是否有 tool_calls｜要点：choices 是数组须先 get(0)；有 tool_calls 进入工具调用分支，否则直接返回回答
@@ -273,6 +288,9 @@ public class LlmService {
                     objectMapper.writeValueAsString(body), headers);
             ResponseEntity<String> response = restTemplate.exchange(
                     apiUrl, HttpMethod.POST, entity, String.class);
+            // 功能：记一次 LLM 调用（全站唯一埋点）｜要点：查询改写/意图路由/反思评审这些"子任务"
+            // 同样消耗 LLM 额度，必须计入——修复前它们完全不在指标内
+            metrics.recordLlmCall();
             DeepSeekResponse resp = objectMapper.readValue(response.getBody(), DeepSeekResponse.class);
             return resp.getChoices().get(0).getMessage().getContent();
         } catch (Exception e) {

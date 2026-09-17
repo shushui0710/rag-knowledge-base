@@ -39,9 +39,11 @@ public class ChatController {
     }
 
     /**
-     * 问答入口：DTO 接收提问 → 空值校验 → 委托 ChatService.ask 执行 RAG 链路。
+     * 问答入口：DTO 接收提问 → 空值校验 → 委托 ChatService.ask 按 mode 选择链路执行。
      * 【设计要点】@RequestBody DTO 绑定与字段校验、入口层只做参数合法性，业务逻辑沉降到 Service
      * 【常见问题】为什么用 DTO 而非 @RequestBody String？——DTO 经 Jackson 反序列化可逐字段校验，裸 String 只能拿到原文；会话归属由哪层校验？——Service 内做归属校验，保证任何入口调用都安全
+     * 【常见问题】mode 是什么？——链路开关：不传 = 默认 RAG 链路；"agent" = 多 Agent 编排（对话页「深度思考」）。
+     * 之所以复用这个端点而不是让前端直接调 /api/agent/orchestrate：裸端点不落库，回答进不了会话历史、刷新即丢。
      */
     @Operation(summary = "发送问题并获取回答")
     @PostMapping("/ask/{sessionId}")
@@ -55,13 +57,15 @@ public class ChatController {
         if (req == null || req.getQuestion() == null || req.getQuestion().isBlank()) {
             throw new BusinessException("问题不能为空");
         }
-        return Result.success(chatService.ask(sessionId, req.getQuestion()));
+        return Result.success(chatService.ask(sessionId, req.getQuestion(), req.getMode()));
     }
 
     /** 提问请求体 DTO：以对象收 JSON，借助 Jackson 反序列化按字段校验（裸 String 无法做字段级校验） */
     @lombok.Data
     public static class AskRequest {
         private String question;
+        /** 链路模式：null/未传 = 默认 RAG 链路；"agent" = 多 Agent 编排（前端「深度思考」开关） */
+        private String mode;
     }
 
     @Operation(summary = "获取会话历史消息")
