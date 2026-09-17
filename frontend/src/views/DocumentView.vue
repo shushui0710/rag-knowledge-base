@@ -12,19 +12,22 @@
       </el-select>
     </div>
 
+    <!-- 【缺陷修复·前后端白名单不一致】accept 原为 ".pdf,.doc,.docx,.md,.txt"，
+         而后端 ALLOWED_FILE_TYPES 只有 {pdf, docx, md, txt}：用户按界面提示选中 .doc（Word 97-2003）
+         能通过前端筛选，提交后才被后端拒绝。此处去掉 .doc，与后端白名单严格对齐 -->
     <el-upload
       :action="uploadUrl"
       :headers="uploadHeaders"
       :data="{ category: uploadCategory }"
       :on-success="handleUploadSuccess"
       :on-error="handleUploadError"
-      accept=".pdf,.doc,.docx,.md,.txt"
+      accept=".pdf,.docx,.md,.txt"
       :show-file-list="false"
       drag
     >
       <el-icon style="font-size: 40px; color: #c0c4cc;"><UploadFilled /></el-icon>
       <div style="margin-top: 8px; color: #606266;">将文件拖到此处，或点击上传</div>
-      <div style="font-size: 12px; color: #909399; margin-top: 4px;">支持 PDF / Word / Markdown / TXT</div>
+      <div style="font-size: 12px; color: #909399; margin-top: 4px;">支持 PDF / DOCX / Markdown / TXT，单个不超过 50MB</div>
     </el-upload>
 
     <div style="margin-top: 12px;">

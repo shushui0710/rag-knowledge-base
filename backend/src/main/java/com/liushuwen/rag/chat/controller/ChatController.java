@@ -1,5 +1,6 @@
 package com.liushuwen.rag.chat.controller;
 
+import com.liushuwen.rag.common.BusinessException;
 import com.liushuwen.rag.common.Result;
 import com.liushuwen.rag.chat.entity.ChatMessage;
 import com.liushuwen.rag.chat.entity.ChatSession;
@@ -45,9 +46,14 @@ public class ChatController {
     @Operation(summary = "发送问题并获取回答")
     @PostMapping("/ask/{sessionId}")
     public Result<ChatMessage> ask(@PathVariable Long sessionId, @RequestBody AskRequest req) {
-        // 功能：空问题直接返回 400，DTO 接收 JSON 才能按字段校验｜要点：@RequestBody 绑定原理（String 只能接原文，DTO 走 Jackson 反序列化）
+        // 功能：空问题抛业务异常，由全局异常处理器统一转 HTTP 400｜要点：@RequestBody 绑定原理（String 只能接原文，DTO 走 Jackson 反序列化）
+        // 【缺陷修复·HTTP 语义双轨】修复前此处写的是 return Result.error(400, "问题不能为空")：
+        // 方法正常返回 → Spring 按 HTTP 200 序列化，业务码只落在响应体的 code 字段；
+        // 而 Service 抛 BusinessException 时 GlobalExceptionHandler 的 @ResponseStatus(BAD_REQUEST)
+        // 会返回真正的 HTTP 400。同一类客户端错误出现两种 HTTP 表现，会误导网关、监控、第三方集成等
+        // 按 HTTP 语义判断的调用方。改为抛异常，使「参数校验」与「业务校验」收敛到同一出口。
         if (req == null || req.getQuestion() == null || req.getQuestion().isBlank()) {
-            return Result.error(400, "问题不能为空");
+            throw new BusinessException("问题不能为空");
         }
         return Result.success(chatService.ask(sessionId, req.getQuestion()));
     }

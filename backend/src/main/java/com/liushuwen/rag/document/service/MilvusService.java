@@ -625,7 +625,22 @@ public class MilvusService {
             // ⚠️ 降级而非抛异常：collection 未升级（无 bm25_vector / BM25 Function）时
             //    稀疏路会失败，此时退回纯稠密检索，保证问答主流程可用（与 Rerank 降级同理）
             log.warn("混合检索失败（稀疏路），降级为纯稠密检索: {}", e.getMessage());
-            return search(queryVector, topK);
+            return degradeToDense(queryVector, topK, documentIds);
         }
+    }
+
+    /**
+     * 混合检索降级实现：稀疏路不可用时退回纯稠密检索。
+     * 【设计要点】降级不能丢安全不变式——修复前此处调用的是不带过滤的 search(queryVector, topK)
+     * （documentIds 传 null），一旦稀疏路异常（旧 collection 未重建 BM25、或 Milvus 瞬时故障），
+     * 检索会退化为"全库无过滤"，把其他用户的向量一并召回，构成跨租户内容泄露。
+     * 降级只应降低召回质量，绝不放大可见范围，因此必须原样带上 documentIds。
+     * 【常见问题】为什么独立成 public 方法？——验收用例要直接验证"降级仍隔离"这一安全不变式
+     * （见 A3-08），而构造稀疏路故障需要真实触发异常，故把降级入口显式暴露出来便于验证。
+     */
+    public List<SearchResult> degradeToDense(float[] queryVector, int topK, List<Long> documentIds) {
+        log.warn("混合检索降级为纯稠密检索（保留 documentIds 用户隔离：{}）",
+                documentIds == null ? "null=不过滤" : documentIds.size() + " 个文档");
+        return search(queryVector, topK, documentIds);
     }
 }

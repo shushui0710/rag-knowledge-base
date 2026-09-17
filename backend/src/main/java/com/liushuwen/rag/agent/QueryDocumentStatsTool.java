@@ -10,6 +10,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -54,13 +55,26 @@ public class QueryDocumentStatsTool implements Tool {
                 new LambdaQueryWrapper<Document>()
                         .eq(Document::getUserId, userId)
                         .eq(Document::getEmbeddingStatus, 1));
-        // 有内容分块的文档数（可作为"已处理"参考）
-        // document_chunk 表没有 user_id 字段，用子查询限定当前用户的文档
-        long withChunk = documentChunkMapper.selectCount(
+        // 有内容分块的【文档】数：必须按 document_id 去重后计数。
+        // 【缺陷修复·统计口径】原实现是 selectCount(...isNotNull(content))，统计的是 document_chunk 的
+        // 【行数】；而 512/64 的滑窗会把一篇文档切成多块，于是该数字必然 ≥ 文档总数，出现
+        // 「共 1 篇文档，有内容分块的文档 2 篇」这种自相矛盾的统计（Agent 还专门把该矛盾当异常报给用户）。
+        // 正确做法是按 document_id 分组去重——GROUP BY 在 SQL 侧完成，Java 侧拿到的就是「文档数」。
+        // 【同时去掉手写 SQL】原实现用 inSql 拼原生子查询（并把 userId 直接拼进 SQL 字符串），
+        // 改为「先取当前用户文档 id → 再 in 过滤」，既保留「逻辑已删除文档不计入」的语义，
+        // 又不必依赖对 MyBatis-Plus 逻辑删除插件改写范围的推断。
+        List<Long> docIds = documentMapper.selectList(new LambdaQueryWrapper<Document>()
+                        .select(Document::getId)
+                        .eq(Document::getUserId, userId))
+                .stream().map(Document::getId).toList();
+        // document_chunk 无 user_id 字段，靠 document_id 归属；docIds 为空时 MP 会生成
+        // 非法的 IN () ，因此必须短路
+        long withChunk = docIds.isEmpty() ? 0L : documentChunkMapper.selectList(
                 new LambdaQueryWrapper<DocumentChunk>()
-                        .inSql(DocumentChunk::getDocumentId,
-                                "select id from document where user_id = " + userId)
-                        .isNotNull(DocumentChunk::getContent));
+                        .select(DocumentChunk::getDocumentId)
+                        .in(DocumentChunk::getDocumentId, docIds)
+                        .isNotNull(DocumentChunk::getContent)
+                        .groupBy(DocumentChunk::getDocumentId)).size();
 
         log.info("[Tool:{}] 统计结果(userId={}): total={}, embedded={}, withChunk={}",
                 name(), userId, total, embedded, withChunk);

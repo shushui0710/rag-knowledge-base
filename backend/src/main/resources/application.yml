@@ -1,5 +1,13 @@
 server:
   port: 18080
+  tomcat:
+    # 【缺陷修复·G-06】超限上传要先把请求体读完再回 413。
+    # Tomcat 默认 maxSwallowSize=2MB，小于被拒请求的剩余体积时会直接掐断连接，
+    # 客户端只能拿到 "Error writing request body to server" 这类不透明的网络错误，
+    # 既读不到 413 状态码也读不到「文件过大」提示（浏览器侧表现为连接被重置）。
+    # 放宽到 64MB（略高于 50MB 上限）：超限文件能得到清晰的 413 响应；
+    # 同时保持有限吞读（非 -1 无界），对远超阈值的请求仍会中止读取，避免无界读放大风险。
+    max-swallow-size: 64MB
 
 spring:
   datasource:

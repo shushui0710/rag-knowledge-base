@@ -18,9 +18,9 @@ public interface Agent {
      *
      * @param task    分派来的任务（可能是原始问题，也可能是拆解后的子任务）
      * @param history 会话历史（List of {"role":..,"content":..}）
-     * @return 结果文本
+     * @return 结果文本 + 生成该文本所依据的证据片段（供上层反思评审核对"是否有据"）
      */
-    String execute(String task, List<Map<String, Object>> history);
+    AgentResult execute(String task, List<Map<String, Object>> history);
 
     enum AgentType {
         DOCUMENT,   // 文档问答（RAG）

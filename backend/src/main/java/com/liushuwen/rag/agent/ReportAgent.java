@@ -30,32 +30,34 @@ public class ReportAgent implements Agent {
     }
 
     @Override
-    public String execute(String task, List<Map<String, Object>> history) {
+    public AgentResult execute(String task, List<Map<String, Object>> history) {
         try {
             // 1) RAG 检索 task 相关文档片段
             List<float[]> vecs = embeddingService.embed(List.of(task));
             if (vecs == null || vecs.isEmpty()) {
-                return "文档向量化失败，请稍后重试。";
+                return AgentResult.of("文档向量化失败，请稍后重试。");
             }
             List<MilvusService.SearchResult> hits = milvusService.search(vecs.get(0), 5);
             if (hits == null || hits.isEmpty()) {
-                return "未检索到与「" + task + "」相关的文档，无法生成报告。";
+                return AgentResult.of("未检索到与「" + task + "」相关的文档，无法生成报告。");
             }
-            // 2) 组装上下文（空值防御）
+            // 2) 组装上下文（空值防御），同时留存为评审依据
             StringBuilder ctx = new StringBuilder();
+            List<String> evidence = new java.util.ArrayList<>();
             for (int i = 0; i < hits.size(); i++) {
                 String content = hits.get(i).getContent();
-                ctx.append("【参考").append(i + 1).append("】")
-                        .append(content == null ? "" : content).append("\n\n");
+                content = content == null ? "" : content;
+                ctx.append("【参考").append(i + 1).append("】").append(content).append("\n\n");
+                evidence.add(content);
             }
             // 3) 报告结构 Prompt 生成（Markdown）
             String prompt = "你是报告生成助手。请基于以下资料，生成一份结构化的"
                     + "「" + task + "」报告（含：引言/现状/问题/建议）。\n\n资料：\n"
                     + ctx + "\n要求：分点输出，Markdown 格式，引用资料中的具体内容。";
-            return llmService.chat(prompt);
+            return AgentResult.of(llmService.chat(prompt), evidence);
         } catch (Exception e) {
             log.error("报告生成失败: task={}, error={}", task, e.getMessage(), e);
-            return "报告生成失败：" + e.getMessage() + "，请稍后重试。";
+            return AgentResult.of("报告生成失败：" + e.getMessage() + "，请稍后重试。");
         }
     }
 }

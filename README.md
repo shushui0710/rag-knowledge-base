@@ -5,22 +5,23 @@
 核心亮点：
 
 - **混合检索**：Milvus 2.5 内置 BM25 Function，稠密 + 稀疏双路召回，加权融合（alpha=0.7）后经智谱 Rerank 精排（召回 20 → 精排 5），并按最低相似度 0.35 过滤
-- **Agentic 能力**：ReAct 循环（≤5 轮）+ 工具调用 + 意图路由（DOCUMENT / STATS / HYBRID）+ 多 Agent 编排与反思重写
-- **生产化设计**：长期记忆（qa_memory）、三层降级 + LLM 熔断器（5 次/60s）、指标观测、评估集回归测试
+- **Agentic 能力**：ReAct 循环（≤5 轮）+ 工具调用 + 意图路由（DOCUMENT / STATS / HYBRID）+ 多 Agent 编排；反思评审（LLM-as-Judge）带证据评审并限 1 次重写，**仅作用于 LLM 生成的回答**（工具直出的确定性事实不重写）
+- **生产化设计**：长期记忆（qa_memory）、三层降级 + LLM 熔断器（5 次/60s，仅 Agent 链路）、指标观测、评估集回归、**58 用例验收套件（A1–A6 + 评估，真实 HTTP 全链路）**
 
 ## 核心功能
 
 | 模块 | 功能 |
 |------|------|
 | 用户认证 | 注册 / 登录（JWT + BCrypt），`JwtInterceptor` + ThreadLocal 登录态，路由守卫 |
-| 文档管理 | 上传（PDF/Word/MD/TXT，支持分类）、解析分块、向量化入库、删除（级联清理向量）、重建混合索引 |
+| 文档管理 | 上传（PDF/Word/MD/TXT，支持分类）、解析分块、向量化入库、重建混合索引；删除为逻辑删除（⚠️ 未级联清理 chunk/向量/MinIO，见「已知缺口」） |
 | 智能问答 | 多会话管理、来源引用、Markdown 渲染、历史记录、会话标题修改 |
-| Agentic 问答 | 单 Agent（ReAct + 工具调用）、多 Agent 编排（主管分派 + 反思重写） |
+| Agentic 问答 | 单 Agent（ReAct + 工具调用）、多 Agent 编排（主管分派 + 证据驱动反思评审） |
 | 长期记忆 | qa_memory 独立 collection 存问答对，问答时自动召回相关历史 |
 | 检索评估 | `docs/eval/questions.json`（20 题）+ EvalRunnerTest 命中率评测 |
 | 指标观测 | 今日问答量、平均耗时、LLM / 工具调用次数 |
-| 数据隔离 | 文档、会话、记忆均按用户隔离；检索支持 documentIds 过滤 |
+| 数据隔离 | 文档、会话、记忆均按用户隔离；检索支持 documentIds 过滤（含降级路径） |
 | 接口文档 | Knife4j 在线 API 文档（http://localhost:18080/doc.html） |
+| 验收套件 | A1–A6 六个验收域 + 评估回归，共 58 个用例走真实 HTTP（见「测试与验收」） |
 
 ## 系统架构
 
@@ -57,19 +58,47 @@
 
 **离线入库**：文档上传 → MinIO 存储 → PDFBox/POI 解析 → 滑动窗口分块（512/64）→ 智谱 Embedding 向量化 → Milvus 存储
 
-**在线问答**（`ChatServiceImpl.ask`）：长期记忆召回 → LLM 查询改写 → 混合检索（稠密 + BM25 稀疏，召回 20）→ Rerank 精排（Top 5）→ 相似度阈值过滤（≥0.35）→ Prompt 拼接 → DeepSeek 生成 → 答案 + 来源引用 → 问答对写入长期记忆
-
-**Agentic 问答**（`AgentController`）：
+**在线问答**（`ChatServiceImpl.ask`）：
 
 ```
-用户提问 → [意图路由 Router]
-   ├─ DOCUMENT → RAG 检索问答（原链路）
-   ├─ STATS    → Agent 调数据工具（query_document_stats / query_document_list）
-   └─ HYBRID   → AgentExecutor 完整 ReAct 循环（≤5 轮）：
-                 思考 → 调工具 → 观察结果 → 再思考 → 最终回答
+提问 → ① 先把提问落库（失败也留下记录，便于排查与续聊）
+     → ② 向量化问题
+     → ③ 查当前用户已向量化文档 ID 列表（检索层隔离用）
+     → ④ 长期记忆召回（旁路，异常静默返回空）
+     → ⑤ LLM 查询改写（失败回退原句）→ ⑥ 混合检索（稠密 + BM25 稀疏，召回 20）
+     → ⑦ Rerank 精排（Top 5，API 失败按原分排序）
+     → ⑧ minScore 0.35 过滤（过滤后为空 → 兜底文案直接返回，不调 LLM）
+     → ⑨ 拼 Prompt（参考片段 + 历史问答记录）→ DeepSeek 生成
+     → ⑩ 落库回答 + sources（chunkId/score/100 字预览）→ 检索最高分 ≥0.6 才回存长期记忆
 ```
 
-> **降级策略**：collection 未重建（无 BM25 字段）时混合检索自动降级为纯稠密；Rerank API 失败时降级按原分数排序；LLM 连续失败 5 次触发熔断 60 秒。
+> **分数口径**：混合检索的**排序依据**是融合分（0.7×稠密 + 0.3×稀疏），但对外暴露的 `score`
+> 对稠密路命中的分块仍是**稠密原分**（仅稀疏路独有的分块才回填融合分）。
+> 这样 `minScore` 阈值始终筛的是量纲一致的 COSINE 语义分，代价是 sources 展示分 ≠ 排序分。
+
+**Agentic 问答**（`AgentController`，两条入口互不相同）：
+
+```
+入口① POST /api/agent/ask  → AgentExecutor  （单 Agent，ReAct 循环）
+   提问 → [熔断器 tryAcquire] → 思考 → 调工具 → 观察 → 再思考（≤5 轮）
+        → 最终回答 / 超轮降级文案 / 熔断兜底文案
+
+入口② POST /api/agent/orchestrate → OrchestratorAgent（多 Agent 编排，主管模式）
+   提问 → [RouterService 意图路由 temperature=0.1]
+      ├─ DOCUMENT → DocumentAgent：RAG 检索链（查询改写 → 混合检索 → Rerank → LLM 生成）
+      ├─ STATS    → StatsAgent：工具直答（query_document_stats + query_document_list）
+      │               → 跳过反思评审（确定性事实，重写只会降质）
+      └─ HYBRID   → StatsAgent + DocumentAgent 组合回答
+                    （"【数据概况】\n{统计}\n\n【文档解答】\n{问答}"）
+   → 反思评审 CriticService.judge(question, answer, evidence)
+      → 不合格则带评审意见 LLM 重写（critic-max-retry=1 硬上限，空重写保留原答案）
+```
+
+> **注意**：ReAct 循环只在入口①；入口② 的 HYBRID 是"子 Agent 组合"而非 ReAct 循环。
+> 反思评审只对 LLM 生成的回答生效，且必须把 `AgentResult.evidence`（工具输出 / 检索片段）交给评委
+> —— 传空证据会让任何回答都被判"无知识库依据"，触发一次纯 LLM 重写并把准确数字换成模糊复述。
+
+> **降级策略**：collection 未重建（无 BM25 字段）时混合检索自动降级为纯稠密（**降级仍保留 documentIds 用户过滤**）；Rerank API 失败时降级按原分数排序；查询改写失败用原句；记忆召回/评审异常静默 fail-open；LLM 连续失败 5 次触发熔断 60 秒（**仅入口①的 ReAct 链路**，主问答链路无熔断保护）。
 
 ## 技术栈
 
@@ -230,6 +259,112 @@ cd backend
 mvn.cmd test -Dtest=EvalRunnerTest
 ```
 
+## 测试与验收
+
+### 运行验收套件
+
+```bash
+cd backend
+mvn.cmd test -Dtest=A1_AuthAndContractAcceptanceTest,A2_IngestionAcceptanceTest,A3_RetrievalAcceptanceTest,A4_ChatFlowAcceptanceTest,A5_AgentAndBreakerAcceptanceTest,A6_KnownGapAcceptanceTest,EvalRunnerTest
+```
+
+**前置条件**：5 个容器全部 healthy、`.env` 密钥与运行中的容器一致、后端可访问 MySQL/MinIO/Milvus。
+
+**两个必须的环境开关**（否则会得到看似"代码 bug"的失败）：
+
+| 开关 | 原因 |
+|------|------|
+| `-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8` | 中文 Windows 上 JDK 17 默认 GBK，中文经 Milvus BM25 分词会触发 tantivy Rust panic → 容器 SIGABRT（已写入 surefire `argLine`） |
+| `-Djava.net.useSystemProxies=false` | 本机若装 Clash 等代理，JVM 会走代理导致 `localhost` 访问失败 / 调用 DeepSeek 报 PKIX 证书链错误 |
+
+验收套件第一条输出即**环境指纹**（java.version / file.encoding / useSystemProxies / 实际选定的代理路由），用于把环境问题与代码问题分离。
+
+### 覆盖范围与通过标准
+
+| 域 | 用例 | 覆盖内容 | 通过标准（P0） |
+|----|------|----------|----------------|
+| A1 认证与统一契约 | 13 | 注册/登录/重名/密码不回传/统一失败文案、无 token 与篡改 token 拒绝、`Result` 结构、请求体契约（对象 vs 裸 JSON 串）、空问题校验 | 正向返回 200；负向精确返回 **HTTP 400**（非 500）；密码字段恒为 null |
+| A2 离线入库 | 12 | 格式白名单/空文件/无扩展名/未登录上传拒绝、上传落库字段、分块算法边界、向量化入库可召回、幂等防重、删除幂等、列表隔离 | 非法输入 400；`chunkCount/embeddingStatus` 与实际一致；向量化后可被检索命中 |
+| A3 检索链路 | 8 | 稠密 TopK/降序/content、BM25 稀疏路词面命中、融合排序差异、`documentIds` 隔离、空集合短路、content 完整性、连续 20 次中文检索稳定性、**降级仍保留隔离** | 分数降序、content 非空；跨用户内容不可见（含降级路径）；Milvus `/healthz` 保持健康 |
+| A4 在线问答全链路 | 8 | 端到端问答+来源引用、sources 结构、空召回兜底（不调 LLM）、历史顺序、会话级联删除、长期记忆闭环（隔离+门槛） | 返回 200 且回答非空；sources 含 chunkId/score/预览；兜底路径不产生 LLM 调用 |
+| A5 Agent 链路与熔断 | 9 | 熔断状态机与降级文案、ReAct 单 Agent（真实工具调用）、编排 STATS 直答、空问题校验、指标联动、工具注册表、**Agent 证据契约** | ReAct 返回非空回答；STATS 回答必须含真实文档数且保留工具计量表述；`AgentResult.evidence` 非空 |
+| A6 已知缺口固化 | 7 | 会话归属未校验（读/删）、删文档向量残留、重解析无 HTTP 入口、鉴权返回 400 而非 401、标题引号入库、缓存配置未接线 | **断言"当前真实行为"**：修好即失败，强制同步文档（不计入 P0 门槛） |
+| 评估回归 | 1 | 20 题评估集 Top5 命中率（稠密 vs 混合） | 命中率可复现输出（用于趋势对比，不设硬门槛） |
+
+### 当前结果（2026-09-17）
+
+```
+A1  13/13    A2  12/12    A3   8/8    A4   8/8
+A5   9/9     A6   7/7     Eval 1/1     → Tests run: 58, Failures: 0, Errors: 0
+```
+
+关键实测数据：
+
+| 指标 | 实测值 | 来源 |
+|------|--------|------|
+| 端到端问答耗时（含改写+混合检索+精排+LLM） | 3.13s / 4.78s / 3.58s，均值 **3.83s** | A4-08 |
+| 空召回兜底耗时（未调用 LLM） | **1.55s** | A4-03 |
+| 单 Agent ReAct 问答（真实工具调用） | **1.93s**（随 LLM 波动 1.9–5.0s） | A5-03 |
+| 多 Agent 编排 STATS 分支（工具直答） | **1.18s** | A5-05 |
+| 稠密检索首条相似度 | 0.4114 | A3-01 |
+| 融合排序差异 | dense `[0.484844, 0.478224]` → hybrid `[0.478224, 0.484844]` | A3-03 |
+| 长期记忆重排最高分 / 跨用户召回 | 1.0000 / 本用户 1 条、他人 0 条 | A4-07 |
+| 评估集 Top5 命中率（20 题 / 2 文档 33 分块） | 稠密 **100.0%** / 混合 **100.0%** | EV-01 |
+| 连续 20 次中文混合检索 | 无异常，Milvus `/healthz` 健康 | A3-07 |
+
+### 测试报告与证据产物
+
+除 JUnit 验收套件外，还跑了一轮**面向全量功能**的黑盒测试（脚本免 JVM，直接打真实 HTTP），三层证据互相印证：
+
+| 层 | 规模 | 产物 |
+|----|------|------|
+| 后端集成（JUnit） | 6 域 58 用例，`Tests run: 58, Failures: 0` | 本文件「覆盖范围与通过标准」 |
+| HTTP 全接口黑盒 | 48 用例（A1–A6 实测 + 补充 S-01…S-06），48/48 PASS | `_probe/api_full_suite.mjs` · `api_suite_result.json` |
+| UI 全流程截图 | 27 张（22 条前端交互 + 5 张接口证据页），全程无 5xx | `screenshots/全量功能测试-2026-09-17/` |
+
+**汇总报告**：`RAG项目全量功能测试报告-2026-09-17.html`（自包含单文件，含用例清单、实测明细、截图墙、缺陷复盘）。
+
+### 已知缺口（A6 用例固化，修好即测试失败）
+
+| # | 缺口 | 影响 |
+|---|------|------|
+| ① | `getHistory` 只按 sessionId 过滤，**不校验会话归属** | 任一登录用户可用自己的 token 读取他人会话（越权读） |
+| ② | `deleteSession` 同样不校验归属 | 可删除他人会话（越权删） |
+| ③ | `delete(id)` 只做 document 行逻辑删除，**未清理 document_chunk / Milvus 向量 / MinIO 对象** | 数据残留；实测仍残留 1 行分块、向量可按 document_id 召回 |
+| ④ | `reparseDocument`（增量重解析）已实现但 **Controller 未暴露** | HTTP 层不可达 |
+| ⑤ | 鉴权失败返回 **HTTP 400**，前端仅在 401 时登出跳转 | 前端 401 分支为死代码，token 过期不会自动跳登录页 |
+| ⑥ | 会话标题：前端发 JSON 字符串、后端收裸 String | **引号被一并入库**（如 `"验收标题"`） |
+| ⑦ | `rag.retrieval.embed-cache-limit` 已配置但 `EmbeddingService` 未注入 | 改 yml 不生效，上限实为硬编码常量 |
+
+> 这七项都已写进 `A6_KnownGapAcceptanceTest`，是"文档准确性"的可回归护栏，而非"已知问题无所谓"。
+
+### 第一轮（验收套件重写）修复的 6 处缺陷
+
+| 缺陷 | 根因 | 修复 |
+|------|------|------|
+| 新用户未上传文档即提问返回 **500** | `ChatServiceImpl` 对 Rerank 返回的不可变 `List.of()` 调 `removeIf` → `UnsupportedOperationException` | 改 `stream().filter().collect(toList())` |
+| 裸 JSON 串发 `/api/chat/ask` 返回 **500** | `HttpMessageNotReadableException` 落进 catch-all | 新增专用 handler 返回 400 |
+| 编排接口可能返回 **HTTP 200 + 空回答** | Critic 重写返回空内容被直接采用 | 空重写保留原回答 |
+| 编排 STATS 回答被"重写降质" | 反思评审固定传空证据 → 必判"无依据" → 纯 LLM 重写丢掉准确数字 | 引入 `AgentResult.evidence` 携证据；STATS 工具直答跳过评审 |
+| 混合检索降级时**丢失用户过滤** | catch 分支调用不带 `documentIds` 的 `search()` | 降级统一走 `degradeToDense(...)` 保留隔离 |
+| 文档统计自相矛盾（有内容分块的文档数 > 文档总数） | `QueryDocumentStatsTool` 用 `inSql` 手写原生子查询，MyBatis-Plus 逻辑删除**只改写框架生成的 SQL** → 已删文档的残留分块被计入 | 子查询补 `deleted = 0 and user_id = ...` |
+
+### 第二轮（全量功能黑盒测试）修复的 6 处缺陷（G-01 ~ G-06）
+
+都是在"用例全绿"的前提下**靠跨层对照才暴露**的缺陷：断言只校验了业务码/回答内容，没有校验 HTTP 状态码与语义正确性。
+
+| # | 严重度 | 缺陷 | 根因 | 修复 |
+|---|--------|------|------|------|
+| **G-01** | 中高 | 参数校验失败返回 **HTTP 200**，业务异常返回 HTTP 400 —— 同一类客户端错误两种 HTTP 表现 | 空问题校验写成 `return Result.error(400, ...)`（对象正常返回 → 200），而 Service 抛 `BusinessException` 走 `@ResponseStatus(BAD_REQUEST)` → 真 400 | 三个端点的内联分支统一改 `throw new BusinessException(...)`；并给 A1-12 补「HTTP 状态码必须为 400」断言防回退 |
+| **G-02** | 中 | Agent 统计把「分块**行数**」当「**文档**数」上报，造出 `withChunk > total` | `selectCount(...isNotNull(content))` 统计的是 document_chunk 行数，一个文档会切成多块 → 数字必然 ≥ 文档总数 | 改为按 `document_id` 去重计数；A5-05 种子文档改 40 段长文使该场景真正被覆盖 |
+| **G-03** | 低 | 前后端文件白名单不一致：前端 `accept` 放行 `.doc`，后端白名单不含 `.doc` | 前端 accept 写 `.pdf,.doc,.docx,.md,.txt`，后端 `ALLOWED_FILE_TYPES` 只有 pdf/docx/md/txt | 前端 accept 去掉 `.doc`，文案由「支持 PDF / Word」改为「支持 PDF / DOCX / Markdown / TXT」 |
+| **G-04** | 中 | 超过 50MB 的上传返回 **HTTP 500**「系统内部错误」，把客户端错误报成服务端故障 | `MaxUploadSizeExceededException` 落进 catch-all | `GlobalExceptionHandler` 新增 `MaxUploadSizeExceededException` → **413**、`MultipartException` → **400** |
+| **G-05** | 中 | 不存在的路径返回 **HTTP 500**，把 404 误报成服务端故障 | `@ExceptionHandler(Exception.class)` catch-all 吞掉了 Spring 的 `NoResourceFoundException`（Knife4j 请求 `/favicon.ico` 即触发） | 新增 `NoResourceFoundException` / `NoHandlerFoundException` handler → **404** |
+| **G-06** | 中 | 超限上传时服务端**直接掐断连接**，客户端只拿到不透明网络错误（`Error writing request body to server`），拿不到 413 | Tomcat `max-swallow-size` 默认 2MB < 请求体 → 连接在返回 413 之前就被掐断 | `application.yml` 设 `server.tomcat.max-swallow-size: 64MB`（限量而非无限，避免放任超大 body） |
+
+> **共性（面试可讲的判断力）**：G-01 / G-04 / G-05 都是**"HTTP 状态码语义"**层面的问题——返回体看起来对（业务码正确），但 HTTP 层骗过了网关/监控/第三方集成；G-02 是**"修 bug 修错病因"**（把 DISTINCT 缺失误判为逻辑删除穿透）；G-03 / G-06 是**"层与层之间契约不对齐"**（前端 offer 了什么 vs 后端接受什么，容器 swallow 上限 vs 应用声明的上限）。四类都能在"用例全绿"下存活，说明**只测业务码不测 HTTP 语义**是有盲区的。
+
+
 ## 配置说明
 
 ### 环境变量（.env）
@@ -242,6 +377,11 @@ mvn.cmd test -Dtest=EvalRunnerTest
 | `DEEPSEEK_API_KEY` | DeepSeek 大模型密钥（必填） | — |
 | `ZHIPU_API_KEY` | 智谱密钥（Embedding/Rerank，必填） | — |
 | `JWT_SECRET` | JWT 签名密钥 | 开发可用默认值，生产必改 |
+
+> ⚠️ **凭据漂移陷阱（实测踩坑）**：MinIO / MySQL 的凭据只在**容器首次初始化**时生效。
+> 如果容器已用旧凭据创建过 Volume，之后改 `.env` 里的 `MINIO_ROOT_USER/PASSWORD` 并不会改变容器内实际凭据，
+> 后端拿着新凭据调 MinIO 会一路 401/400（表现为"上传文档失败"）。验收前请确认 `.env` 与
+> `docker inspect <容器>` 中的实际环境变量一致；不一致时要么改 `.env` 回滚，要么删 Volume 重建容器。
 
 ### 检索与 Agent 调优（application.yml → `rag.*`）
 
@@ -296,8 +436,9 @@ rag-knowledge-base/
 │       │   │   ├── QueryDocumentListTool.java       工具：文档列表
 │       │   │   ├── GenerateReportTool.java          工具：报告生成
 │       │   │   ├── AgentExecutor.java               ReAct 循环执行器（≤5 轮）
-│       │   │   ├── Agent.java + DocumentAgent / StatsAgent / ReportAgent
-│       │   │   ├── OrchestratorAgent.java           多 Agent 编排（主管分派）
+│       │   │   ├── Agent.java + AgentResult.java   Agent 契约（回答 + 证据片段）
+│       │   │   ├── DocumentAgent / StatsAgent / ReportAgent   专用子 Agent
+│       │   │   ├── OrchestratorAgent.java           多 Agent 编排（主管分派 + 反思评审）
 │       │   │   ├── AgentMetrics.java                指标埋点
 │       │   │   └── LlmCircuitBreaker.java           熔断器
 │       │   ├── rag/                      🔍 检索增强模块
@@ -315,8 +456,17 @@ rag-knowledge-base/
 │       │       ├── MilvusConfig / MinioConfig / RagProperties(@ConfigurationProperties)
 │       │       └── MybatisPlusConfig / MyMetaObjectHandler / CorsConfig
 │       ├── main/resources/application.yml
-│       └── test/java/com/liushuwen/rag/eval/
-│           └── EvalRunnerTest.java       评估测试（读 docs/eval/questions.json）
+│       └── test/java/com/liushuwen/rag/
+│           ├── acceptance/                ✅ 验收套件（真实 HTTP，58 用例）
+│           │   ├── AcceptanceSupport.java        基类：真实 RestTemplate + 环境指纹 + 向量可见性等待
+│           │   ├── A1_AuthAndContractAcceptanceTest.java      认证与统一契约（12）
+│           │   ├── A2_IngestionAcceptanceTest.java            离线入库（11）
+│           │   ├── A3_RetrievalAcceptanceTest.java            检索链路与隔离（8）
+│           │   ├── A4_ChatFlowAcceptanceTest.java             在线问答全链路（8）
+│           │   ├── A5_AgentAndBreakerAcceptanceTest.java      Agent 链路与熔断（9）
+│           │   └── A6_KnownGapAcceptanceTest.java             已知缺口固化（7）
+│           └── eval/
+│               └── EvalRunnerTest.java       评估回归（读 docs/eval/questions.json，20 题）
 │
 ├── frontend/                             Vue3 前端
 │   ├── vite.config.js                    /api 代理 → localhost:18080
@@ -366,9 +516,9 @@ rag-knowledge-base/
 | GET | `/api/auth/me` | 获取当前用户信息 | 是 |
 | POST | `/api/document/upload` | 上传文档（`file` + 可选 `category`，自动解析分块入库） | 是 |
 | GET | `/api/document/list` | 文档列表（按用户隔离） | 是 |
-| DELETE | `/api/document/{id}` | 删除文档（级联清理 MinIO/MySQL/Milvus） | 是 |
+| DELETE | `/api/document/{id}` | 删除文档（⚠️ 当前仅逻辑删除 document 行，未清理分块 / Milvus 向量 / MinIO 对象，见「已知缺口」） | 是 |
 | POST | `/api/document/embed/{id}` | 触发向量化入库 | 是 |
-| POST | `/api/document/rebuild-index` | 重建混合检索索引（升级 BM25 结构，自动回放已向量化文档） | 是 |
+| POST | `/api/document/rebuild-index` | 重建混合检索索引（升级 BM25 结构；⚠️ 全局操作：drop 主 collection 后回放**所有用户**已向量化文档） | 是 |
 | POST | `/api/chat/session` | 创建对话会话 | 是 |
 | GET | `/api/chat/sessions` | 会话列表 | 是 |
 | PUT | `/api/chat/session/{sessionId}/title` | 修改会话标题 | 是 |
@@ -390,6 +540,7 @@ rag-knowledge-base/
 | 第 5-6 周 | 前端交互、JWT 认证、数据隔离、文档分类 | ✅ |
 | 第 7 周 | 项目文档与评估 | ✅ |
 | 第 8 周 | Agentic RAG 演进：混合检索 / Rerank / 查询改写 / ReAct / 意图路由 / 多 Agent / 长期记忆 / 降级熔断 / 评估 | ✅ |
+| 第 9 周 | 验收测试重写（A1–A6 + 评估，58 用例真实 HTTP）+ 全量功能黑盒测试（48 API 用例 + 27 张 UI 截图，全程无 5xx）+ 修复 12 处缺陷（6 + G-01 ~ G-06）+ 文档与实现对齐 + 已知缺口固化 | ✅ |
 
 ## 常见问题
 

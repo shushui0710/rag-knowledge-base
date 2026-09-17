@@ -26,15 +26,16 @@ public class StatsAgent implements Agent {
     }
 
     @Override
-    public String execute(String task, List<Map<String, Object>> history) {
+    public AgentResult execute(String task, List<Map<String, Object>> history) {
         try {
             // 统计 + 列表组合返回（覆盖"有多少/列出哪些"两类问题）
             String stats = statsTool.execute(Map.of());
             String list = listTool.execute(Map.of());
-            return stats + "\n\n" + list;
+            // 证据 = 工具原文：本 Agent 不经过 LLM，输出即数据库聚合事实，可作为自身依据交给上层评审
+            return AgentResult.of(stats + "\n\n" + list, List.of(stats, list));
         } catch (Exception e) {
             log.error("数据查询失败: task={}, error={}", task, e.getMessage(), e);
-            return "数据查询失败：" + e.getMessage() + "，请稍后重试。";
+            return AgentResult.of("数据查询失败：" + e.getMessage() + "，请稍后重试。");
         }
     }
 }

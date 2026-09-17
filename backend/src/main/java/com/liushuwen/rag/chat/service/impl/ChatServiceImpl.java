@@ -25,6 +25,7 @@ import org.springframework.stereotype.Service;
 import com.liushuwen.rag.config.RagProperties;
 
 import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * RAG 在线问答链路编排服务（核心难点类）。
@@ -127,7 +128,13 @@ public class ChatServiceImpl implements ChatService {
 
         // 功能：按 minScore 阈值（yml 默认 0.35）过滤低分片段，过滤后为空则走兜底文案直接返回｜要点：COSINE ∈ [-1,1]，中文语义相似度普遍偏低（0.3~0.5 常见），阈值要拿测试集校准；空结果让 LLM 硬编会幻觉，故给兜底而非编造
         double minScore = ragProperties.getAgent().getMinScore();   // yml 默认 0.35
-        results.removeIf(h -> h.getScore() < minScore);
+        // 【缺陷修复·不可变集合】RerankService 与 MilvusService.hybridSearch 在"无候选/用户无文档"时
+        // 返回的是 List.of()（JDK 不可变集合），在其上调用 removeIf 会抛 UnsupportedOperationException。
+        // 该路径恰是新用户"未上传文档即提问"的常态链路，修复前必现 HTTP 500。改用 stream().filter() 生成
+        // 新的可变列表，既是防御性编程（不假设上游返回可变集合），也保持过滤语义不变。
+        results = results.stream()
+                .filter(h -> h.getScore() >= minScore)
+                .collect(Collectors.toList());
         if (results.isEmpty()) {
             ChatMessage fallback = new ChatMessage();
             fallback.setSessionId(sessionId);

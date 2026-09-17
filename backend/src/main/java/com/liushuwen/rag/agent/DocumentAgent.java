@@ -15,6 +15,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -49,12 +50,12 @@ public class DocumentAgent implements Agent {
     }
 
     @Override
-    public String execute(String task, List<Map<String, Object>> history) {
+    public AgentResult execute(String task, List<Map<String, Object>> history) {
         // 功能：本轮 history 多轮记忆 + 跨会话长期记忆 recall（按用户隔离）｜要点：双入口记忆设计
         // 常见问题：为什么分两轮历史？→ 当前轮多轮上下文 + 跨会话长期记忆，召回注入 Prompt 增强连贯性
         List<float[]> vectors = embeddingService.embed(List.of(task));
         if (vectors == null || vectors.isEmpty()) {
-            return "文档向量化失败，请稍后重试。";
+            return AgentResult.of("文档向量化失败，请稍后重试。");
         }
 
         // 检索层用户隔离：只在当前用户已向量化文档内检索
@@ -78,14 +79,17 @@ public class DocumentAgent implements Agent {
                 milvusService.hybridSearch(rewriteQuery, vectors.get(0), recallTopK, documentIds),
                 rerankTopN);
         if (results == null || results.isEmpty()) {
-            return "未在知识库中找到相关文档，请换个问法或先上传相关文档。";
+            return AgentResult.of("未在知识库中找到相关文档，请换个问法或先上传相关文档。");
         }
 
+        // 功能：检索片段既拼进 Prompt 又作为"依据"随结果返回｜要点：上层反思评审要核对"是否有据"，必须拿到原始片段
         StringBuilder ctx = new StringBuilder();
+        List<String> evidence = new ArrayList<>();
         for (int i = 0; i < results.size(); i++) {
             String content = results.get(i).getContent();
-            ctx.append("【参考").append(i + 1).append("】")
-                    .append(content == null ? "" : content).append("\n\n");
+            content = content == null ? "" : content;
+            ctx.append("【参考").append(i + 1).append("】").append(content).append("\n\n");
+            evidence.add(content);
         }
         // 长期记忆注入（标注为历史问答记录）
         if (memories != null && !memories.isEmpty()) {
@@ -103,6 +107,6 @@ public class DocumentAgent implements Agent {
         if (topScore >= MEMORY_SAVE_MIN_SCORE) {
             memoryService.saveExchange(userId, task, answer);
         }
-        return answer;
+        return AgentResult.of(answer, evidence);
     }
 }

@@ -19,6 +19,11 @@
 
     <properties>
         <java.version>17</java.version>
+        <!-- ⚠️ 中文 Windows 上 JDK 17 默认 file.encoding=GBK，会导致中文经 Milvus BM25 分词
+             变乱码字节流 → tantivy Rust panic → Milvus 容器 SIGABRT(Exit 134)。
+             sourceEncoding + surefire argLine 双管齐下，保证编译与测试 JVM 都是 UTF-8 -->
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
         <mybatis-plus.version>3.5.5</mybatis-plus.version>
         <!-- Milvus SDK：2.4.1 → 2.5.14（路线A：配合服务端 2.5.x 使用内置 BM25 Function）
              官方兼容表：Milvus 2.5.x ↔ SDK 2.5.14；v1 API（MilvusServiceClient）仍保留可用 -->
@@ -166,6 +171,18 @@
                            java -Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8 -jar xxx.jar
                          或设置环境变量 JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8 -->
                     <jvmArguments>-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8</jvmArguments>
+                </configuration>
+            </plugin>
+            <!-- 验收测试执行器：强制 UTF-8 并输出用例级明细，供《验收报告》逐条取证 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!-- 编码：与 spring-boot:run 的 jvmArguments 保持一致，避免测试进程走 GBK 触发 Milvus 崩溃 -->
+                    <argLine>-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8 -Djava.net.useSystemProxies=false</argLine>
+                    <trimStackTrace>false</trimStackTrace>
+                    <!-- 不因单个测试类失败而中断，保证一轮跑完能拿到完整验收清单 -->
+                    <testFailureIgnore>false</testFailureIgnore>
                 </configuration>
             </plugin>
         </plugins>
