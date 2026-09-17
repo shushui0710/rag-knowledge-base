@@ -158,6 +158,14 @@
                             <artifactId>lombok</artifactId>
                         </exclude>
                     </excludes>
+                    <!-- ⚠️ Windows 必需：JDK 17 在中文 Windows 上默认 file.encoding=GBK，
+                         中文文本经 Milvus 服务端 BM25 Function 建索引时会被转成乱码字节流，
+                         触发 tantivy 分词器按多字节切分 → Rust panic → Milvus 容器 SIGABRT(Exit 134)。
+                         这里强制 UTF-8，保证 mvn spring-boot:run 启动即生效。
+                         若以打包 jar 方式运行，需自行追加：
+                           java -Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8 -jar xxx.jar
+                         或设置环境变量 JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8 -->
+                    <jvmArguments>-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8</jvmArguments>
                 </configuration>
             </plugin>
         </plugins>

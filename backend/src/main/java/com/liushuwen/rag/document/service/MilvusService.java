@@ -19,6 +19,7 @@ import io.milvus.v2.service.collection.request.CreateCollectionReq;
 import io.milvus.v2.service.collection.request.HasCollectionReq;
 import io.milvus.v2.service.collection.request.LoadCollectionReq;
 import io.milvus.v2.service.index.request.CreateIndexReq;
+import io.milvus.v2.service.vector.request.InsertReq;
 import io.milvus.v2.service.vector.request.SearchReq;
 import io.milvus.v2.service.vector.request.data.EmbeddedText;
 import io.milvus.v2.service.vector.response.SearchResp;
@@ -197,7 +198,13 @@ public class MilvusService {
                     .withRows(rows)
                     .build();
 
-            milvusServiceClient.insert(insertParam);
+            // ⚠️ 必须走 v2 insert：混合 collection 带 BM25 Function（bm25_vector 由服务端生成），
+            //    v1 insert 的 ParamUtils 校验器要求行数据提供全部字段，会报
+            //    "The field: bm25_vector is not provided"；v2 insert 识别 Function 生成字段，跳过校验
+            milvusClientV2.insert(InsertReq.builder()
+                    .collectionName(collectionName)
+                    .data(rows)
+                    .build());
             log.info("Milvus插入成功: {}条向量, documentId={}", chunkIds.size(), documentId);
 
         } catch (Exception e) {
@@ -522,16 +529,23 @@ public class MilvusService {
                     .outputFieldNames(List.of("bm25_vector"))
                     .build());                                       // 服务端自动 BM25 分词
 
-            // 2) 建表 + 稀疏向量索引 + 加载
+            // 2) 建表 + 向量索引（稠密 embedding + 稀疏 bm25_vector 都必须建，缺一则 loadCollection 报
+            //    "there is no vector index on field"）+ 加载
             milvusClientV2.createCollection(CreateCollectionReq.builder()
                     .collectionName(collectionName).collectionSchema(schema).build());
             milvusClientV2.createIndex(CreateIndexReq.builder()
                     .collectionName(collectionName)
-                    .indexParams(List.of(IndexParam.builder()
-                            .fieldName("bm25_vector")
-                            .indexType(IndexParam.IndexType.AUTOINDEX)
-                            .metricType(IndexParam.MetricType.BM25)
-                            .build()))
+                    .indexParams(List.of(
+                            IndexParam.builder()
+                                    .fieldName("embedding")
+                                    .indexType(IndexParam.IndexType.AUTOINDEX)
+                                    .metricType(IndexParam.MetricType.COSINE)
+                                    .build(),
+                            IndexParam.builder()
+                                    .fieldName("bm25_vector")
+                                    .indexType(IndexParam.IndexType.AUTOINDEX)
+                                    .metricType(IndexParam.MetricType.BM25)
+                                    .build()))
                     .build());
             milvusClientV2.loadCollection(LoadCollectionReq.builder()
                     .collectionName(collectionName).build());

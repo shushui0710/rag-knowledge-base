@@ -9,9 +9,8 @@ export function createSession() {
 }
 
 export function askQuestion(sessionId, question) {
-  return request.post(`/chat/ask/${sessionId}`, JSON.stringify(question), {
-    headers: { 'Content-Type': 'application/json' },
-  })
+  // 后端 @RequestBody AskRequest 期望对象 {"question": "..."}，不能发裸字符串
+  return request.post(`/chat/ask/${sessionId}`, { question })
 }
 
 export function getHistory(sessionId) {
