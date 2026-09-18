@@ -12,15 +12,15 @@ import java.util.concurrent.atomic.AtomicLong;
  * 【设计要点】线程安全计数：ConcurrentHashMap + AtomicLong 无锁并发累加，避免 synchronized 开销
  * 【设计要点·唯一写者口径】埋点收敛到「唯一出口」，而不是散落在各调用点——
  *   ① queryCount / avgCostMs：用户问答次数与端到端耗时，由**入口层**记账
- *      （ChatServiceImpl.ask 覆盖对话页两种模式、AgentController 覆盖 /api/agent/* 两个裸端点），
+ *      （ChatServiceImpl.ask 覆盖对话页两种模式、AgentController 覆盖调试端点 /api/agent/ask），
  *      一次用户提问恰好记一次；
  *   ② llmCalls：由 **LlmService** 记账——它的 3 个方法是全站唯一打 /v1/chat/completions 的出口；
  *   ③ toolCalls：由 **ToolRegistry.execute** 记账——它是全站唯一执行 Tool 的出口。
  *   出口唯一 ⇒ 任何链路（RAG / 单 Agent ReAct / 多 Agent 编排）都不会漏记，也不会重复记。
  * 【曾有缺陷·G-08/G-09】修复前 llmCalls 的写法是"双计"：AgentExecutor 循环内每轮调一次 recordLlmCall()，
  * 结束时 recordQuery(iterations, toolCount) 又按轮数/工具数 addAndGet 补一次，同一次调用被记两遍；
- * 同时埋点只存在于 AgentExecutor 内部，主 RAG 链路（/api/chat/ask）与多 Agent 编排链路（/api/agent/orchestrate、
- * 对话页 mode=agent）全程不计数——指标只反映了 1/3 的流量。现已按上述"唯一出口"口径重构。
+ * 同时埋点只存在于 AgentExecutor 内部，主 RAG 链路（/api/chat/ask）与多 Agent 编排链路（对话页 mode=agent）
+ * 全程不计数——指标只反映了 1/3 的流量。现已按上述"唯一出口"口径重构。
  * 历史原因：埋点曾与"谁调用 LLM"耦合在执行器里，而执行器并非唯一调用方，必然既漏又重。
  * 【常见问题】生产环境如何做可观测？——换 Micrometer + Prometheus，指标/日志/链路追踪三件套
  */

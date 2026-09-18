@@ -2,7 +2,6 @@ package com.liushuwen.rag.controller;
 
 import com.liushuwen.rag.agent.AgentExecutor;
 import com.liushuwen.rag.agent.AgentMetrics;
-import com.liushuwen.rag.agent.OrchestratorAgent;
 import com.liushuwen.rag.common.BusinessException;
 import com.liushuwen.rag.common.Result;
 import io.swagger.v3.oas.annotations.Operation;
@@ -14,24 +13,30 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Agent 智能问答接口：单 Agent（ReAct+工具）与多 Agent 编排两个入口。
- * 【设计要点】编排模式：单 Agent 用 ReAct 循环（思考-行动-观察）调工具；多 Agent 用主管(Orchestrator)分派子任务
- * 【设计要点】入口层指标记账：/api/agent/* 是"裸链路入口"，不经过 ChatService，故由本类统一记账一次。
- * 记账口径——入口记"次数+端到端耗时"，依赖出口（LlmService/ToolRegistry.execute）记"调用次数"。
- * 【常见问题】为何 /api/** 也走 JWT 拦截？——与现有接口一致，问答须登录；orchestrate 的 history 为何暂传空？——会话历史持久化未完成，先跑通链路
+ * Agent 智能问答接口：暴露 ReAct 引擎的**调试入口**（单端点）。
+ * 【定位说明·这是调试端点，不是产品入口】用户唯一的 Agent 入口是对话页「深度思考」
+ * （POST /api/chat/ask + mode=agent → OrchestratorAgent → ReportAgent → 同一个 AgentExecutor）。
+ * 本端点保留的理由是「可独立验证引擎」：它直连 AgentExecutor，不掺意图路由那次 LLM 调用
+ * （路由本身要烧一次 LLM，且可能把问题分派到别的分支），因此适合 Knife4j 手工调试与
+ * acceptance A5 的隔离取证——A5-12 的三链降级对比、A5-14 的「单引擎两入口」assertSame 都依赖它。
+ * 【设计要点】入口层指标记账：/api/agent/ask 不经过 ChatService，故由本类统一记账一次。
+ * 记账口径——入口记"次数+端到端耗时"，依赖出口（LlmService/ToolRegistry.execute）记"调用次数"；熔断同样收口在 LlmService。
+ * 【已删除·POST /api/agent/orchestrate】该端点与产品入口完全重叠（产品入口 = 同一套 OrchestratorAgent 代码
+ * + 多轮历史 + 落库，严格覆盖它），前端（frontend/src）对它的引用为 0 次，独有价值仅"不落库"，
+ * 属纯冗余：留着会让"编排到底有几个入口"变得含糊。删除后 OrchestratorAgent.execute(String, List)
+ * 失去唯一调用方，已作为死方法一并移除——与当初删 REPORT 死分支同一原则：装配了没人调的东西不留。
+ * 【常见问题】为何 /api/** 也走 JWT 拦截？——与现有接口一致，问答须登录
  */
-@Tag(name = "Agent 智能问答")
+@Tag(name = "Agent 引擎调试接口")
 @RestController
 @RequestMapping("/api/agent")
 @RequiredArgsConstructor
 public class AgentController {
 
     private final AgentExecutor agentExecutor;
-    private final OrchestratorAgent orchestratorAgent;
 
     /** 指标记账（入口层唯一写者之一，另一个是 ChatServiceImpl.ask） */
     private final AgentMetrics metrics;
@@ -41,7 +46,7 @@ public class AgentController {
         private String question;
     }
 
-    @Operation(summary = "单 Agent 问答（ReAct + 工具调用）")
+    @Operation(summary = "ReAct 引擎直连（调试用；产品入口在对话页「深度思考」）")
     @PostMapping("/ask")
     public Result<String> ask(@RequestBody AskRequest req) {
         // 【缺陷修复·HTTP 语义双轨】原为 return Result.error(400, ...)：方法正常返回会被 Spring
@@ -51,17 +56,6 @@ public class AgentController {
             throw new BusinessException("问题不能为空");
         }
         return Result.success(timed(() -> agentExecutor.execute(req.getQuestion())));
-    }
-
-    @Operation(summary = "多 Agent 编排问答")
-    @PostMapping("/orchestrate")
-    public Result<String> orchestrate(@RequestBody AskRequest req) {
-        // 同上：与 /ask 保持一致的 HTTP 语义（缺陷修复·HTTP 语义双轨）
-        if (req == null || req.getQuestion() == null || req.getQuestion().isBlank()) {
-            throw new BusinessException("问题不能为空");
-        }
-        // 功能：调用多 Agent 编排，历史暂传空列表｜要点：会话历史持久化未完成，先跑通链路，后续接会话表或前端传入
-        return Result.success(timed(() -> orchestratorAgent.execute(req.getQuestion(), List.of())));
     }
 
     /**

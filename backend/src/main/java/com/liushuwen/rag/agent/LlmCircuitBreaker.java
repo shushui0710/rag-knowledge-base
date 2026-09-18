@@ -11,6 +11,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * LLM 熔断器：下游连续失败达阈值后打开熔断，期间直接走兜底，保护 LLM API 不被持续打崩。
  * 【设计要点】熔断状态机：closed→连续失败达阈值(5次)→open 60s→恢复；与限流区别（护下游 vs 护己）
  * 【常见问题】为什么熔断而非一直重试？——重试既烧钱又雪上加霜，熔断给下游喘息、恢复后自动放行
+ * 【接线位置·为什么必须挂在唯一出口】本类只被 {@link com.liushuwen.rag.chat.service.LlmService} 持有，
+ * 而不是被某个执行器（如 AgentExecutor）持有。修复前挂在执行器上 ⇒ 只有路过该执行器的链路受保护，
+ * 用户真正在用的主问答链路 /api/chat/ask 完全裸奔。熔断保护的是"下游 LLM API"，
+ * 因此判据必须是"是否经过 LLM 出口"，而不是"是否经过某个执行器"。
  */
 @Slf4j
 @Component

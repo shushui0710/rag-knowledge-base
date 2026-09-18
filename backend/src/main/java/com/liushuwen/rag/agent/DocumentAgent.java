@@ -2,6 +2,7 @@ package com.liushuwen.rag.agent;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.liushuwen.rag.chat.service.LlmService;
+import com.liushuwen.rag.common.LlmUnavailableException;
 import com.liushuwen.rag.common.UserContext;
 import com.liushuwen.rag.config.RagProperties;
 import com.liushuwen.rag.document.entity.Document;
@@ -105,13 +106,24 @@ public class DocumentAgent implements Agent {
         String prompt = buildHistoryBlock(history)
                 + "请根据以下参考资料回答用户问题：\n\n" + ctx
                 + "用户问题：" + task;
-        String answer = llmService.chat(prompt);
+        // 【熔断降级】LLM 唯一出口熔断打开时抛 LlmUnavailableException：本 Agent 返回统一兜底文案，
+        // AgentResult 照常携带 evidence ⇒ 上层仍能把"检索到的依据"展示给用户，且整条编排链不会中断
+        String answer;
+        boolean degraded = false;
+        try {
+            answer = llmService.chat(prompt);
+        } catch (LlmUnavailableException e) {
+            log.warn("[DocumentAgent] LLM 熔断中，返回兜底文案: {}", task);
+            answer = LlmUnavailableException.FALLBACK_MESSAGE;
+            degraded = true;
+        }
 
         // 高质量问答对回存长期记忆（topScore≥门槛才存，与 ChatServiceImpl 同一质量线）
+        // 降级产生的兜底文案不含任何知识，不得入库（degraded 拦截）
         float topScore = results.stream()
                 .map(MilvusService.SearchResult::getScore)
                 .max(Float::compare).orElse(0f);
-        if (topScore >= MEMORY_SAVE_MIN_SCORE) {
+        if (!degraded && topScore >= MEMORY_SAVE_MIN_SCORE) {
             memoryService.saveExchange(userId, task, answer);
         }
         return AgentResult.of(answer, evidence);

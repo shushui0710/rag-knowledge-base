@@ -16,6 +16,8 @@ import java.util.Map;
 /**
  * 主管 Agent：路由意图后分派专用子 Agent，再经 CriticService 反思评审（不合格重写一次）汇总返回。
  * 【设计要点】多 Agent 主管模式（Supervisor）：意图路由 + 子 Agent 分派 + HYBRID 组合回答
+ * 【设计要点】四条分派分支：DOCUMENT（RAG 问答）/ STATS（工具直答）/ REPORT（ReAct + 报告生成）/ HYBRID（组合），
+ * 由 RouterService 的 LLM 分类产出；子 Agent 通过 Spring 注入的 List&lt;Agent&gt; 按 type() 取用（策略模式）。
  * 【常见问题】反思为何只做一次且重写上限硬控？——控制 LLM 成本与延迟，防自我修正无限循环
  */
 @Slf4j
@@ -42,22 +44,13 @@ public class OrchestratorAgent {
     }
 
     /**
-     * 多 Agent 编排入口（只取回答文本）。
-     * 【设计要点】保留此签名供 AgentController 等"只要文本"的调用方使用；需要落库带来源时用 executeResult
-     *
-     * @param question 用户问题
-     * @param history  会话历史
-     * @return 最终回答
-     */
-    public String execute(String question, List<Map<String, Object>> history) {
-        return executeResult(question, history).answer();
-    }
-
-    /**
      * 多 Agent 编排入口（回答 + 依据）。
      * 【设计要点】对话链路需要把"依据片段"一并落库随回答返回，故不能只给文本——
      * 这也是把编排接进对话页时必须补的能力：原来只返回 String，落库只能存空 sources，
      * 前端「参考来源」区就是空的，等于把 agent 的能力阉割掉一半。
+     * 【设计要点·为什么不再提供"只取文本"的重载】此前另有一个 execute(question, history) 返回 String 的重载，
+     * 唯一调用方是已删除的裸接口 POST /api/agent/orchestrate。该端点与产品入口（对话页 mode=agent =
+     * 同一套编排 + 多轮历史 + 落库）完全重叠、前端引用为 0，属纯冗余，故端点与重载一并移除。
      *
      * @param question 用户问题
      * @param history  会话历史（多轮上下文，供子 Agent 注入 Prompt）
@@ -66,13 +59,24 @@ public class OrchestratorAgent {
     public AgentResult executeResult(String question, List<Map<String, Object>> history) {
         Route route = routerService.route(question);
         AgentResult result;
-        // 是否为"工具直答"：输出不经过 LLM，是数据库聚合的确定性事实
-        boolean toolGrounded;
+        // 是否跳过反思评审（重写只会帮倒忙的两种情况）：
+        //   ① STATS —— 回答由工具直出（MySQL 聚合的确定性事实），既没有幻觉可纠，
+        //      也没有"文档依据片段"供评委核对；
+        //   ② REPORT —— 回答是长结构化产物，而重写 Prompt（"更直接地回答用户问题、逻辑清晰"）
+        //      是面向短问答设计的，套在整篇报告上会把章节结构推平；报告的依据同样已随
+        //      ReAct 的工具输出返回（AgentResult.evidence），不靠重写补质量。
+        boolean skipReflection;
         switch (route) {
             case STATS -> {
                 Agent statsAgent = findAgent(Agent.AgentType.STATS);
                 result = statsAgent.execute(question, history);
-                toolGrounded = true;
+                skipReflection = true;
+            }
+            case REPORT -> {
+                // 报告生成：走 ReportAgent（内部即 AgentExecutor 的 ReAct 循环 + generate_report 工具）
+                Agent reportAgent = findAgent(Agent.AgentType.REPORT);
+                result = reportAgent.execute(question, history);
+                skipReflection = true;
             }
             case HYBRID -> {
                 // HYBRID = 先查数据统计，再结合文档问答（组合回答）
@@ -83,24 +87,23 @@ public class OrchestratorAgent {
                 result = AgentResult.of(
                         "【数据概况】\n" + stats.answer() + "\n\n【文档解答】\n" + doc.answer(),
                         concat(stats.evidence(), doc.evidence()));
-                toolGrounded = false;      // 组合回答含 LLM 生成部分，仍需反思
+                skipReflection = false;      // 组合回答含 LLM 生成部分，仍需反思
             }
             default -> {
                 Agent docAgent = findAgent(Agent.AgentType.DOCUMENT);
                 result = docAgent.execute(question, history);
-                toolGrounded = false;
+                skipReflection = false;
             }
         }
         log.info("[Orchestrator] 路由={}，完成生成", route);
 
         // 功能：反思评审，不合格带意见重写一次（重写次数硬上限，防无限循环）｜要点：Critic 自省
-        // 【缺陷修复·反思误用】STATS 分支的回答由工具直出（MySQL 聚合事实），既不存在需要纠正的幻觉，
-        // 也没有"文档依据片段"可供评委核对。修复前对分支统一调 Critic 并传空证据（List.of()），
+        // 【缺陷修复·反思误用】修复前对 STATS 分支统一调 Critic 并传空证据（List.of()），
         // 评委必判"无知识库依据"不合格 → 触发一次纯 LLM 重写，把准确数字换成模型的模糊复述
         // （验收实测：回答退化为"根据当前可检索到的知识库内容，文档数量为"，数字与列表全丢）。
-        // 结论：确定性事实不进"评审-重写"闭环，反思只作用于 LLM 生成的回答。
-        if (toolGrounded) {
-            log.info("[Orchestrator] 路由={} 为工具直答，跳过反思评审（重写只会降质）", route);
+        // 结论：反思只作用于"面向短问答、由 LLM 生成"的回答（DOCUMENT / HYBRID）。
+        if (skipReflection) {
+            log.info("[Orchestrator] 路由={} 为工具直答或长结构化产物，跳过反思评审（重写只会降质）", route);
             return result;
         }
         return selfCorrect(question, result);
@@ -133,9 +136,18 @@ public class OrchestratorAgent {
             }
             log.info("[Critic] 回答不合格（{}），第{}次重写: {}", c.getReason(), i + 1, question);
             // 带着评审意见重写（把 reason 塞进 system）
-            String rewritten = llmService.chatWithSystem(
-                    "根据评审意见改进你的回答，要求更直接地回答用户问题、逻辑清晰。\n评审意见：" + c.getReason(),
-                    question, 0.4);
+            // 【缺陷修复·重写异常】重写本身也是一次 LLM 调用，熔断打开或调用失败时会抛异常。
+            // 原实现让异常直接冒泡 ⇒ 一次"锦上添花"的重写失败会把已经生成好的回答整条打掉（用户拿到 500）。
+            // 重写是增强而非必需，失败即保留原回答（与下方"空回答保留原文"同一原则）。
+            String rewritten;
+            try {
+                rewritten = llmService.chatWithSystem(
+                        "根据评审意见改进你的回答，要求更直接地回答用户问题、逻辑清晰。\n评审意见：" + c.getReason(),
+                        question, 0.4);
+            } catch (Exception e) {
+                log.warn("[Critic] 第{}次重写调用失败，保留原回答: {}", i + 1, e.getMessage());
+                return AgentResult.of(current, result.evidence());
+            }
             // 【缺陷修复·空回答】重写调用可能返回空内容（如思考模型只回 reasoning_content、或返回体异常）。
             // 若直接采用空串，用户会收到 HTTP 200 + 空回答——比"未重写"更糟。故空值即保留原回答，保证可用性优先。
             if (rewritten == null || rewritten.isBlank()) {

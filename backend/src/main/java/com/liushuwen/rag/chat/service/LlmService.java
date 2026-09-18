@@ -1,10 +1,13 @@
 package com.liushuwen.rag.chat.service;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.liushuwen.rag.agent.AgentMetrics;
+import com.liushuwen.rag.agent.LlmCircuitBreaker;
 import com.liushuwen.rag.agent.Tool;
 import com.liushuwen.rag.common.BusinessException;
+import com.liushuwen.rag.common.LlmUnavailableException;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -24,7 +27,12 @@ import java.util.stream.Collectors;
  * 在 Agentic RAG 链路中提供三种能力：纯问答 chat、带 Function Calling 的 chatWithTools、可定制 system 的 chatWithSystem。
  * 【设计要点】第三方 AI API 标准调用范式（Bearer 认证 → 构造 messages → RestTemplate 发请求 → POJO/JsonNode 解析 → 异常降级），以及思考模型 messages 协议的字段兼容
  * 【设计要点】本类是**全站 LLM 调用的唯一出口**（3 个方法三条形态：纯问答 / Function Calling / 自定义 system），
- * 因此指标埋点（llmCalls）放在这里：出口唯一 ⇒ 主 RAG 链、单 Agent、多 Agent 编排一律被覆盖，且不会重复计数。
+ * 因此两件"跨界关注点"都收口在这里：①指标埋点（llmCalls）②熔断（LlmCircuitBreaker）。
+ * 出口唯一 ⇒ 主 RAG 链、单 Agent、多 Agent 编排（含意图路由/查询改写/反思评审）一律被覆盖，既不漏记也不重记。
+ * 【缺陷修复·熔断挂在执行器层】修复前熔断只被 AgentExecutor 使用 ⇒ 只有 /api/agent/ask 有保护，
+ * 而用户真正在用的主问答链路 /api/chat/ask 完全没有熔断。根因是"挂错了层"：熔断的目的是保护下游 LLM API，
+ * 挂在某个执行器上，天然只能覆盖"路过该执行器"的链路；挂到唯一出口才与调用方无关地覆盖全站。
+ * 这与指标埋点从"散落各调用点"收口到"唯一出口"是同一个思路（G-08/G-09 的延续）。
  * 【常见问题】为什么用 LinkedHashMap 构造请求体？——保证 JSON 字段顺序与协议一致（模型参数顺序敏感场景）；为什么 Function Calling 的 assistant 消息必须原样回填？——思维链/工具调用原始字段（reasoning_content/tool_calls）缺失会被 API 拒绝
  */
 @Slf4j
@@ -58,17 +66,52 @@ public class LlmService {
     private final AgentMetrics metrics;
 
     /**
+     * LLM 熔断器：与指标埋点同挂"唯一出口"。
+     * 三个方法在发起真实 HTTP 前统一 tryAcquire，成功后 onSuccess、失败后 onFailure。
+     */
+    private final LlmCircuitBreaker circuitBreaker;
+
+    /**
+     * 唯一出口的底层实现：熔断判断 → 发 POST /v1/chat/completions → 成功清零计数并记一次调用 → 返回原始响应体。
+     * 【设计要点】把"熔断 + 认证 + 发请求 + 计数"压成一个出口，上层三个方法只负责"拼请求体 / 解响应体"，
+     * 跨界关注点全部落在这里 ⇒ 新增一条调用链时天然被熔断与指标覆盖，无需在调用处补埋点。
+     * 【常见问题】熔断打开时为什么抛异常而不是返回空串？——返回空串会被上层当成"模型给了空回答"静默吞掉，
+     * 用户拿到空内容；抛专属异常才能让每条链路按自己的语义降级
+     * （主问答给兜底文案、路由回落 DOCUMENT、改写退回原句、评审放行、ReAct 返回降级提示）。
+     *
+     * @param body 已拼好的 OpenAI 兼容请求体
+     * @return 原始响应体 JSON 字符串
+     */
+    private String postChatCompletions(Map<String, Object> body) throws JsonProcessingException {
+        // 功能：熔断前置判断——打开期间直接抛专属异常，不发请求｜要点：熔断点必须在"唯一出口"，才能覆盖全站链路
+        if (!circuitBreaker.tryAcquire()) {
+            throw new LlmUnavailableException();
+        }
+        // 功能：构造请求头（JSON + Bearer Token 认证）｜要点：HttpHeaders.setBearerAuth 注入 API Key，Content-Type 声明 application/json
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(apiKey);
+
+        // 功能：向 /v1/chat/completions 发 POST 请求｜要点：RestTemplate.exchange 同步调用，HttpEntity 封装请求体+头，String.class 收原始响应
+        String apiUrl = baseUrl + "/v1/chat/completions";
+        HttpEntity<String> entity = new HttpEntity<>(objectMapper.writeValueAsString(body), headers);
+        ResponseEntity<String> response = restTemplate.exchange(
+                apiUrl, HttpMethod.POST, entity, String.class);
+
+        // 功能：调用成功 → 清零熔断失败计数 + 记一次 LLM 调用｜要点：两个"全站唯一写者"都收口在出口处，
+        // 只统计"真的发出并拿到响应"的调用；失败时由上层 catch 统一 onFailure 并转 BusinessException
+        circuitBreaker.onSuccess();
+        metrics.recordLlmCall();
+        return response.getBody();
+    }
+
+    /**
      * 纯问答调用：构造 system+user 双消息的 OpenAI 兼容请求，调 DeepSeek 取回答文本。
      * 【设计要点】OpenAI 兼容协议形态（model + messages + max_tokens/temperature），RestTemplate 同步调用与 POJO 绑定解析
      * 【常见问题】为什么 messages 用 List<Map> 而非强类型？——协议字段少且固定，Map 构造最轻；异常如何降级？——catch 后转 BusinessException，不把底层错误暴露给前端
      */
     public String chat(String prompt) {
         try {
-            // 功能：构造请求头（JSON + Bearer Token 认证）｜要点：HttpHeaders.setBearerAuth 注入 API Key，Content-Type 声明 application/json
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.APPLICATION_JSON);
-            headers.setBearerAuth(apiKey);
-
             // 功能：构造 OpenAI 兼容请求体（model + messages[system,user] + max_tokens/temperature），用 LinkedHashMap 保序后写 JSON｜要点：LinkedHashMap 保证字段顺序与协议一致；messages 用 Map 列表贴合协议、不引入多余 POJO
             Map<String,Object> body=new LinkedHashMap<>();
             List<Map<String,String>> messages=new ArrayList<>();
@@ -86,29 +129,23 @@ public class LlmService {
             body.put("messages",messages);
             body.put("max_tokens",maxTokens);
             body.put("temperature",temperature);
-            String requestBody=objectMapper.writeValueAsString(body);
 
-
-
-            // 功能：向 /v1/chat/completions 发 POST 请求｜要点：RestTemplate.exchange 同步调用，HttpEntity 封装请求体+头，String.class 收原始响应
-            String apiUrl = baseUrl + "/v1/chat/completions";
-            HttpEntity<String> entity = new HttpEntity<>(requestBody, headers);
-            ResponseEntity<String> response = restTemplate.exchange(
-                    apiUrl, HttpMethod.POST, entity, String.class);
-            // 功能：记一次 LLM 调用（全站唯一埋点）｜要点：只统计"真的发出并拿到响应"的调用，
-            // 失败时下方 catch 直接转 BusinessException，不计数——避免把降级路径算成 LLM 消耗
-            metrics.recordLlmCall();
+            // 功能：交唯一出口发请求（熔断前置 + Bearer 认证 + 响应体返回 + 计数）｜要点：三条形态共用同一出口，熔断与指标才能"一处收口、全站覆盖"
+            String raw = postChatCompletions(body);
 
             // 功能：把响应体反序列化为 DeepSeekResponse（@JsonIgnoreProperties 忽略未知字段），取 choices[0].message.content｜要点：POJO 绑定比手动遍历 JsonNode 更稳健，字段缺失由 Jackson 容错；choices 是数组须先 get(0)
-            DeepSeekResponse resp = objectMapper.readValue(response.getBody(), DeepSeekResponse.class);
+            DeepSeekResponse resp = objectMapper.readValue(raw, DeepSeekResponse.class);
             String answer = resp.getChoices().get(0).getMessage().getContent();
-
 
 
             log.info("DeepSeek生成完成, 回答长度: {}", answer.length());
             return answer;
 
+        } catch (LlmUnavailableException e) {
+            // 熔断打开：本次压根没发出请求，不属于"调用失败"，不能污染失败计数
+            throw e;
         } catch (Exception e) {
+            circuitBreaker.onFailure();
             log.error("调用DeepSeek API失败: {}", e.getMessage());
             throw new BusinessException("大模型生成失败: " + e.getMessage());
         }
@@ -172,11 +209,6 @@ public class LlmService {
      */
     public LlmResponse chatWithTools(List<Map<String, Object>> messages, List<Tool> tools) {
         try {
-            // 功能：构造请求头（与 chat() 一致：JSON + Bearer 认证）｜要点：复用同一套 OpenAI 兼容认证头
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.APPLICATION_JSON);
-            headers.setBearerAuth(apiKey);
-
             // 功能：构造请求体——messages + tools（type=function + name/description/parameters 的 JSON Schema）｜要点：用 LinkedHashMap 逐字段拼装工具定义，parameters 由 readTree 解析 schema 保结构
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("model", model);                        // deepseek-v4-flash
@@ -199,30 +231,28 @@ public class LlmService {
             body.put("tool_choice", "auto");
             body.put("temperature", 0.3);
 
-            // 功能：向 /v1/chat/completions 发 POST（含 tools）｜要点：RestTemplate.exchange 同步调用，String 收响应后反序列化
-            String apiUrl = baseUrl + "/v1/chat/completions";
-            HttpEntity<String> entity = new HttpEntity<>(
-                    objectMapper.writeValueAsString(body), headers);
-            ResponseEntity<String> response = restTemplate.exchange(
-                    apiUrl, HttpMethod.POST, entity, String.class);
-            // 功能：记一次 LLM 调用（全站唯一埋点）｜要点：ReAct 每轮决策都算一次真实调用，
-            // 计数只在此处发生，AgentExecutor 不再自行计数——修复前两处都记，导致整体翻倍
-            metrics.recordLlmCall();
-            DeepSeekResponse resp = objectMapper.readValue(response.getBody(), DeepSeekResponse.class);
+            // 功能：交唯一出口发请求（熔断前置 + 认证 + 计数），返回原始响应体｜要点：ReAct 每轮决策都算一次真实调用，
+            // 计数只在出口处发生，AgentExecutor 不再自行计数——修复前两处都记，导致整体翻倍
+            String rawBody = postChatCompletions(body);
+            DeepSeekResponse resp = objectMapper.readValue(rawBody, DeepSeekResponse.class);
 
             // 功能：取 choices[0].message 判断是否有 tool_calls｜要点：choices 是数组须先 get(0)；有 tool_calls 进入工具调用分支，否则直接返回回答
             Message msg = resp.getChoices().get(0).getMessage();
             if (msg.getToolCalls() != null && !msg.getToolCalls().isEmpty()) {
                 // 功能：把模型返回的 assistant 消息完整原样保存（含 role/content/reasoning_content/tool_calls），供 ReAct 循环回填｜要点：思考模型缺 reasoning_content 必报错、tool_calls 缺 index/type 报 "missing field type"，须从原始 JSON 取
                 // 常见问题：为什么用 readTree→Map 而非 convertValue(POJO→Map)？→ convertValue 会把字段名退化成 Java 的 reasoningContent/toolCalls，API 不认，故必须用 JsonNode 保留原始 JSON 字段名
-                com.fasterxml.jackson.databind.JsonNode rawNode = objectMapper.readTree(response.getBody())
+                com.fasterxml.jackson.databind.JsonNode rawNode = objectMapper.readTree(rawBody)
                         .path("choices").get(0).path("message");
                 Map<String, Object> raw = objectMapper.convertValue(rawNode, Map.class);
                 raw.put("type", "message");   // 思考模型要求每条消息带 type 字段
                 return LlmResponse.toolCalls(msg.getToolCalls(), raw);
             }
             return LlmResponse.answer(msg.getContent() == null ? "" : msg.getContent());
+        } catch (LlmUnavailableException e) {
+            // 熔断打开：本模块未发出请求，不计失败
+            throw e;
         } catch (Exception e) {
+            circuitBreaker.onFailure();
             log.error("Function Calling 调用失败: {}", e.getMessage(), e);
             throw new BusinessException("大模型生成失败: " + e.getMessage());
         }
@@ -267,11 +297,6 @@ public class LlmService {
      */
     public String chatWithSystem(String system, String user, double temperature) {
         try {
-            // 功能：构造请求头（与 chat() 一致：JSON + Bearer 认证）｜要点：复用同一套 OpenAI 兼容认证头
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.APPLICATION_JSON);
-            headers.setBearerAuth(apiKey);
-
             // 功能：构造请求体 messages=[system,user]，temperature 参数化（改写/路由用低值）｜要点：用 Map.of 快速拼装 system/user 双消息
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("model", model);                       // 当前模型 deepseek-v4-flash
@@ -282,18 +307,16 @@ public class LlmService {
             body.put("max_tokens", maxTokens);
             body.put("temperature", temperature);
 
-            // 功能：发请求并复用 POJO 绑定取 choices[0].message.content｜要点：DeepSeekResponse 反序列化复用，降低重复代码
-            String apiUrl = baseUrl + "/v1/chat/completions";
-            HttpEntity<String> entity = new HttpEntity<>(
-                    objectMapper.writeValueAsString(body), headers);
-            ResponseEntity<String> response = restTemplate.exchange(
-                    apiUrl, HttpMethod.POST, entity, String.class);
-            // 功能：记一次 LLM 调用（全站唯一埋点）｜要点：查询改写/意图路由/反思评审这些"子任务"
-            // 同样消耗 LLM 额度，必须计入——修复前它们完全不在指标内
-            metrics.recordLlmCall();
-            DeepSeekResponse resp = objectMapper.readValue(response.getBody(), DeepSeekResponse.class);
+            // 功能：交唯一出口发请求并复用 POJO 绑定取 choices[0].message.content｜要点：查询改写/意图路由/反思评审这些"子任务"
+            // 同样消耗 LLM 额度、同样需要熔断保护，走同一出口后三者自动被覆盖
+            String raw = postChatCompletions(body);
+            DeepSeekResponse resp = objectMapper.readValue(raw, DeepSeekResponse.class);
             return resp.getChoices().get(0).getMessage().getContent();
+        } catch (LlmUnavailableException e) {
+            // 熔断打开：本模块未发出请求，不计失败；由调用方按各自语义降级
+            throw e;
         } catch (Exception e) {
+            circuitBreaker.onFailure();
             log.error("chatWithSystem 调用失败: {}", e.getMessage(), e);
             throw new BusinessException("大模型生成失败: " + e.getMessage());
         }

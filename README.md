@@ -5,8 +5,8 @@
 核心亮点：
 
 - **混合检索**：Milvus 2.5 内置 BM25 Function，稠密 + 稀疏双路召回，加权融合（alpha=0.7）后经智谱 Rerank 精排（召回 20 → 精排 5），并按最低相似度 0.35 过滤
-- **Agentic 能力**：ReAct 循环（≤5 轮）+ 工具调用 + 意图路由（DOCUMENT / STATS / HYBRID）+ 多 Agent 编排；反思评审（LLM-as-Judge）带证据评审并限 1 次重写，**仅作用于 LLM 生成的回答**（工具直出的确定性事实不重写）
-- **生产化设计**：长期记忆（qa_memory）、三层降级 + LLM 熔断器（5 次/60s，仅 Agent 链路）、指标观测、评估集回归、**60 用例验收套件（A1–A6 + 评估，真实 HTTP 全链路）**
+- **Agentic 能力**：ReAct 循环（≤5 轮）+ 工具调用 + 意图路由（DOCUMENT / STATS / REPORT / HYBRID）+ 多 Agent 编排；反思评审（LLM-as-Judge）带证据评审并限 1 次重写，**只作用于"面向短问答、由 LLM 生成"的回答**（STATS 的工具直出确定性事实、REPORT 的长结构化产物都跳过重写）
+- **生产化设计**：长期记忆（qa_memory）、逐依赖降级（4 条路径：混合检索→纯稠密 / Rerank→原分 / 查询改写→原句 / 记忆·评审 fail-open）+ LLM 熔断器（5 次/60s，**挂在全站 LLM 唯一出口 ⇒ 全链路覆盖**）、指标观测、评估集回归、**63 用例验收套件（A1–A6 + 评估，真实 HTTP 全链路）**
 
 ## 核心功能
 
@@ -21,7 +21,7 @@
 | 指标观测 | 今日问答量、平均耗时、LLM / 工具调用次数 |
 | 数据隔离 | 文档、会话、记忆均按用户隔离；检索支持 documentIds 过滤（含降级路径） |
 | 接口文档 | Knife4j 在线 API 文档（http://localhost:18080/doc.html） |
-| 验收套件 | A1–A6 六个验收域 + 评估回归，共 60 个用例走真实 HTTP（见「测试与验收」） |
+| 验收套件 | A1–A6 六个验收域 + 评估回归，共 63 个用例走真实 HTTP（见「测试与验收」） |
 
 ## 系统架构
 
@@ -76,44 +76,59 @@
 > 对稠密路命中的分块仍是**稠密原分**（仅稀疏路独有的分块才回填融合分）。
 > 这样 `minScore` 阈值始终筛的是量纲一致的 COSINE 语义分，代价是 sources 展示分 ≠ 排序分。
 
-**Agentic 问答**（产品入口为对话页「深度思考」开关；`AgentController` 另保留两条裸接口）：
+**Agentic 问答**（**一条链路、两个角色**：编排层挑活 → ReAct 引擎干活 → 统一收口。**用户侧只有一个入口——对话页「深度思考」开关**；编排层的 `ReportAgent` 复用 ReAct 引擎的**同一个实例**；`AgentController` 只保留一条引擎直连端点 `/api/agent/ask`，定位是调试口，不是产品入口）：
 
 ```
 ★ 产品入口（对话页「深度思考」开关开启时）
 POST /api/chat/ask/{sessionId}  {"question":"...","mode":"agent"}
    → ChatServiceImpl.askByAgent：读最近 10 条会话历史
-   → OrchestratorAgent.executeResult(question, history)  ← 与入口②同一条编排链路
    → 回答 + 依据片段（sources[].type = "evidence"）
    → 按与普通问答**完全相同**的落库路径写入（先存提问 → 存回答），因此历史可回读、指标可跟踪
    → 前端显示「AI助手 · 多 Agent」标签；依据片段无相似度时按语义降级展示（不伪造 score）
    → mode 为空 → 走下方 RAG 主链路（行为与改造前完全一致）；mode 非法 → 静默回退 RAG，不把问答打挂
 
-入口① POST /api/agent/ask  → AgentExecutor  （单 Agent，ReAct 循环；裸接口，不落库）
-   提问 → [熔断器 tryAcquire] → 思考 → 调工具 → 观察 → 再思考（≤5 轮）
-        → 最终回答 / 超轮降级文案 / 熔断兜底文案
-
-入口② POST /api/agent/orchestrate → OrchestratorAgent（多 Agent 编排，主管模式；裸接口，不落库）
+【编排层 · 挑活】OrchestratorAgent.executeResult(question, history)（主管模式）
    提问 → [RouterService 意图路由 temperature=0.1]
       ├─ DOCUMENT → DocumentAgent：RAG 检索链（查询改写 → 混合检索 → Rerank → LLM 生成）
       │               → 支持多轮：注入最近 6 轮历史（单条截断 200 字）
       ├─ STATS    → StatsAgent：工具直答（query_document_stats + query_document_list）
       │               → 跳过反思评审（确定性事实，重写只会降质）
+      ├─ REPORT   → ReportAgent：交给 ReAct 引擎（复用同一个 AgentExecutor 实例，不重写第二套循环）
+      │               → LLM 自主调用 generate_report（RAG 检索 → 引言/现状/问题/建议 的 Markdown 报告）
+      │               → 跳过反思评审（长结构化产物，重写会把章节推平）
       └─ HYBRID   → StatsAgent + DocumentAgent 组合回答
                     （"【数据概况】\n{统计}\n\n【文档解答】\n{问答}"）
    → 反思评审 CriticService.judge(question, answer, evidence)
-      → 不合格则带评审意见 LLM 重写（critic-max-retry=1 硬上限，空重写保留原答案）
+      → 不合格则带评审意见 LLM 重写（critic-max-retry=1 硬上限；重写返回空内容或调用失败都保留原答案）
+
+【ReAct 引擎 · 干活】AgentExecutor（仅 REPORT 分支与工具组合不确定的长尾请求进入）
+   提问 → 思考 → 调工具 → 观察 → 再思考（≤5 轮）
+        → 最终回答 / 超轮降级文案 / 熔断兜底文案
+   ※ 熔断判断已不在这一层：它随指标一起收口到全站 LLM 唯一出口 LlmService（见下方「降级策略」）。
+
+※ 附注（非产品入口）：引擎直连端点 POST /api/agent/ask → 直连 AgentExecutor（仅供调试与验收取证；
+   不落库，不对外承诺）。产品侧可达 ReAct 能力的唯一入口是对话页「深度思考」——编排层的 REPORT 分支
+   复用的就是这个引擎实例。
 ```
 
-> **注意**：ReAct 循环只在入口①；产品入口与入口② 的 HYBRID 是"子 Agent 组合"而非 ReAct 循环。
-> 反思评审只对 LLM 生成的回答生效，且必须把 `AgentResult.evidence`（工具输出 / 检索片段）交给评委
-> —— 传空证据会让任何回答都被判"无知识库依据"，触发一次纯 LLM 重写并把准确数字换成模糊复述。
->
-> **为什么要接产品入口**：入口① / ② 此前只有测试会调用，前端三个页面里没有任何 Agent 入口，
-> 也就意味着「编排、路由直答、反思重写」这些能力用户实际用不上；而且裸接口不落库，问答历史留不下来。
-> 因此没有新增第五个页面，而是把编排链路接到用户已在用的问答入口上（`mode=agent`），
-> 复用同样的落库路径与来源展示——这样既保留了 API 形态，又让能力真正产生用户价值。
 
-> **降级策略**：collection 未重建（无 BM25 字段）时混合检索自动降级为纯稠密（**降级仍保留 documentIds 用户过滤**）；Rerank API 失败时降级按原分数排序；查询改写失败用原句；记忆召回/评审异常静默 fail-open；LLM 连续失败 5 次触发熔断 60 秒（**仅入口①的 ReAct 链路**，主问答链路无熔断保护）。
+> **注意**：ReAct 引擎只被编排层的 REPORT 分支复用（`ReportAgent` 直接复用 `AgentExecutor`，不另写一套循环），引擎直连端点走的也是它；
+> HYBRID 是"子 Agent 组合"而非 ReAct 循环。反思评审只对"面向短问答、由 LLM 生成"的回答生效（DOCUMENT / HYBRID），
+> 且必须把 `AgentResult.evidence`（工具输出 / 检索片段）交给评委 —— 传空证据会让任何回答都被判"无知识库依据"，
+> 触发一次纯 LLM 重写并把准确数字换成模糊复述；STATS（工具直出确定性事实）与 REPORT（长结构化产物）直接跳过评审。
+>
+> **为什么要接产品入口**：编排、路由直答、反思重写这类能力必须落在用户已经在用的入口上——
+> 不新增第四个页面，而是把 Agent 能力接到对话页（`mode=agent`），复用同样的落库路径与来源展示，
+> 既保留 API 形态，又让能力真正产生用户价值。
+>
+> **同一条思路还收口了两处**：
+> ① **报告生成**：`generate_report` 原先只有引擎直连端点够得着
+> ⇒ 把 `REPORT` 纳入意图路由，报告能力随链路③ 一起进对话页（顺带让"装配了却选不中"的 `ReportAgent` 从死分支变活分支）；
+> ② **熔断器**：原先只覆盖引擎直连那条路（主问答链 `/api/chat/ask` 不设防）
+> ⇒ 连同指标一起收口到全站 LLM 唯一出口 `LlmService`，从此与调用方无关地覆盖全站。
+> 两处的完整来龙去脉见下方缺陷表 **G-07** / **G-09**。
+
+> **降级策略**：collection 未重建（无 BM25 字段）时混合检索自动降级为纯稠密（**降级仍保留 documentIds 用户过滤**）；Rerank API 失败时降级按原分数排序；查询改写失败用原句；记忆召回/评审异常静默 fail-open；**熔断器收口在全站 LLM 唯一出口 `LlmService`（连续失败 5 次 → 熔断 60 秒、成功清零），因此主问答链、编排链、ReAct 链以及意图路由 / 查询改写 / 反思评审这些子任务调用全部受保护**——熔断期内一个请求都不发（`llmCalls` 零增长），各链路按自身语义降级：问答返回统一兜底文案（且不写入长期记忆）、路由回落 DOCUMENT、改写退回原句、评审放行、ReAct 返回降级提示。
 
 ## 技术栈
 
@@ -259,14 +274,10 @@ curl -X POST http://localhost:18080/api/chat/ask/1 \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"question":"目前知识库里有哪些分类的文档？各有多少篇？","mode":"agent"}'
 
-# 4b. 裸接口形态（不走对话页、不落库；供联调与压测使用）
+# 4b. 引擎直连形态（不走对话页、不落库；仅供联调与验收取证）
 curl -X POST http://localhost:18080/api/agent/ask \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"question":"目前知识库里有哪些分类的文档？各有多少篇？"}'
-curl -X POST http://localhost:18080/api/agent/orchestrate \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"question":"总结知识库内容并生成一份分析报告"}'
-
 # 5. 查看今日指标
 curl http://localhost:18080/api/metrics/today -H "Authorization: Bearer $TOKEN"
 ```
@@ -308,15 +319,15 @@ mvn.cmd test -Dtest=A1_AuthAndContractAcceptanceTest,A2_IngestionAcceptanceTest,
 | A2 离线入库 | 12 | 格式白名单/空文件/无扩展名/未登录上传拒绝、上传落库字段、分块算法边界、向量化入库可召回、幂等防重、删除幂等、列表隔离 | 非法输入 400；`chunkCount/embeddingStatus` 与实际一致；向量化后可被检索命中 |
 | A3 检索链路 | 8 | 稠密 TopK/降序/content、BM25 稀疏路词面命中、融合排序差异、`documentIds` 隔离、空集合短路、content 完整性、连续 20 次中文检索稳定性、**降级仍保留隔离** | 分数降序、content 非空；跨用户内容不可见（含降级路径）；Milvus `/healthz` 保持健康 |
 | A4 在线问答全链路 | 8 | 端到端问答+来源引用、sources 结构、空召回兜底（不调 LLM）、历史顺序、会话级联删除、长期记忆闭环（隔离+门槛） | 返回 200 且回答非空；sources 含 chunkId/score/预览；兜底路径不产生 LLM 调用 |
-| A5 Agent 链路与熔断 | 11 | 熔断状态机与降级文案、ReAct 单 Agent（真实工具调用）、编排 STATS 直答、空问题校验、指标联动、工具注册表、**Agent 证据契约**、**对话页 agent 模式落库回读（A5-10）**、**非法 mode 回退 RAG（A5-11）** | ReAct 返回非空回答；STATS 回答必须含真实文档数且保留工具计量表述；`AgentResult.evidence` 非空；`mode=agent` 走对话端点后历史可回读且来源为 `type=evidence` |
+| A5 Agent 链路与熔断 | 14 | 熔断状态机、**熔断收口到唯一出口（挂点结构 + 三出口守卫）（A5-02）**、ReAct 单 Agent（真实工具调用）、编排 STATS 直答、空问题校验、指标联动、工具注册表、**Agent 证据契约**、**对话页 agent 模式落库回读（A5-10）**、**非法 mode 回退 RAG（A5-11）**、**熔断端到端覆盖三条链路（A5-12）**、**REPORT 分支可达并落库（A5-13）**、**四类路由逐一可达 + 编排与引擎直连端点同一 ReAct 引擎实例（A5-14）** | ReAct 返回非空回答；STATS 回答必须含真实文档数且保留工具计量表述；`AgentResult.evidence` 非空；熔断打开时三条链路均 HTTP 200 + 统一兜底文案且 `llmCalls` 零增长；路由可识别 REPORT 且报告带依据产出 |
 | A6 已知缺口固化 | 7 | 会话归属未校验（读/删）、删文档向量残留、重解析无 HTTP 入口、鉴权返回 400 而非 401、标题引号入库、缓存配置未接线 | **断言"当前真实行为"**：修好即失败，强制同步文档（不计入 P0 门槛） |
 | 评估回归 | 1 | 20 题评估集 Top5 命中率（稠密 vs 混合） | 命中率可复现输出（用于趋势对比，不设硬门槛） |
 
-### 当前结果（2026-09-17）
+### 当前结果（2026-09-18）
 
 ```
 A1  13/13    A2  12/12    A3   8/8    A4   8/8
-A5  11/11    A6   7/7     Eval 1/1     → Tests run: 60, Failures: 0, Errors: 0
+A5  14/14    A6   7/7     Eval 1/1     → Tests run: 63, Failures: 0, Errors: 0
 ```
 
 关键实测数据：
@@ -339,7 +350,8 @@ A5  11/11    A6   7/7     Eval 1/1     → Tests run: 60, Failures: 0, Errors: 0
 
 | 层 | 规模 | 产物 |
 |----|------|------|
-| 后端集成（JUnit） | 6 域 60 用例，`Tests run: 60, Failures: 0` | 本文件「覆盖范围与通过标准」 |
+| 后端集成（JUnit） | 6 域 63 用例，`Tests run: 63, Failures: 0` | 本文件「覆盖范围与通过标准」 |
+| C+A 收口专项（09-18） | 四类路由 4/4 命中 + 报告经对话页落库可回读；界面 7 张 | `screenshots/C+A收口-2026-09-18/` + `_probe/ca_evidence.json` |
 | HTTP 全接口黑盒 | 50 用例（A1–A6 实测 + 补充 S-01…S-08），50/50 PASS | `_probe/api_full_suite.mjs` · `api_supplement.mjs` · `api_suite_result.json` |
 | UI 全流程截图 | 28 张（23 条前端交互 + 5 张接口证据页），全程无 5xx | `screenshots/全量功能测试-2026-09-17/` |
 
@@ -389,7 +401,7 @@ G-07 更进一步——它不是"行为不对"，而是"功能正确却没接上
 | **G-04** | 中 | 超过 50MB 的上传返回 **HTTP 500**「系统内部错误」，把客户端错误报成服务端故障 | `MaxUploadSizeExceededException` 落进 catch-all | `GlobalExceptionHandler` 新增 `MaxUploadSizeExceededException` → **413**、`MultipartException` → **400** |
 | **G-05** | 中 | 不存在的路径返回 **HTTP 500**，把 404 误报成服务端故障 | `@ExceptionHandler(Exception.class)` catch-all 吞掉了 Spring 的 `NoResourceFoundException`（Knife4j 请求 `/favicon.ico` 即触发） | 新增 `NoResourceFoundException` / `NoHandlerFoundException` handler → **404** |
 | **G-06** | 中 | 超限上传时服务端**直接掐断连接**，客户端只拿到不透明网络错误（`Error writing request body to server`），拿不到 413 | Tomcat `max-swallow-size` 默认 2MB < 请求体 → 连接在返回 413 之前就被掐断 | `application.yml` 设 `server.tomcat.max-swallow-size: 64MB`（限量而非无限，避免放任超大 body） |
-| **G-07** | **高（产品级）** | **Agent 模块"实现了但没被产品用上"**：问答主链路 `ChatServiceImpl.ask` 是另一套内联 RAG 实现，编排能力只挂在两个裸 API 上，前端三个页面里 `agent` 出现 **0 次** | 第 8 周交付的 Agent 体系与主问答链路是**两条并行实现**，从未接线；`DocumentAgent` 的 `history` 形参也一直没被使用 | 不新增页面，把编排接进用户已在用的问答入口：`AskRequest` 加 `mode` 字段 → `ChatServiceImpl.askByAgent` 调 `OrchestratorAgent.executeResult()` → 走同样落库路径；`DocumentAgent` 让 history 真正生效（6 轮 / 200 字截断）；前端对话页加「深度思考」开关 |
+| **G-07** | **高（产品级）** | **Agent 模块"实现了但没被产品用上"**：问答主链路 `ChatServiceImpl.ask` 是另一套内联 RAG 实现，编排能力当时只挂在两个没有前端入口的后端接口上，前端三个页面里 `agent` 出现 **0 次** | 第 8 周交付的 Agent 体系与主问答链路是**两条并行实现**，从未接线；`DocumentAgent` 的 `history` 形参也一直没被使用 | 不新增页面，把编排接进用户已在用的问答入口：`AskRequest` 加 `mode` 字段 → `ChatServiceImpl.askByAgent` 调 `OrchestratorAgent.executeResult()` → 走同样落库路径；`DocumentAgent` 让 history 真正生效（6 轮 / 200 字截断）；前端对话页加「深度思考」开关 |
 
 > **共性（面试可讲的判断力）**：G-01 / G-04 / G-05 都是**"HTTP 状态码语义"**层面的问题——返回体看起来对（业务码正确），但 HTTP 层骗过了网关/监控/第三方集成；G-02 是**"修 bug 修错病因"**（把 DISTINCT 缺失误判为逻辑删除穿透）；G-03 / G-06 是**"层与层之间契约不对齐"**（前端 offer 了什么 vs 后端接受什么，容器 swallow 上限 vs 应用声明的上限）。四类都能在"用例全绿"下存活，说明**只测业务码不测 HTTP 语义**是有盲区的。
 >
@@ -410,7 +422,7 @@ G-07 更进一步——它不是"行为不对"，而是"功能正确却没接上
 | # | 问题 | 现象与证据 |
 |---|------|-----------|
 | G-08 | **指标双计**：`AgentExecutor` 循环内已调 `recordLlmCall()`，收尾又调 `recordQuery(cost, iterations, toolCount)`，而后者内部再次 `addAndGet(...)` | 实测 1 次 `POST /api/agent/ask` 指标 **+4 LLM / +2 工具**，真实值是 2 次 LLM / 1 次工具 —— 恰好是 `iterations×2`、`toolCount×2`。盲区成因：A5-06 只断言 `llmCalls > 0` 与 `queryCount` 增长，**不校验数值**——"大于零"这种弱断言能放过"翻倍"这种量级错误 |
-| G-09 | **指标覆盖缺口**：`AgentMetrics` 的唯一写入者是 `AgentExecutor` | 17 个端点里只有 `/api/agent/ask` 被埋点；**产品主链路** `/api/chat/ask`（含 `mode=agent` 走编排的分支）与 `/api/agent/orchestrate` 全都**不计数**；`StatsAgent` 直接调 `tool.execute()` 也绕过了埋点 |
+| G-09 | **指标覆盖缺口**：`AgentMetrics` 的唯一写入者是 `AgentExecutor` | 当时 17 个端点里只有 `/api/agent/ask` 被埋点；**产品主链路** `/api/chat/ask`（含 `mode=agent` 走编排的分支）与 `/api/agent/orchestrate` 全都**不计数**；`StatsAgent` 直接调 `tool.execute()` 也绕过了埋点 |
 
 ##### 修法：把埋点收敛到「唯一出口」，而不是在各调用点补计数
 
@@ -418,7 +430,7 @@ G-07 更进一步——它不是"行为不对"，而是"功能正确却没接上
 |------|---------|-----------|
 | `llmCalls` | `LlmService`（3 个方法） | 全站唯一打 `/v1/chat/completions` 的地方。主 RAG 链、单 Agent ReAct、以及编排里的意图路由 / 查询改写 / 反思评审都必然经过它 ⇒ **不重不漏** |
 | `toolCalls` | `ToolRegistry.execute(name, args)`（本轮**新增**的方法） | 全站唯一执行 `Tool` 的地方。`AgentExecutor` 的 ReAct 循环与 `StatsAgent` 的工具直调都收口到这里 ⇒ 修掉"旁路直调不计数"（顺带解除了 `StatsAgent` 对具体 Tool 类型的硬依赖） |
-| `queryCount` / `avgCostMs` | 入口层各记一次（`ChatServiceImpl.ask` 覆盖对话页两种模式；`AgentController` 覆盖两个裸端点） | 入口与"一次用户请求"一一对应，天然只记一次。耗时不再只统计 LLM 段，而是**用户感知的端到端耗时** |
+| `queryCount` / `avgCostMs` | 入口层各记一次（`ChatServiceImpl.ask` 覆盖对话页两种模式；`AgentController` 覆盖引擎直连端点） | 入口与"一次用户请求"一一对应，天然只记一次。耗时不再只统计 LLM 段，而是**用户感知的端到端耗时** |
 
 配套的三处结构性调整：
 
@@ -426,11 +438,30 @@ G-07 更进一步——它不是"行为不对"，而是"功能正确却没接上
 - `AgentExecutor` 不再持有 `AgentMetrics`，回归"只编排循环、不管记账"的纯执行器；
 - 入口记账放进 `try/finally`：即使链路抛异常，本次提问同样已被受理，也应计入流量。
 
-> 一句话原则：**出口唯一 ⇒ 计数不可能漏、也不可能重**。反过来，把计数写进会被上层复用的执行器，就是在制造 G-08 那种隐患。
+> 一句话原则：**出口唯一 ⇒ 计数不可能漏、也不可能重**。反过来，把计数写进会被编排层复用的执行器，就是在制造 G-08 那种隐患。
+>
+> **同一条原则后来还修掉了一处同类问题（熔断挂错层）**：`LlmCircuitBreaker` 原挂在 `AgentExecutor` 上，
+> 于是只有"路过该执行器"的入口① 被保护，用户真正在用的主问答链 `/api/chat/ask` 裸奔。
+> 判据与指标一样应该是"是否经过 LLM 出口"，而不是"是否经过某个执行器"——现已收口到 `LlmService`，
+> 由 A5-02（挂点结构 + 三出口守卫）与 A5-12（三条链路端到端降级 + `llmCalls` 零增长）正反两面取证。
 
 **回归护栏**：`A5-06` 从"断言 `llmCalls > 0`"升级为**精确增量断言**——实测一次验收会话 `queryCount 2→5`、`llmCalls 3→7`、`toolCalls 3→6`，
 分解正好 = RAG 链 1 次 LLM（仅查询改写）+ 编排 STATS 链 1 次 LLM / 2 次工具（统计 + 列表）+ ReAct 链 2 次 LLM / 1 次工具，无任何倍数偏差。
-数字错了用例立刻变红；后端 60 条、API 50 条同步复测全绿。
+数字错了用例立刻变红；后端 63 条、API 50 条同步复测全绿。
+
+#### 后续收口（2026-09-18）：把「挂错层 / 没有入口」的两处同类残留一并修掉
+
+> 下面 2 处**不计入**上面的 9 项（G-01 ~ G-09）：G 编号表是 09-17 定稿轮的快照，
+> 追溯改写历史轮计数只会让各文档口径全部漂移。本轮属**同一根因的延续修复**，按同一格式单列说明。
+
+| # | 问题 | 现象与证据 | 修法 |
+|---|------|-----------|------|
+| ① | **熔断挂错层**：`LlmCircuitBreaker` 只被 `AgentExecutor` 持有 | 与 G-09 **完全同源**——都是"把跨界关注点挂在某一层执行器上"。后果更严重：用户真正在用的主问答链 `/api/chat/ask` 完全没有熔断，LLM 持续失败时它会一路打到超时；而"有熔断"的入口① 反而只有测试在调 | 收口到全站 LLM 唯一出口 `LlmService`（`postChatCompletions` 内 `tryAcquire` / `onSuccess` / `onFailure`），新增 `LlmUnavailableException` 供各链路按自身语义降级：问答返回统一兜底文案且**不写入长期记忆**、路由回落 DOCUMENT、改写退回原句、评审放行、ReAct 返回降级提示。取证：A5-02（挂点结构 + 三出口守卫 + 复位恢复）+ A5-12（三链端到端降级且 `llmCalls` 零增长） |
+| ② | **报告生成「实现了但用户不可达」**：`generate_report` 工具只能被 ReAct 循环调用，而 ReAct 只有引擎直连端点 `/api/agent/ask` 够得着 | 与 G-07 同源（功能是对的、但没有任何产品路径会调用它）。旁证：README 写着"助手能自主决定**生成报告**"，而对话页任何问法都触发不到；`ReportAgent`/`AgentType.REPORT` 此前因"装配了却选不中"被删——**删除只解决了死分支，没解决没有入口** | 意图路由扩出第 4 类 `REPORT`；`ReportAgent` 复用 `AgentExecutor` 的 ReAct 循环（不重写第二套循环）；`OrchestratorAgent` 增加 `case REPORT` 并跳过反思重写；`AgentExecutor` 新增 `executeResult(...)` 把工具输出作为证据返回，供落库 sources 与反思核对。取证：A5-13 |
+
+> **这两处共有的判断力（面试可讲）**：`grep 机制名 / 能力名` 扫全部表面，逐处问"它**真覆盖/真触达**这条入口吗"。
+> 熔断被四处文档写成"降级矩阵的一员"（读起来像主链路也有），报告生成被写成"助手能自主决定"（读起来像能用）——
+> **数字对、定位错，比数字错更难被发现**；而两者的发现方式都是交叉核对，不是任何一次测试执行。
 
 ### 交付前代码审计：删掉 2 个孤立类 + 4 处冗余 import
 
@@ -438,12 +469,19 @@ G-07 更进一步——它不是"行为不对"，而是"功能正确却没接上
 
 | 清掉的东西 | 为什么是死代码 |
 |-----------|--------------|
-| `agent/ReportAgent.java` + `AgentType.REPORT` | 它 `@Component` 进了 `OrchestratorAgent` 的 `List<Agent>`，但 `RouterService` 只能产出 `DOCUMENT/STATS/HYBRID`、`switch` 里也没有 `case REPORT` ⇒ **装配了却永远选不中**；而它的功能与可达的 `generate_report` 工具几乎逐行相同。报告能力保留在工具里（ReAct 循环中由 LLM 自主调用），删掉重复的那条路 |
 | `eval/EvalRunner.java`（含内部重复的 `EvalCase`） | 无任何引用，`main()` 只往空 `List` 打印「待填充」，真正的 20 题评估早在 `test/eval/EvalRunnerTest` 里跑通；内部 `EvalCase` 还与 test 侧同名类重复定义。删除后 `eval` 包只存在于 test 侧（唯一评估入口） |
 | 4 处未使用 import | `ToolRegistry`（ConcurrentHashMap）、`AuthController`（BusinessException）、`A3_RetrievalAcceptanceTest`（assertEquals）、`AcceptanceSupport`（SourceHttpMessageConverter） |
 
-> 这三项**没有计入上面的缺陷数**：它们不改变任何接口行为，是收尾清理而非功能缺陷。
+> 这两项**没有计入上面的缺陷数**：它们不改变任何接口行为，是收尾清理而非功能缺陷。
 > 目的是让「写了却没人调」的代码在仓库里归零——面试官随手点开一个类，都应该能问出「谁在调它」并得到答案。
+
+**后续迭代：被删的 `ReportAgent` 又加回来了，但这次它不再是死分支。**
+审计当时删它的理由成立：`RouterService` 只能产出 `DOCUMENT/STATS/HYBRID`，`switch` 里也没有 `case REPORT`
+⇒ 它 `@Component` 进了 `List<Agent>` 却永远选不中（"装配了却选不中"）。但**删除只解决了"死分支"，没解决根因**：
+`generate_report` 只能被 ReAct 循环调用，而 ReAct 原先只有引擎直连端点够得着 ⇒ 报告生成对用户等于不存在。
+修复方式是把路由扩出第 4 类 `REPORT`，并让 `ReportAgent` 直接复用 `AgentExecutor` 的 ReAct 循环（不重写第二套循环）：
+死分支变成活分支，报告能力与 ReAct 能力一起接进对话页。**"删掉重复实现"和"补上缺失入口"是两件事，前者做完了不等于后者做了。**
+详见上文「Agentic 问答」。
 
 ## 配置说明
 
@@ -528,7 +566,7 @@ rag-knowledge-base/
 │       │   │   ├── CriticService.java + Impl + Critique     反思评审
 │       │   │   └── MemoryService.java + Impl                长期记忆（qa_memory）
 │       │   ├── controller/               🌐 顶层控制器
-│       │   │   ├── AgentController.java             /api/agent/ask + /orchestrate
+│       │   │   ├── AgentController.java             /api/agent/ask（引擎直连端点）
 │       │   │   └── MetricsController.java           /api/metrics/today
 │       │   ├── common/                   🔧 Result / BusinessException / GlobalExceptionHandler / UserContext
 │       │   └── config/                   ⚙️ JwtUtil / JwtInterceptor / WebMvcConfig / RestTemplateConfig
@@ -536,13 +574,13 @@ rag-knowledge-base/
 │       │       └── MybatisPlusConfig / MyMetaObjectHandler / CorsConfig
 │       ├── main/resources/application.yml
 │       └── test/java/com/liushuwen/rag/
-│           ├── acceptance/                ✅ 验收套件（真实 HTTP，60 用例）
+│           ├── acceptance/                ✅ 验收套件（真实 HTTP，63 用例）
 │           │   ├── AcceptanceSupport.java        基类：真实 RestTemplate + 环境指纹 + 向量可见性等待
 │           │   ├── A1_AuthAndContractAcceptanceTest.java      认证与统一契约（13）
 │           │   ├── A2_IngestionAcceptanceTest.java            离线入库（12）
 │           │   ├── A3_RetrievalAcceptanceTest.java            检索链路与隔离（8）
 │           │   ├── A4_ChatFlowAcceptanceTest.java             在线问答全链路（8）
-│           │   ├── A5_AgentAndBreakerAcceptanceTest.java      Agent 链路与熔断（11）
+│           │   ├── A5_AgentAndBreakerAcceptanceTest.java      Agent 链路与熔断（14）
 │           │   └── A6_KnownGapAcceptanceTest.java             已知缺口固化（7）
 │           └── eval/
 │               └── EvalRunnerTest.java       唯一评估入口（读 docs/eval/questions.json，20 题）
@@ -604,9 +642,10 @@ rag-knowledge-base/
 | DELETE | `/api/chat/session/{sessionId}` | 删除会话（级联删除消息） | 是 |
 | POST | `/api/chat/ask/{sessionId}` | 智能问答（body：`{"question":"..."}`；可选 `"mode":"agent"` 走多 Agent 编排） | 是 |
 | GET | `/api/chat/history/{sessionId}` | 获取会话历史消息 | 是 |
-| POST | `/api/agent/ask` | 单 Agent 问答（ReAct + 工具调用） | 是 |
-| POST | `/api/agent/orchestrate` | 多 Agent 编排问答（主管分派 + 反思重写） | 是 |
+| POST | `/api/agent/ask` | ReAct 引擎直连端点（直连 `AgentExecutor`；产品入口是对话页「深度思考」） | 是 |
 | GET | `/api/metrics/today` | 今日指标（问答量 / 平均耗时 / LLM / 工具调用） | 是 |
+
+> **端点总数：16 个**（认证 3 / 文档 5 / 会话问答 6 / Agent 1 / 指标 1）。09-17 时为 17 个（Agent 2），09-18 收敛动作删除了与产品入口完全重叠的 `POST /api/agent/orchestrate` ⇒ 16。
 
 > 完整接口文档：http://localhost:18080/doc.html （Knife4j）。认证接口在页面右上角「Authorize」输入 `Bearer <token>` 统一配置。
 
@@ -619,7 +658,8 @@ rag-knowledge-base/
 | 第 5-6 周 | 前端交互、JWT 认证、数据隔离、文档分类 | ✅ |
 | 第 7 周 | 项目文档与评估 | ✅ |
 | 第 8 周 | Agentic RAG 演进：混合检索 / Rerank / 查询改写 / ReAct / 意图路由 / 多 Agent / 长期记忆 / 降级熔断 / 评估 | ✅ |
-| 第 9 周 | 验收测试重写（A1–A6 + 评估，60 用例真实 HTTP）+ 全量功能黑盒测试（50 API 用例 + 28 张 UI 截图，全程无 5xx）+ 修复 15 处缺陷（6 + G-01 ~ G-09）+ **Agent 模块接入对话页（深度思考开关 → mode=agent 落库回读）** + **指标埋点口径重构（埋点收敛到唯一出口：LlmService / ToolRegistry.execute / 入口层）** + 文档与实现对齐 + 已知缺口固化 | ✅ |
+| 第 9 周 | 验收测试重写（A1–A6 + 评估，当轮 60 用例真实 HTTP；09-18 收口后 63）+ 全量功能黑盒测试（50 API 用例 + 28 张 UI 截图，全程无 5xx）+ 修复 15 处缺陷（6 + G-01 ~ G-09）+ **Agent 模块接入对话页（深度思考开关 → mode=agent 落库回读）** + **指标埋点口径重构（埋点收敛到唯一出口：LlmService / ToolRegistry.execute / 入口层）** + 文档与实现对齐 + 已知缺口固化 | ✅ |
+| 第 9 周·收口 | **熔断收口到唯一出口**（`LlmService`，从此覆盖主问答链 / 编排链 / ReAct 链全链路，新增 `LlmUnavailableException` 供各链路按自身语义降级）+ **报告生成接入对话页**（意图路由第 4 类 `REPORT` + `ReportAgent` 复用 ReAct 引擎 + `AgentExecutor.executeResult` 返回证据）+ 验收套件扩到 **63 用例**（新增 A5-02 改造 / A5-12 熔断端到端 / A5-13 REPORT 分支 / A5-14 四类路由 + 单引擎实例（编排与引擎直连端点 assertSame））| ✅ |
 
 ## 常见问题
 

@@ -4,6 +4,7 @@ import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.liushuwen.rag.common.BusinessException;
+import com.liushuwen.rag.common.LlmUnavailableException;
 import com.liushuwen.rag.common.UserContext;
 import com.liushuwen.rag.chat.entity.ChatMessage;
 import com.liushuwen.rag.chat.entity.ChatSession;
@@ -37,7 +38,7 @@ import java.util.stream.Collectors;
  * RAG 在线问答链路编排服务（核心难点类）。
  * 在整条链路中处于"召回 → 精排 → 生成"的串联中枢，把检索、记忆、模型能力编排成一次问答。
  * 【设计要点】RAG 在线链路编排：每环节为何这样排布（检索前先改写、精排后再过滤、生成前先做会话归属校验）
- * 【常见问题】各环节如何降级？——改写失败用原句、检索/记忆异常静默、Rerank 失败退回原分数；saveExchange 为何设分数门槛？——检索最高分 ≥ 0.6 才存长期记忆，防低质回答污染记忆库
+ * 【常见问题】各环节如何降级？——改写失败用原句、检索/记忆异常静默、Rerank 失败退回原分数、LLM 熔断时返回统一兜底文案；saveExchange 为何设分数门槛？——检索最高分 ≥ 0.6 才存长期记忆，防低质回答污染记忆库
  */
 @Slf4j
 @Service
@@ -60,8 +61,9 @@ public class ChatServiceImpl implements ChatService {
     private final DocumentMapper documentMapper;
     /**
      * 多 Agent 编排（意图路由 + 子 Agent 分派 + 反思评审）。
-     * 【设计要点】对话页「深度思考」模式走这条链路：为什么复用 chat 入口而不是让前端直接调 /api/agent/orchestrate？
-     * 因为直接调裸端点不会落库——回答不进 chat_message 表，会话历史里看不到、刷新即丢，也无法复用会话归属与标题逻辑。
+     * 【设计要点】对话页「深度思考」模式走这条链路：为什么复用 chat 入口而不是另开一个裸端点？
+     * 因为裸端点不落库——回答不进 chat_message 表，会话历史里看不到、刷新即丢，也无法复用会话归属与标题逻辑。
+     * （原先并存的 /api/agent/orchestrate 就是这样一个裸端点，已被删除。）
      */
     private final OrchestratorAgent orchestratorAgent;
 
@@ -223,7 +225,18 @@ public class ChatServiceImpl implements ChatService {
 
 
         // 功能：调 LLM 生成回答 → 构建 sources JSON（含 chunkId/score/预览）→ 落库助手消息并返回｜要点：存 sources 实现答案可追溯（用户知来源）；用 FastJSON 与 Milvus SDK 依赖统一，避免双 JSON 库
-        String answer=llmService.chat(prompt);
+        // 【熔断降级】熔断打开时 LlmService（唯一出口）抛 LlmUnavailableException。本链路不能因此把
+        // 用户请求打成 500：改为返回统一的"服务暂不可用"兜底回答，检索到的依据照常落库可追溯；
+        // 并且这条兜底回答不进长期记忆（degraded 标志），避免降级文案以"高质量问答"身份污染记忆库。
+        String answer;
+        boolean degraded = false;
+        try {
+            answer = llmService.chat(prompt);
+        } catch (LlmUnavailableException e) {
+            log.warn("LLM 熔断中，主问答链返回兜底文案: {}", question);
+            answer = LlmUnavailableException.FALLBACK_MESSAGE;
+            degraded = true;
+        }
 
         JSONArray sourcesArray = new JSONArray();
         for (MilvusService.SearchResult sr : results) {
@@ -246,10 +259,11 @@ public class ChatServiceImpl implements ChatService {
         chatMessageMapper.insert(assistantMsg);
 
         // 功能：把本次问答对存入长期记忆（旁路增强，失败只记日志不阻断）｜要点：质量门槛检索最高分 ≥ 0.6（MEMORY_SAVE_MIN_SCORE）才存，确保记忆有可信来源支撑，防低质/兜底回答污染跨会话复用的记忆库
+        // 熔断降级产生的兜底文案虽然检索分可能够高，但内容不含任何知识——不得入库（degraded 拦截）
         float topScore = results.stream()
                 .map(MilvusService.SearchResult::getScore)
                 .max(Float::compare).orElse(0f);
-        if (topScore >= MEMORY_SAVE_MIN_SCORE) {
+        if (!degraded && topScore >= MEMORY_SAVE_MIN_SCORE) {
             memoryService.saveExchange(userId, question, answer);
         }
 
