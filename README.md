@@ -441,7 +441,7 @@ G-07 更进一步——它不是"行为不对"，而是"功能正确却没接上
 > 一句话原则：**出口唯一 ⇒ 计数不可能漏、也不可能重**。反过来，把计数写进会被编排层复用的执行器，就是在制造 G-08 那种隐患。
 >
 > **同一条原则后来还修掉了一处同类问题（熔断挂错层）**：`LlmCircuitBreaker` 原挂在 `AgentExecutor` 上，
-> 于是只有"路过该执行器"的入口① 被保护，用户真正在用的主问答链 `/api/chat/ask` 裸奔。
+> 于是只有"路过该执行器"的引擎直连端点被保护，用户真正在用的主问答链 `/api/chat/ask` 裸奔。
 > 判据与指标一样应该是"是否经过 LLM 出口"，而不是"是否经过某个执行器"——现已收口到 `LlmService`，
 > 由 A5-02（挂点结构 + 三出口守卫）与 A5-12（三条链路端到端降级 + `llmCalls` 零增长）正反两面取证。
 
@@ -456,7 +456,7 @@ G-07 更进一步——它不是"行为不对"，而是"功能正确却没接上
 
 | # | 问题 | 现象与证据 | 修法 |
 |---|------|-----------|------|
-| ① | **熔断挂错层**：`LlmCircuitBreaker` 只被 `AgentExecutor` 持有 | 与 G-09 **完全同源**——都是"把跨界关注点挂在某一层执行器上"。后果更严重：用户真正在用的主问答链 `/api/chat/ask` 完全没有熔断，LLM 持续失败时它会一路打到超时；而"有熔断"的入口① 反而只有测试在调 | 收口到全站 LLM 唯一出口 `LlmService`（`postChatCompletions` 内 `tryAcquire` / `onSuccess` / `onFailure`），新增 `LlmUnavailableException` 供各链路按自身语义降级：问答返回统一兜底文案且**不写入长期记忆**、路由回落 DOCUMENT、改写退回原句、评审放行、ReAct 返回降级提示。取证：A5-02（挂点结构 + 三出口守卫 + 复位恢复）+ A5-12（三链端到端降级且 `llmCalls` 零增长） |
+| ① | **熔断挂错层**：`LlmCircuitBreaker` 只被 `AgentExecutor` 持有 | 与 G-09 **完全同源**——都是"把跨界关注点挂在某一层执行器上"。后果更严重：用户真正在用的主问答链 `/api/chat/ask` 完全没有熔断，LLM 持续失败时它会一路打到超时；而"有熔断"的引擎直连端点反而只有测试在调 | 收口到全站 LLM 唯一出口 `LlmService`（`postChatCompletions` 内 `tryAcquire` / `onSuccess` / `onFailure`），新增 `LlmUnavailableException` 供各链路按自身语义降级：问答返回统一兜底文案且**不写入长期记忆**、路由回落 DOCUMENT、改写退回原句、评审放行、ReAct 返回降级提示。取证：A5-02（挂点结构 + 三出口守卫 + 复位恢复）+ A5-12（三链端到端降级且 `llmCalls` 零增长） |
 | ② | **报告生成「实现了但用户不可达」**：`generate_report` 工具只能被 ReAct 循环调用，而 ReAct 只有引擎直连端点 `/api/agent/ask` 够得着 | 与 G-07 同源（功能是对的、但没有任何产品路径会调用它）。旁证：README 写着"助手能自主决定**生成报告**"，而对话页任何问法都触发不到；`ReportAgent`/`AgentType.REPORT` 此前因"装配了却选不中"被删——**删除只解决了死分支，没解决没有入口** | 意图路由扩出第 4 类 `REPORT`；`ReportAgent` 复用 `AgentExecutor` 的 ReAct 循环（不重写第二套循环）；`OrchestratorAgent` 增加 `case REPORT` 并跳过反思重写；`AgentExecutor` 新增 `executeResult(...)` 把工具输出作为证据返回，供落库 sources 与反思核对。取证：A5-13 |
 
 > **这两处共有的判断力（面试可讲）**：`grep 机制名 / 能力名` 扫全部表面，逐处问"它**真覆盖/真触达**这条入口吗"。

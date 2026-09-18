@@ -6,7 +6,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 /**
- * 意图路由实现：调 LLM 做结构化分类，把用户问题映射到 DOCUMENT/STATS/REPORT/HYBRID 四条链路。
+ * 意图路由实现：调 LLM 做结构化分类，把用户问题映射到 DOCUMENT/STATS/REPORT/HYBRID 四类路由。
  * 【设计要点】LLM 结构化输出 + 低温度求稳：temperature=0.1 压低随机性，让分类稳定可复现；解析容错把非法输出降级为 DOCUMENT
  * 【常见问题】为什么非法输出也归 DOCUMENT？——宁可多检索也不漏答，路由失败兜底 DOCUMENT 保证主流程永远有结果
  * 【熔断边界】本类是 LLM 的调用方之一，熔断打开时 chatWithSystem 抛 LlmUnavailableException，

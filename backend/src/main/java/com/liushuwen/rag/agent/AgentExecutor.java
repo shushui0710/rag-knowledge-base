@@ -63,11 +63,11 @@ public class AgentExecutor {
     /**
      * 执行一次 Agent 问答（回答 + 依据 + 多轮历史）。
      * 【设计要点】ReportAgent（编排路由的 REPORT 分支）复用本方法 ⇒ 单 Agent 的 ReAct 能力成为编排链路的一条分支，
-     * 而不是"只有裸接口 /api/agent/ask 才够得着"的孤岛。
+     * 而不是"只有引擎直连端点 /api/agent/ask 才够得着"的孤岛。
      * 【设计要点】evidence 收集循环内每次工具执行的输出（截断）：这些输出就是回答的事实依据，
      * 上层据此落库 sources 并供 CriticService 核对"有没有知识库依据"。
      * 【已删除·executeResult(String) 单参重载】该重载（无历史，返回 AgentResult）在 main 与 test 中均无调用方，
-     * 属死方法。随裸接口 /api/agent/orchestrate 的删除一并清理——"装配了没人调"的方法与端点同罪。
+     * 属死方法。随编排接口 /api/agent/orchestrate 的删除一并清理——"装配了没人调"的方法与端点同罪。
      *
      * @param userQuestion 用户问题
      * @param history      会话历史（按时间正序，元素形如 {"type":"message","role":"user"/"assistant","content":"..."}）

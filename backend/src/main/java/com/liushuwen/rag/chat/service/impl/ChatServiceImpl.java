@@ -61,9 +61,9 @@ public class ChatServiceImpl implements ChatService {
     private final DocumentMapper documentMapper;
     /**
      * 多 Agent 编排（意图路由 + 子 Agent 分派 + 反思评审）。
-     * 【设计要点】对话页「深度思考」模式走这条链路：为什么复用 chat 入口而不是另开一个裸端点？
-     * 因为裸端点不落库——回答不进 chat_message 表，会话历史里看不到、刷新即丢，也无法复用会话归属与标题逻辑。
-     * （原先并存的 /api/agent/orchestrate 就是这样一个裸端点，已被删除。）
+     * 【设计要点】对话页「深度思考」模式走这条链路：为什么复用 chat 入口而不是另开一个引擎直连端点？
+     * 因为引擎直连端点不落库——回答不进 chat_message 表，会话历史里看不到、刷新即丢，也无法复用会话归属与标题逻辑。
+     * （原先并存的 /api/agent/orchestrate 就是这样一个直连端点，已被删除。）
      */
     private final OrchestratorAgent orchestratorAgent;
 

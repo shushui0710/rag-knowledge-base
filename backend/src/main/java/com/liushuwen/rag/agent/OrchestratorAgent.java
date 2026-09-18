@@ -49,7 +49,7 @@ public class OrchestratorAgent {
      * 这也是把编排接进对话页时必须补的能力：原来只返回 String，落库只能存空 sources，
      * 前端「参考来源」区就是空的，等于把 agent 的能力阉割掉一半。
      * 【设计要点·为什么不再提供"只取文本"的重载】此前另有一个 execute(question, history) 返回 String 的重载，
-     * 唯一调用方是已删除的裸接口 POST /api/agent/orchestrate。该端点与产品入口（对话页 mode=agent =
+     * 唯一调用方是已删除的编排接口 POST /api/agent/orchestrate。该端点与产品入口（对话页 mode=agent =
      * 同一套编排 + 多轮历史 + 落库）完全重叠、前端引用为 0，属纯冗余，故端点与重载一并移除。
      *
      * @param question 用户问题

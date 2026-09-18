@@ -30,7 +30,7 @@ import java.util.function.Supplier;
  * 失去唯一调用方，已作为死方法一并移除——与当初删 REPORT 死分支同一原则：装配了没人调的东西不留。
  * 【常见问题】为何 /api/** 也走 JWT 拦截？——与现有接口一致，问答须登录
  */
-@Tag(name = "Agent 引擎调试接口")
+@Tag(name = "Agent 引擎直连接口")
 @RestController
 @RequestMapping("/api/agent")
 @RequiredArgsConstructor

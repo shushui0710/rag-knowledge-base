@@ -47,8 +47,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   7. 工具注册表自动收集（开闭原则：新增 @Component 即注册）
  *   8. Agent 证据契约（反思评审可用性的前提）
  *   9. 熔断端到端覆盖（熔断期间主问答链 / 编排链 / ReAct 链均优雅降级，且一次 LLM 请求都不发出）
- *  10. REPORT 分支：报告生成从"裸接口孤岛"变成编排链路的一条正常分支，可经对话页触达并落库
- *  11. 四类路由逐一可达（DOCUMENT/STATS/REPORT/HYBRID 各有唯一归属）+ "一个 ReAct 引擎、两个入口"的结构断言
+ *  10. REPORT 分支：报告生成从"引擎直连端点孤岛"变成编排链路的一条正常分支，可经对话页触达并落库
+ *  11. 四类路由逐一可达（DOCUMENT/STATS/REPORT/HYBRID 各有唯一归属）+ 引擎直连端点与 REPORT 分支共用同一个 ReAct 引擎实例的结构断言
  *
  * 【重要边界说明】
  *   1) 熔断器（LlmCircuitBreaker）挂在 **LlmService —— 全站 LLM 调用的唯一出口**，
@@ -61,19 +61,19 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *      评审时传入 AgentResult.evidence 作为"依据片段"，不再传空列表。
  *   3) REPORT 分支的意图识别由路由的 LLM 分类产出（temperature=0.1），A5-13 用与路由 Prompt 示例同形的
  *      问法做断言；分支本身的产出与落库则用 Agent 层直调 + 对话页 HTTP 两条路径分别取证。
- *   4) 【09-18 收口·端点收敛】裸接口 POST /api/agent/orchestrate 已删除——它与产品入口完全重叠
+ *   4) 【09-18 收口·端点收敛】编排接口 POST /api/agent/orchestrate 已删除——它与产品入口完全重叠
  *      （产品入口 = 同一套 OrchestratorAgent + 多轮历史 + 落库，严格覆盖它）、前端 frontend/src 引用为 0、
  *      独有价值仅"不落库"，属纯冗余；删除后 OrchestratorAgent.execute(String, List) 与
  *      AgentExecutor.executeResult(String) 失去调用方，作为死方法一并移除。
  *      因此本套件里凡涉及"编排链"的用例（A5-05 / A5-06 / A5-12）统一改走产品入口
  *      POST /api/chat/ask + mode=agent——这样验的才是用户真实可达的那条路。
- *      仅存的裸端点 /api/agent/ask 保留为**引擎调试/隔离取证**入口：它直连 AgentExecutor、不掺意图路由
+ *      仅存的引擎直连端点 /api/agent/ask 保留为**调试与隔离取证**入口：它直连 AgentExecutor、不掺意图路由
  *      那次 LLM 调用，A5-12 的三链降级对比与 A5-14 的 assertSame 都依赖它。
  *
  * 通过标准（P0）：
  *   - 熔断器：连续 5 次失败后 tryAcquire 返回 false；onSuccess 后失败计数归零
  *   - 熔断器只被 LlmService 持有（唯一出口）；熔断期间 3 个出口方法统一抛 LlmUnavailableException
- *   - /api/agent/ask（引擎调试端点）返回非空回答；空问题被拒（400）
+ *   - /api/agent/ask（引擎直连端点）返回非空回答；空问题被拒（400）
  *   - 编排链（产品入口：对话页 mode=agent）对统计类问题给出含真实文档数、保留工具计量表述的回答
  *   - /api/metrics/today 结构与计数口径正确：入口记 queryCount/avgCostMs，唯一出口记 llmCalls/toolCalls，
  *     RAG 链（改写 1 次 LLM）、编排 STATS 分支（路由 1 次 LLM + 2 次工具）增量均精确可预测
@@ -258,13 +258,13 @@ class A5_AgentAndBreakerAcceptanceTest extends AcceptanceSupport {
 
     @Test
     @Order(4)
-    @DisplayName("A5-04 引擎调试端点参数校验：空问题被拒，且 HTTP 语义与业务异常路径一致")
+    @DisplayName("A5-04 引擎直连端点参数校验：空问题被拒，且 HTTP 语义与业务异常路径一致")
     void a504_agent_rejects_blank_question() {
         AuthSession s = newUser();
 
-        // 【用例收缩说明】原先还覆盖 /api/agent/orchestrate（编排裸接口）。该端点与产品入口
+        // 【用例收缩说明】原先还覆盖 /api/agent/orchestrate（编排接口）。该端点与产品入口
         // （对话页 mode=agent = 同一套 OrchestratorAgent + 多轮历史 + 落库）完全重叠、前端引用为 0，
-        // 已作为纯冗余删除，故此处只保留引擎调试端点 /api/agent/ask。
+        // 已作为纯冗余删除，故此处只保留引擎直连端点 /api/agent/ask。
         // 校验分支要与 Service 抛 BusinessException 的路径保持同一套 HTTP 语义：
         // 修复前它用 return Result.error(400, ...) 做内联校验，方法正常返回 → Spring 按 HTTP 200 发出，
         // 与 BusinessException 的 HTTP 400 形成两套语义；原用例只断言响应体 code，因此该缺陷可以全绿存活。
@@ -284,7 +284,7 @@ class A5_AgentAndBreakerAcceptanceTest extends AcceptanceSupport {
                             + "若为 200 说明校验走了 return Result.error(...) 的内联分支。实际："
                             + resp.getStatusCode() + "，" + bodyOf(resp));
         }
-        step("A5-04 通过：引擎调试端点 /api/agent/ask 的空问题 HTTP 400 + 「问题不能为空」");
+        step("A5-04 通过：引擎直连端点 /api/agent/ask 的空问题 HTTP 400 + 「问题不能为空」");
     }
 
     // ==================== 3. 多 Agent 编排与意图路由 ====================
@@ -294,7 +294,7 @@ class A5_AgentAndBreakerAcceptanceTest extends AcceptanceSupport {
     @DisplayName("A5-05 编排的 STATS 分支：经产品入口（对话页 mode=agent）由工具直答，数字不得被重写丢失")
     void a505_orchestrator_routes_stats_question() {
         AuthSession s = newUser();
-        // 【为什么改走产品入口】本用例原先打裸接口 /api/agent/orchestrate。该端点与产品入口完全重叠
+        // 【为什么改走产品入口】本用例原先打编排接口 /api/agent/orchestrate。该端点与产品入口完全重叠
         // （同一套 OrchestratorAgent，产品入口只是多了多轮历史 + 落库），前端引用为 0，已删除。
         // 现在直接走用户真实可达的链路：POST /api/chat/ask + mode=agent，断言从落库回答里读。
         // 先播种一个文档，使统计结果非零，让"回答里出现数字"具备真实语义。
@@ -376,7 +376,7 @@ class A5_AgentAndBreakerAcceptanceTest extends AcceptanceSupport {
                 "RAG 链路不涉及工具调用，toolCalls 不应变化");
 
         // ---- 2) 多 Agent 编排链路（STATS 分支，经产品入口 mode=agent）----
-        // 【口径变化】原先打裸接口 /api/agent/orchestrate，该端点已作为纯冗余删除（与产品入口完全重叠）。
+        // 【口径变化】原先打编排接口 /api/agent/orchestrate，该端点已作为纯冗余删除（与产品入口完全重叠）。
         // 改走用户真实可达的对话页链路：POST /api/chat/ask + mode=agent。计数口径完全不变——
         // askByAgent 只多做两件不耗 LLM 的事：读一次会话历史（查库）与落库。
         // 【G-08/G-09 回归护栏】STATS 分支是确定性链路：意图路由 1 次 LLM + StatsAgent 组合调用 2 个工具
@@ -513,7 +513,7 @@ class A5_AgentAndBreakerAcceptanceTest extends AcceptanceSupport {
         assertTrue(hasEvidenceTag, "依据项应带 type=evidence 标记（前端据此渲染「依据片段」而非「相似度」）");
 
         // 落库与回读——这是"接进产品"与"只挂个裸 API"的分界线：
-        // 若仍只有裸端点（如已删除的 /api/agent/orchestrate）就写不进 chat_message，
+        // 若仍只有直连端点（如已删除的 /api/agent/orchestrate）就写不进 chat_message，
         // 会话历史里看不到、刷新即丢，前端「参考来源」也无从渲染。
         JsonNode history = jsonOf(httpGet("/api/chat/history/" + sessionId, s.token())).path("data");
         assertTrue(history.isArray(), "历史应为数组");
@@ -592,7 +592,7 @@ class A5_AgentAndBreakerAcceptanceTest extends AcceptanceSupport {
                     "熔断期 ReAct 链应返回统一熔断兜底文案");
 
             // ---- ③ 编排链（产品入口 mode=agent；意图路由本身就是一次 LLM 调用）----
-            // 原先打裸接口 /api/agent/orchestrate，该端点已作为纯冗余删除，改走用户真实可达的对话页链路。
+            // 原先打编排接口 /api/agent/orchestrate，该端点已作为纯冗余删除，改走用户真实可达的对话页链路。
             long orchSessionId = createSession(s.token());
             ResponseEntity<byte[]> orchResp = httpPostJson("/api/chat/ask/" + orchSessionId,
                     "{\"question\":\"知识库里有哪些文档？\",\"mode\":\"agent\"}", s.token());
@@ -693,22 +693,22 @@ class A5_AgentAndBreakerAcceptanceTest extends AcceptanceSupport {
                 + "经 /api/chat/ask?mode=agent 落库 " + history.size() + " 条");
     }
 
-    // ==================== 11. 四类路由全覆盖 + "一个引擎、两个入口" ====================
+    // ==================== 11. 四类路由全覆盖 + 引擎直连端点与 REPORT 分支共用同一引擎 ====================
 
     @Test
     @Order(14)
-    @DisplayName("A5-14 四类路由逐一可达 + 两个入口共用同一个 ReAct 引擎（一个引擎、两个入口）")
+    @DisplayName("A5-14 四类路由逐一可达 + 引擎直连端点与 REPORT 分支共用同一个 ReAct 引擎实例")
     void a514_four_routes_and_single_react_engine() throws Exception {
-        // ---- ① 结构断言：链路③ 与链路④ 不是两套实现，而是"一个 ReAct 引擎、两个入口" ----
-        // 入口① = AgentController./api/agent/ask 直连的 AgentExecutor（裸接口，调试/验收入口）；
-        // 入口② = 对话页「深度思考」→ OrchestratorAgent 的 REPORT 分支 → ReportAgent → 同一个 AgentExecutor。
+        // ---- ① 结构断言：引擎直连端点与产品入口不是两套实现，而是共用同一个 ReAct 引擎实例 ----
+        // 调试/取证侧 = AgentController./api/agent/ask 直连的 AgentExecutor（引擎直连端点）；
+        // 产品侧 = 对话页「深度思考」→ OrchestratorAgent 的 REPORT 分支 → ReportAgent → 同一个 AgentExecutor。
         // 之所以用 assertSame 盯住 Bean 实例：只要两者是同一个 Bean，ReAct 循环与工具注册表就只有一份，
         // 埋点（LlmService/ToolRegistry 唯一出口）与熔断（LlmService 唯一出口）自然不存在"某条链路漏记"的口径分裂。
-        assertNotNull(agentController, "AgentController 应被装配（入口①的载体）");
+        assertNotNull(agentController, "AgentController 应被装配（引擎直连端点的载体）");
         Object engineBehindApi = fieldValueOf(AgentController.class, "agentExecutor", agentController);
         Object engineBehindReportBranch = fieldValueOf(ReportAgent.class, "agentExecutor", reportAgent);
         assertSame(engineBehindApi, engineBehindReportBranch,
-                "入口①（/api/agent/ask）与入口②（对话页 mode=agent → REPORT 分支）必须复用同一个 AgentExecutor 实例，"
+                "引擎直连端点（/api/agent/ask）与产品入口（对话页 mode=agent → REPORT 分支）必须复用同一个 AgentExecutor 实例，"
                         + "否则就是「两个引擎、四份口径」，链路③/④ 的对比结论不再成立");
 
         // ---- ② 四类路由逐一断言：四类意图各有唯一归属，REPORT/HYBRID 都不是"选不中的死分支" ----
@@ -730,10 +730,10 @@ class A5_AgentAndBreakerAcceptanceTest extends AcceptanceSupport {
         }
 
         step("A5-14 通过：四类路由逐一命中（" + hits.toString().trim() + "），"
-                + "且入口①的 AgentExecutor 与 REPORT 分支的 AgentExecutor 为同一实例（一个引擎、两个入口）");
+                + "且引擎直连端点的 AgentExecutor 与 REPORT 分支的 AgentExecutor 为同一实例（同一个引擎，不是两套实现）");
     }
 
-    /** 读取指定类的私有字段值（用于断言"两个入口是否共用同一个引擎实例"） */
+    /** 读取指定类的私有字段值（用于断言"引擎直连端点与产品入口是否共用同一个引擎实例"） */
     private static Object fieldValueOf(Class<?> clazz, String fieldName, Object target) throws Exception {
         Field f = clazz.getDeclaredField(fieldName);
         f.setAccessible(true);

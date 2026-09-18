@@ -43,7 +43,7 @@ public class ChatController {
      * 【设计要点】@RequestBody DTO 绑定与字段校验、入口层只做参数合法性，业务逻辑沉降到 Service
      * 【常见问题】为什么用 DTO 而非 @RequestBody String？——DTO 经 Jackson 反序列化可逐字段校验，裸 String 只能拿到原文；会话归属由哪层校验？——Service 内做归属校验，保证任何入口调用都安全
      * 【常见问题】mode 是什么？——链路开关：不传 = 默认 RAG 链路；"agent" = 多 Agent 编排（对话页「深度思考」）。
-     * 之所以复用这个端点而不是另开一个裸端点：裸端点不落库，回答进不了会话历史、刷新即丢
+     * 之所以复用这个端点而不是另开一个引擎直连端点：引擎直连端点不落库，回答进不了会话历史、刷新即丢
      * （原先并存的 /api/agent/orchestrate 即属此类，已作为冗余删除）。
      */
     @Operation(summary = "发送问题并获取回答")
