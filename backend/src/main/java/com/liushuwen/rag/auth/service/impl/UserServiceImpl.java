@@ -45,6 +45,8 @@ public class UserServiceImpl implements UserService {
         user.setUsername(username);
         user.setPassword(encodedPassword);
         user.setNickname(username);
+        // 功能：注册一律写普通角色｜要点：提权只能由运维在库侧显式 UPDATE，注册接口不可自助获得运维权限
+        user.setRole(User.ROLE_USER);
         userMapper.insert(user);
         // 常见问题：密码为什么不能明文入库？→ 数据库一旦泄漏即全员裸奔，哈希不可逆也无法挽回
         log.info("注册用户: {}", username);

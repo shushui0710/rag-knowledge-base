@@ -1,7 +1,8 @@
-package com.liushuwen.rag.rag;
+package com.liushuwen.rag.rag.impl;
 
 import com.liushuwen.rag.document.service.EmbeddingService;
-import com.liushuwen.rag.document.service.MilvusService;
+import com.liushuwen.rag.document.service.MilvusMemoryStore;
+import com.liushuwen.rag.rag.MemoryService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -20,13 +21,10 @@ import java.util.stream.Collectors;
 public class MemoryServiceImpl implements MemoryService {
 
     private final EmbeddingService embeddingService;
-    private final MilvusService milvusService;
+    private final MilvusMemoryStore milvusMemoryStore;
 
     // 功能：记忆召回最低相似度阈值（>0.5 才注入）｜要点：相似度过滤防低相关噪声污染上下文
     private static final float MEMORY_MIN_SCORE = 0.5f;
-
-    // 功能：回答存储字符上限（200）｜要点：截断防单条记忆膨胀、控向量维度成本
-    private static final int ANSWER_MAX_LEN = 200;
 
     @Override
     public void saveExchange(Long userId, String question, String answer) {
@@ -34,13 +32,22 @@ public class MemoryServiceImpl implements MemoryService {
             if (question == null || answer == null) {
                 return;                                   // 空值防御：参数缺失直接跳过，不写脏数据
             }
-            String qa = question + "\n" + (answer.length() > ANSWER_MAX_LEN
-                    ? answer.substring(0, ANSWER_MAX_LEN) : answer);   // 截断防膨胀：控制单条记忆体积
+            // 【缺陷修复·向量与入库文本不同源】原实现把"截断到 200 字"的结果只用于算向量，入库却传了
+            // **完整 answer**（String qa = ... ; insertMemory(vec, userId, question, answer)）：
+            //   ① 注释宣称的"截断防膨胀、控单条记忆体积"对存储侧根本没生效 —— 这正是"超长内容静默丢失"
+            //      （Milvus code=1100）的上游根因，长回答得以直接撞 2048 字节字段上限；
+            //   ② 向量只反映"问题 + 前 200 字"，content 却存全文 ⇒ 二者语义错位，>200 字回答的后半段
+            //      对相似度贡献为零。
+            // 修法：先把记忆文本按 **UTF-8 字节上限**（与 Milvus schema 同一常量）裁剪一次，
+            // 再让 embedding 与入库**共用这一份文本**。上限取 2048 字节而非 200 字：embedding-3 支持
+            // 8192 tokens 输入，2048 字节（≈682 汉字）远未触顶，保留更完整的上下文更利于召回。
+            String qa = MilvusMemoryStore.truncateUtf8(question + "\n" + answer,
+                    MilvusMemoryStore.MEMORY_CONTENT_MAX_LEN);
             List<float[]> vecs = embeddingService.embed(List.of(qa));
             if (vecs == null || vecs.isEmpty()) {
                 return;
             }
-            milvusService.insertMemory(vecs.get(0), userId, question, answer);
+            milvusMemoryStore.insertMemory(vecs.get(0), userId, qa);
         } catch (Exception e) {
             // 功能：记忆保存失败只记日志、不抛异常｜要点：旁路增强 fail-safe（记忆丢一条不影响本次回答）
             log.warn("长期记忆保存失败（不影响本次回答）: {}", e.getMessage());
@@ -57,7 +64,7 @@ public class MemoryServiceImpl implements MemoryService {
             if (vecs == null || vecs.isEmpty()) {
                 return List.of();
             }
-            return milvusService.searchMemory(vecs.get(0), 3, userId).stream()
+            return milvusMemoryStore.searchMemory(vecs.get(0), 3, userId).stream()
                     .filter(h -> h.getScore() > MEMORY_MIN_SCORE)       // 阈值防低相关：仅超 0.5 的历史记忆注入上下文
                     .map(h -> {
                         // 功能：content 存的是"问题\n回答"，拆成 Q:/A: 可读格式注入 Prompt｜要点：存储格式与展示格式解耦

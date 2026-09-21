@@ -35,7 +35,17 @@ public class ReportAgent implements Agent {
     @Override
     public AgentResult execute(String task, List<Map<String, Object>> history) {
         log.info("[ReportAgent] 转交 ReAct 循环生成报告: {}", task);
+        // 【缺陷修复·报告没被真正产出】只把用户原话丢给 ReAct 时，LLM 往往先查列表/统计，
+        // 然后直接回一段"报告已生成完成 / 生成依据 / 知识库现状"的说明——**报告正文从未产出**
+        // （09-20 实测：三条问法全部没有正文，而模型会自称"已完成"）。
+        // 故在此显式约束执行步骤；它与 AgentExecutor 的「产物优先作答」形成双保险（一个管调用，一个管交付）。
+        String instruction = "【任务类型】报告生成\n"
+                + "【用户要求】" + task + "\n"
+                + "【执行要求】\n"
+                + "1. 必须调用 generate_report 工具生成报告正文；\n"
+                + "2. 拿到工具返回的内容后，把报告全文原样输出给用户：不要概述、不要只回复「已生成 / 已完成」、不要省略任何章节；\n"
+                + "3. 仅当工具明确返回失败信息时，才向用户说明失败原因。\n";
         // 多轮历史透传给 ReAct 循环：报告类任务常有多轮追加（"把第二节展开"），丢历史会让追问断上下文
-        return agentExecutor.executeResult(task, history);
+        return agentExecutor.executeResult(instruction, history);
     }
 }

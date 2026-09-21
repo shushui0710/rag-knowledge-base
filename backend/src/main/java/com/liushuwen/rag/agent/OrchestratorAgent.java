@@ -1,6 +1,6 @@
 package com.liushuwen.rag.agent;
 
-import com.liushuwen.rag.chat.service.LlmService;
+import com.liushuwen.rag.llm.LlmService;
 import com.liushuwen.rag.rag.CriticService;
 import com.liushuwen.rag.rag.Critique;
 import com.liushuwen.rag.rag.Route;
@@ -59,12 +59,15 @@ public class OrchestratorAgent {
     public AgentResult executeResult(String question, List<Map<String, Object>> history) {
         Route route = routerService.route(question);
         AgentResult result;
-        // 是否跳过反思评审（重写只会帮倒忙的两种情况）：
+        // 是否跳过反思评审（重写只会帮倒忙的三种情况）：
         //   ① STATS —— 回答由工具直出（MySQL 聚合的确定性事实），既没有幻觉可纠，
         //      也没有"文档依据片段"供评委核对；
         //   ② REPORT —— 回答是长结构化产物，而重写 Prompt（"更直接地回答用户问题、逻辑清晰"）
         //      是面向短问答设计的，套在整篇报告上会把章节结构推平；报告的依据同样已随
-        //      ReAct 的工具输出返回（AgentResult.evidence），不靠重写补质量。
+        //      ReAct 的工具输出返回（AgentResult.evidence），不靠重写补质量；
+        //   ③ HYBRID —— 组合回答的两段拼接而成，其中【数据概况】段与 STATS 同源（工具直出的
+        //      确定性数字），重写同样会把它换成模糊复述；且两段来源天然"看似矛盾"，
+        //      评委几乎必判不合格 ⇒ 重写必然发生、必然抹平结构（09-20 实测 200+ 字 → 54 字）。
         boolean skipReflection;
         switch (route) {
             case STATS -> {
@@ -87,7 +90,15 @@ public class OrchestratorAgent {
                 result = AgentResult.of(
                         "【数据概况】\n" + stats.answer() + "\n\n【文档解答】\n" + doc.answer(),
                         concat(stats.evidence(), doc.evidence()));
-                skipReflection = false;      // 组合回答含 LLM 生成部分，仍需反思
+                // 【缺陷修复·HYBRID 漏在反思之外】原为 skipReflection = false（"组合回答含 LLM 生成部分，仍需反思"），
+                // 但这条判断漏了 HYBRID 与 STATS 同源的那一半：组合回答里【数据概况】段是**工具直出的确定性数字**，
+                // 反思重写（Prompt 面向短问答："更直接地回答用户问题、逻辑清晰"）同样会把它换成模型的模糊复述——
+                // 09-20 实测确证：路由=HYBRID 时 Critic 判定"对文档数量的回答自相矛盾…整体回答不够简洁"并触发重写，
+                // 返回的正文从「【数据概况】+ 完整统计与文档列表 +【文档解答】」被压缩成一句 54 字的口语概述，
+                // 两个结构标签与文档列表全部丢失（结构是硬拼接的，重写必然抹平）。
+                // 且两段来源天然"看似矛盾"（数字段说有 1 篇文档，检索段对同一问法答"资料未提及"），
+                // 评委几乎必判不合格 ⇒ 重写几乎必然发生。故与 STATS/REPORT 同处理：跳过反思。
+                skipReflection = true;
             }
             default -> {
                 Agent docAgent = findAgent(Agent.AgentType.DOCUMENT);
@@ -101,7 +112,8 @@ public class OrchestratorAgent {
         // 【缺陷修复·反思误用】修复前对 STATS 分支统一调 Critic 并传空证据（List.of()），
         // 评委必判"无知识库依据"不合格 → 触发一次纯 LLM 重写，把准确数字换成模型的模糊复述
         // （验收实测：回答退化为"根据当前可检索到的知识库内容，文档数量为"，数字与列表全丢）。
-        // 结论：反思只作用于"面向短问答、由 LLM 生成"的回答（DOCUMENT / HYBRID）。
+        // 结论：反思只作用于"面向短问答、由 LLM 自由生成"的回答（仅 DOCUMENT 一条分支）。
+        // 09-20 后 STATS / REPORT / HYBRID 三条分支均已跳过（原因见上方 skipReflection 注释）。
         if (skipReflection) {
             log.info("[Orchestrator] 路由={} 为工具直答或长结构化产物，跳过反思评审（重写只会降质）", route);
             return result;

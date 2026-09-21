@@ -5,13 +5,21 @@ import lombok.Data;
 import java.time.LocalDateTime;
 
 /**
- * 用户实体：映射 user 表，承载认证与基本信息。
+ * 用户实体：映射 user 表，承载认证、角色与基本信息。
  * 【设计要点】逻辑删除：@TableLogic 将 deleted 字段转为软删除，查询自动追加条件，避免物理删数据
  * 【常见问题】@TableField(fill=...) 做什么？——配合 MetaObjectHandler 在 insert/update 时自动填充时间；id 为何自增？——单机自增简单可靠，分布式场景需雪花算法
+ *   role 为什么不用配置白名单？——按用户名白名单会被"抢先注册同名账号"绕过（本系统注册开放），
+ *   角色是落库的身份事实，注册一律 USER，提权只能由运维在库侧显式 UPDATE，不可自助获取
  */
 @Data
 @TableName("user")
 public class User {
+
+    /** 普通用户：仅业务功能 */
+    public static final String ROLE_USER = "USER";
+
+    /** 运维管理员：可执行索引重建等全局破坏性运维操作 */
+    public static final String ROLE_ADMIN = "ADMIN";
 
     @TableId(type = IdType.AUTO)
     private Long id; // 主键，数据库自增
@@ -23,6 +31,8 @@ public class User {
     private String nickname; // 昵称，注册时默认等于用户名
 
     private String email; // 邮箱
+
+    private String role; // 角色：USER / ADMIN（默认 USER，仅运维可提权）
 
     @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createTime; // 创建时间，插入时自动填充

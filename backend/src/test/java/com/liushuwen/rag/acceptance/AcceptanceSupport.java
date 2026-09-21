@@ -317,6 +317,56 @@ public abstract class AcceptanceSupport {
         }
     }
 
+    /**
+     * 等待"刚删除的向量"从检索结果中消失。
+     *
+     * 【为什么需要】与插入侧同源：Milvus 的 delete 同样不是立即可见的（Bounded 一致性）。
+     * 删除返回成功（getDeleteCnt()>0）之后立刻检索，仍可能命中已删向量——把"删除后立刻检索为空"
+     * 当断言会得到与业务无关的假失败。断言目标仍是恒等命题「最终不可召回」，只是给它一个可见性窗口。
+     *
+     * @return true = 在超时内检索结果中不再含 mustNotContain；false = 超时仍可召回（真缺陷）
+     */
+    protected static boolean waitUntilNotRetrievable(
+            com.liushuwen.rag.document.service.MilvusService milvus,
+            float[] queryVector, long documentId, String mustNotContain, long timeoutMillis) {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        int attempt = 0;
+        while (true) {
+            attempt++;
+            try {
+                List<com.liushuwen.rag.document.service.MilvusService.SearchResult> hits =
+                        milvus.search(queryVector, 5, List.of(documentId));
+                boolean stillThere = hits.stream().anyMatch(h ->
+                        h.getContent() != null && (mustNotContain == null || h.getContent().contains(mustNotContain)));
+                if (!stillThere) {
+                    if (attempt > 1) {
+                        System.out.println("[验收] 向量删除可见性等待 " + attempt + " 次后消失（Milvus Bounded 一致性窗口）");
+                    }
+                    return true;
+                }
+            } catch (Exception ignored) {
+                // 单次检索异常不致命（删除中的集合可能短暂不可查），继续重试直至超时
+            }
+            if (System.currentTimeMillis() >= deadline) {
+                System.out.println("[验收] 向量删除可见性等待超时：" + timeoutMillis + "ms / " + attempt + " 次仍可召回");
+                return false;
+            }
+            try {
+                Thread.sleep(400);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+    }
+
+    /** 默认 15s 超时的"消失"等待 */
+    protected static boolean waitUntilNotRetrievable(
+            com.liushuwen.rag.document.service.MilvusService milvus,
+            float[] queryVector, long documentId, String mustNotContain) {
+        return waitUntilNotRetrievable(milvus, queryVector, documentId, mustNotContain, 15000);
+    }
+
     /** 默认 15s 超时的可见性等待 */
     protected static boolean waitUntilRetrievable(
             com.liushuwen.rag.document.service.MilvusService milvus,

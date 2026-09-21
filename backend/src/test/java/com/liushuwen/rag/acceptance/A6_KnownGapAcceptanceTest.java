@@ -3,7 +3,6 @@ package com.liushuwen.rag.acceptance;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.liushuwen.rag.config.RagProperties;
 import com.liushuwen.rag.document.service.EmbeddingService;
-import com.liushuwen.rag.document.service.MilvusService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -34,8 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * A6 —— 已知缺口固化验收（把"文档与实现的偏差"变成可回归的测试）。
  *
  * 设计意图：
- *   既有的项目文档中有一批表述与当前实现不符（越权防护、级联删除、增量重解析、
- *   缓存配置生效等）。这些偏差不影响主链路可用性，但会在面试追问时被拆穿。
+ *   既有的项目文档中有一批表述与当前实现不符（增量重解析、缓存配置生效等）。这些偏差不影响主链路可用性，但会在面试追问时被拆穿。
  *   本类不放宽断言去"假装通过"，而是<b>精确断言当前真实行为</b>：
  *     - 一旦实现被修好，这些用例会立刻失败 → 强制同步更新文档，避免文档再次漂移；
  *     - 在当前状态下，它们构成一份"已知缺口清单"的事实依据。
@@ -43,6 +41,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   说明：原先本类清单里的「熔断覆盖范围」缺口（熔断只挂 AgentExecutor、主链路裸奔）已在
  *   后续迭代中修复——熔断收口到全站 LLM 唯一出口 LlmService，覆盖范围由 A5-02 / A5-12 正面取证，
  *   故不再是缺口，也不在本类中固化。
+ *
+ *   同样地，「删除文档不级联清理向量」缺口（原 A6-03）也已在结构治理中修复：delete() 现按
+ *   Milvus 向量 → MinIO 对象 → MySQL 分块 → 文档行 的顺序级联清理，并加 @Transactional 与归属校验，
+ *   其正向取证改由 A2-14 / A2-15 承担，故本类不再固化该缺口。
+ *
+ *   「会话归属校验缺失」缺口（原 A6-01 / A6-02）同样已修复：会话的按 id 读写（读历史 / 删除 / 改标题）
+ *   全部收口到 ChatSessionService 的归属校验，正向取证改由 A4-10 / A4-11 承担。
+ *
+ *   注意：本类的用例编号沿用原始台账编号（缺口③④⑤⑥），**刻意不重排**——
+ *   编号是历史报告的追溯锚点，缺口①②修好后留空反而更容易对上旧文档。
  *
  * 这些用例标记为 @Order 靠后，且不计入 P0 通过门槛（报告单列）。
  * 通过标准：全部断言"当前行为"成立（即测试通过即代表缺口清单准确）。
@@ -52,124 +60,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class A6_KnownGapAcceptanceTest extends AcceptanceSupport {
 
     @Autowired
-    private MilvusService milvusService;
-
-    @Autowired
-    private EmbeddingService embeddingService;
-
-    @Autowired
     private RagProperties ragProperties;
-
-    /** 直接查库统计分块残留：比依赖"检索排序"这类非确定信号更可靠 */
-    @Autowired
-    private com.liushuwen.rag.document.mapper.DocumentChunkMapper chunkMapper;
-
-    // ==================== 缺口①：会话归属校验缺失 ====================
-
-    @Test
-    @Order(1)
-    @DisplayName("A6-01【缺口①】会话归属未校验：B 的 token 可读到 A 的会话历史")
-    void a601_session_ownership_not_enforced_on_read() {
-        AuthSession a = newUser();
-        AuthSession b = newUser();
-        long sessionA = createSession(a.token());
-        ask(a.token(), sessionA, "这是 A 的私密提问");
-
-        JsonNode historyAsB = jsonOf(httpGet("/api/chat/history/" + sessionA, b.token())).path("data");
-
-        assertEquals(200,
-                jsonOf(httpGet("/api/chat/history/" + sessionA, b.token())).path("code").asInt(),
-                "接口本身返回成功");
-        assertTrue(historyAsB.size() > 0,
-                "【缺口】ChatServiceImpl#getHistory 只按 sessionId 过滤，未校验该会话是否属于当前用户，"
-                        + "B 用自己合法 token 即可读到 A 的会话内容。当前实测读到 " + historyAsB.size() + " 条。"
-                        + "文档中「Service 内做归属校验防越权」的表述与实现不符。");
-        boolean leaked = false;
-        for (JsonNode m : historyAsB) {
-            if (m.path("content").asText().contains("A 的私密提问")) {
-                leaked = true;
-            }
-        }
-        assertTrue(leaked, "确实发生了跨用户内容泄露（读到 A 的提问原文）");
-        step("A6-01 记录：跨用户读取会话历史成功，读到 " + historyAsB.size() + " 条（越权缺口确认）");
-    }
-
-    @Test
-    @Order(2)
-    @DisplayName("A6-02【缺口①】会话归属未校验：B 的 token 可删除 A 的会话")
-    void a602_session_ownership_not_enforced_on_delete() {
-        AuthSession a = newUser();
-        AuthSession b = newUser();
-        long sessionA = createSession(a.token());
-
-        ResponseEntity<byte[]> del = httpDelete("/api/chat/session/" + sessionA, b.token());
-        assertEquals(200, del.getStatusCode().value(), "接口返回成功");
-
-        JsonNode stillThere = jsonOf(httpGet("/api/chat/history/" + sessionA, a.token())).path("data");
-        assertTrue(stillThere.isEmpty(),
-                "【缺口】deleteSession 同样未校验归属，B 已成功删除 A 的会话（A 的历史已为空，"
-                        + "实际剩余 " + stillThere.size() + " 条）");
-        step("A6-02 记录：跨用户删除会话成功（越权缺口确认）");
-    }
-
-    // ==================== 缺口②：删除文档不级联清理向量 ====================
-
-    @Test
-    @Order(3)
-    @DisplayName("A6-03【缺口②】删除文档只做 MySQL 逻辑删除：分块行与 Milvus 向量均残留")
-    void a603_delete_document_leaves_orphan_vectors() {
-        AuthSession s = newUser();
-        String marker = "ORPHAN" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
-        JsonNode doc = uploadDoc(s.token(), "将被删除.md",
-                "# 孤儿向量验证\n\n本文档唯一标记词是 " + marker + "，删除后其向量是否仍可被召回？\n"
-                        + "补充内容用于凑足分块长度，确保产生可检索的向量。\n", "其他");
-        long docId = doc.path("id").asLong();
-        embedDoc(s.token(), docId);
-
-        // 前置：向量可被检索（先等写入可见：Milvus Bounded 一致性存在亚秒级窗口）
-        float[] qv = embeddingService.embedSingle("本文档唯一标记词是 " + marker);
-        assertTrue(waitUntilRetrievable(milvusService, qv, docId, marker), "前置条件：向量化后 15s 内仍不可检索");
-        long chunksBefore = countChunks(docId);
-        assertTrue(chunksBefore > 0, "前置条件：文档解析后应有分块，实际 " + chunksBefore);
-
-        // 删除文档（仅 MySQL 逻辑删除）
-        assertEquals(200, httpDelete("/api/document/" + docId, s.token()).getStatusCode().value());
-
-        // ① document 行确已逻辑删除：不再出现在文档列表
-        boolean stillListed = false;
-        for (JsonNode d : jsonOf(httpGet("/api/document/list", s.token())).path("data")) {
-            if (d.path("id").asLong() == docId) {
-                stillListed = true;
-            }
-        }
-        assertFalse(stillListed, "document 行应已逻辑删除（列表不可见）");
-
-        // ② document_chunk 分块行残留（直接查库，避免依赖"检索排序"这类非确定信号）
-        long chunksAfter = countChunks(docId);
-        assertEquals(chunksBefore, chunksAfter,
-                "【缺口】DocumentServiceImpl#delete 只做 documentMapper.deleteById，"
-                        + "未清理 document_chunk，删除后仍残留 " + chunksAfter + " 行分块。"
-                        + "同理 MinIO 原文件对象也未清理。");
-
-        // ③ Milvus 向量残留：Milvus 不知道 MySQL 的逻辑删除，按已删文档的 document_id 仍可直接召回
-        List<MilvusService.SearchResult> orphan = milvusService.search(qv, 5, List.of(docId));
-        assertTrue(orphan.stream().anyMatch(h -> h.getContent() != null && h.getContent().contains(marker)),
-                "【缺口】delete() 未调用 milvusService.deleteByDocumentId，"
-                        + "向量行仍存在且可按 document_id 召回（对比：reparseDocument 里是有调用该方法的）");
-
-        // ④ 正式链路为何看不到脏数据：documentIds 取自 MySQL（deleted=0 且已向量化），已删文档不在其中，
-        //    故主问答链路与 A3 的隔离用例都不受影响 —— 这正是缺口长期未被发现的原因。
-        step("A6-03 记录：删除文档后 document_chunk 残留 " + chunksAfter + " 行、Milvus 向量仍可按 document_id 召回；"
-                + "正式链路因 documentIds 过滤而不可见，掩盖了该缺口。"
-                + "即文档中「级联清理 MinIO/MySQL/Milvus」的表述三项都未落地");
-    }
-
-    /** 统计某文档在 MySQL 中的分块行数 */
-    private long countChunks(long documentId) {
-        return chunkMapper.selectCount(new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper
-                <com.liushuwen.rag.document.entity.DocumentChunk>()
-                .eq(com.liushuwen.rag.document.entity.DocumentChunk::getDocumentId, documentId));
-    }
 
     // ==================== 缺口③：增量重解析无 HTTP 入口 ====================
 

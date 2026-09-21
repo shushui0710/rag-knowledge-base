@@ -43,8 +43,13 @@ class A4_ChatFlowAcceptanceTest extends AcceptanceSupport {
     @Autowired
     private MemoryService memoryService;
 
+    /** 文档向量的可见性等待（语料播种后确认已可召回），走数据面 */
     @Autowired
     private com.liushuwen.rag.document.service.MilvusService milvusService;
+
+    /** 记忆存储：A4-09 直接验证记忆写入的截断保护与主键量级 */
+    @Autowired
+    private com.liushuwen.rag.document.service.MilvusMemoryStore milvusMemoryStore;
 
     @Autowired
     private com.liushuwen.rag.document.service.EmbeddingService embeddingService;
@@ -187,7 +192,7 @@ class A4_ChatFlowAcceptanceTest extends AcceptanceSupport {
 
     @Test
     @Order(5)
-    @DisplayName("A4-05 会话隔离：A 的会话不出现在 B 的列表，B 也读不到 A 的历史")
+    @DisplayName("A4-05 会话列表隔离：A 的会话不出现在 B 的会话列表")
     void a405_session_list_is_isolated() {
         AuthSession a = newUser();
         AuthSession b = newUser();
@@ -199,9 +204,11 @@ class A4_ChatFlowAcceptanceTest extends AcceptanceSupport {
                     "会话列表按 user_id 过滤，B 不应看到 A 创建的会话");
         }
 
-        JsonNode historyAsB = jsonOf(httpGet("/api/chat/history/" + sessionA, b.token())).path("data");
-        step("A4-05 记录：B 读取 A 的会话历史返回 " + historyAsB.size()
-                + " 条（会话列表按 userId 隔离已生效；历史读取本身未做归属校验，A6-01 用有消息的会话确认了越权可读）");
+        // 【射程修正】本条原先的标题写着"B 也读不到 A 的历史"，正文却只记录条数、没有任何断言——
+        // 典型「声明的射程 > 实际射程」：正因为这里没断言，会话越权（原 A6-01）才能一直存活。
+        // 现在把本条收敛到它真正验证的范围（会话**列表**隔离），历史读取的归属校验由 A4-10 正面断言。
+        step("A4-05 通过：B 的会话列表中不含 A 的会话（列表按 user_id 隔离生效）；"
+                + "历史读取的归属校验见 A4-10，会话删除的归属校验见 A4-11");
     }
 
     @Test
@@ -222,6 +229,65 @@ class A4_ChatFlowAcceptanceTest extends AcceptanceSupport {
         JsonNode history = jsonOf(httpGet("/api/chat/history/" + sessionId, s.token())).path("data");
         assertTrue(history.isEmpty(), "级联删除后该会话历史应为空，实际 " + history.size() + " 条");
         step("A4-06 通过：会话级联删除生效");
+    }
+
+    @Test
+    @Order(10)
+    @DisplayName("A4-10 历史读取归属校验：B 读不到 A 的会话历史（业务码 403），A 自己读得到")
+    void a410_history_read_is_owner_only() {
+        // 【为什么要补这一条】修复前 getHistory 只按 sessionId 过滤、不校验归属：
+        // 任何登录用户拿到别人的 sessionId 就能读到完整对话内容（含私密提问原文）。
+        // 缺口原先以"反向固化"记在 A6-01；实现修好后按 A6 自身约定转为本条正向回归。
+        AuthSession a = newUser();
+        AuthSession b = newUser();
+        long sessionA = createSession(a.token());
+        ask(a.token(), sessionA, "这是 A 的私密提问");
+
+        // ① A 自己读得到，且能看到自己的提问原文（确认功能本身没被改坏）
+        JsonNode historyA = jsonOf(httpGet("/api/chat/history/" + sessionA, a.token())).path("data");
+        assertTrue(historyA.size() >= 2, "A 自己应能读到提问与回答，实际 " + historyA.size() + " 条");
+        boolean seenOwn = false;
+        for (JsonNode m : historyA) {
+            if (m.path("content").asText().contains("这是 A 的私密提问")) {
+                seenOwn = true;
+            }
+        }
+        assertTrue(seenOwn, "A 应能在自己的历史里看到提问原文");
+
+        // ② B 读 A 的会话被拒（HTTP 契约仍是 400，业务码 403，见 A6-05）
+        ResponseEntity<byte[]> denied = httpGet("/api/chat/history/" + sessionA, b.token());
+        assertEquals(400, denied.getStatusCode().value(),
+                "越权读历史应被拒绝，实际：" + bodyOf(denied));
+        assertEquals(403, jsonOf(denied).path("code").asInt(),
+                "越权读历史应返回 403 业务码：" + bodyOf(denied));
+        assertFalse(bodyOf(denied).contains("这是 A 的私密提问"),
+                "错误响应体里不得回显他人会话内容（不侧漏）");
+
+        step("A4-10 通过：A 可读自己的历史（" + historyA.size() + " 条），B 读 A 的历史被 403 拒绝且内容未侧漏");
+    }
+
+    @Test
+    @Order(11)
+    @DisplayName("A4-11 会话删除归属校验：B 删不掉 A 的会话（业务码 403），会话仍在")
+    void a411_session_delete_is_owner_only() {
+        // 【为什么要补这一条】修复前 deleteSession 同样不校验归属，B 一条请求就能删掉 A 的全部对话。
+        // 缺口原先记在 A6-02，现转为正向回归。
+        AuthSession a = newUser();
+        AuthSession b = newUser();
+        long sessionA = createSession(a.token());
+        ask(a.token(), sessionA, "A 的会话内容");
+
+        ResponseEntity<byte[]> denied = httpDelete("/api/chat/session/" + sessionA, b.token());
+        assertEquals(400, denied.getStatusCode().value(),
+                "越权删除会话应被拒绝，实际：" + bodyOf(denied));
+        assertEquals(403, jsonOf(denied).path("code").asInt(),
+                "越权删除会话应返回 403 业务码：" + bodyOf(denied));
+
+        // 会话与消息都必须还在
+        JsonNode historyA = jsonOf(httpGet("/api/chat/history/" + sessionA, a.token())).path("data");
+        assertTrue(historyA.size() >= 2,
+                "A 的会话不应被 B 删掉，历史应仍有 2 条，实际 " + historyA.size() + " 条");
+        step("A4-11 通过：B 删除 A 的会话被 403 拒绝，A 的会话与消息完好（" + historyA.size() + " 条）");
     }
 
     // ==================== 4. 长期记忆闭环 ====================
@@ -300,6 +366,79 @@ class A4_ChatFlowAcceptanceTest extends AcceptanceSupport {
         }
         long avg = total / questions.length;
         step("A4-08 实测：连续 3 次端到端问答耗时 " + samples + "，平均 " + avg + "ms（含查询改写 + 混合检索 + 重排 + LLM 生成）");
+    }
+
+    // ==================== 5. 长期记忆健壮性 ====================
+
+    @Test
+    @Order(9)
+    @DisplayName("A4-09 长期记忆健壮性：主键不跨重启冲突 + 超长内容不静默丢失")
+    void a409_memory_id_uniqueness_and_oversize_guard() throws Exception {
+        // ---- ① 主键量级防线：自增序列当前值必须达时间戳量级 ----
+        // 背景（09-20 实测）：原实现 new AtomicLong(1)，而该字段是 Spring 单例的**实例字段** ⇒ 每次应用
+        // 重启（含每一轮验收测试）计数器都归零，新记忆 id 又从 2 开始，与上一轮写入的记忆**主键完全重叠**。
+        // Milvus 不强制主键唯一（insert 不报错），但 query/search 阶段按主键去重 ⇒ 实测 qa_memory 物理 202 行、
+        // id=2 一个主键上压了 38 条记录、全部记录只落在 id=2..10 九个主键上，可召回实体仅剩 9 条，
+        // "跨会话长期记忆"实际退化为"当前进程生命周期内"。
+        // 断言序列量级：一旦有人把它改回 new AtomicLong(1)，本用例立刻失败（防止缺陷无声回归）。
+        java.lang.reflect.Field seqField = com.liushuwen.rag.document.service.MilvusMemoryStore.class
+                .getDeclaredField("memoryIdSeq");
+        seqField.setAccessible(true);
+        java.util.concurrent.atomic.AtomicLong seq =
+                (java.util.concurrent.atomic.AtomicLong) seqField.get(milvusMemoryStore);
+        long idNow = seq.get();
+        assertTrue(idNow > 1_000_000_000_000L,
+                "记忆主键自增序列应达时间戳量级（>1e12）以避开历史小 id，实际 " + idNow
+                        + "。若为小整数，说明初值退回了 new AtomicLong(1)：重启后主键会与历史记忆重叠，"
+                        + "Milvus 按主键去重后绝大多数历史记忆将不可召回");
+
+        // ---- ② 超长内容防线：走**真实生产入口** saveExchange，超 2048 字节须截断入库并仍可召回 ----
+        // 背景（09-20 实测）：content 字段 schema 上限 2048（**UTF-8 字节**），超长时 Milvus 直接报
+        // code=1100 "length of varchar field content exceeds max length"（2600 字必失败、1900 字正常），
+        // 而 insertMemory 把该异常 catch 成一行 WARN ⇒ 记忆静默丢失，用户与用例都看不出少了一条。
+        // 更上游的根因：MemoryServiceImpl.saveExchange 只把"截断到 200 字"的结果拿去算向量，入库却传了
+        // 完整 answer ⇒ 注释宣称的"截断防膨胀"对存储侧完全没生效（详见该类内注释）。
+        // ⚠️ 射程教训（"测试射程决定能发现什么"的又一实例）：本用例原先**直连 milvusService.insertMemory**，
+        // 绕过了 MemoryServiceImpl ⇒ 上游这层截断失效永远测不到。故改为调用生产入口 saveExchange。
+        AuthSession s = newUser();
+        String question = "记忆超长内容落库探测 " + UUID.randomUUID().toString().substring(0, 8);
+        StringBuilder longAnswer = new StringBuilder("这是一条超长回答，用于验证记忆入库的长度保护：");
+        while (longAnswer.length() < 2600) {
+            longAnswer.append("内容持续填充。");
+        }
+        assertTrue(longAnswer.length() > 2048, "前置：构造的回答必须超过 Milvus content 字段上限 2048 字");
+
+        memoryService.saveExchange(s.userId(), question, longAnswer.toString());
+
+        // 轮询等待可见性（与 A4-07 同一处理：Milvus 存在亚秒级可见性窗口）
+        List<com.liushuwen.rag.document.service.MilvusService.SearchResult> hits = List.of();
+        long deadline = System.currentTimeMillis() + 15000;
+        while (System.currentTimeMillis() < deadline) {
+            hits = milvusMemoryStore.searchMemory(embeddingService.embedSingle(question), 3, s.userId());
+            if (!hits.isEmpty()) {
+                break;
+            }
+            try {
+                Thread.sleep(400);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        assertFalse(hits.isEmpty(),
+                "超长回答（" + longAnswer.length() + " 字）应截断入库并可召回；召回为空说明它又被静默丢失了"
+                        + "（Milvus content 字段上限 2048 字节，超长插入失败后被 catch 吞掉）");
+
+        // 存储侧不变量：落库正文的 UTF-8 字节数不得超过 schema 上限（截断必须真作用于存储，而非只作用于向量）
+        String stored = hits.get(0).getContent();
+        int storedBytes = stored.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        assertTrue(storedBytes <= 2048,
+                "入库正文 " + storedBytes + " 字节超过 Milvus content 字段上限 2048 字节 ⇒ 截断只作用于向量、"
+                        + "没作用于入库文本（saveExchange 曾把完整 answer 传给 insertMemory）");
+
+        step("A4-09 通过：记忆主键量级 " + idNow + "（>1e12，重启不再与历史主键冲突），"
+                + "超长回答 " + longAnswer.length() + " 字经生产入口 saveExchange 截断入库 "
+                + storedBytes + " 字节、可召回 " + hits.size() + " 条");
     }
 
     // ==================== 工具 ====================

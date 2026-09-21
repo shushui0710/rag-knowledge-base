@@ -1,4 +1,4 @@
-package com.liushuwen.rag.agent;
+package com.liushuwen.rag.metrics;
 
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;

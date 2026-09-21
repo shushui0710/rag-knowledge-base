@@ -1,9 +1,8 @@
 package com.liushuwen.rag.agent;
 
-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.liushuwen.rag.common.UserContext;
 import com.liushuwen.rag.document.entity.Document;
-import com.liushuwen.rag.document.mapper.DocumentMapper;
+import com.liushuwen.rag.document.service.DocumentService;
+import com.liushuwen.rag.llm.Tool;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -13,7 +12,8 @@ import java.util.Map;
 
 /**
  * 工具：文档列表查询，按分类（可选）过滤、仅查当前用户文档、最多返回 10 条，失败返回错误文案。
- * 【设计要点】数据隔离 + 上限防护：eq(userId) 隔离，last("limit 10") 控返回量，避免超长上下文
+ * 【设计要点】数据隔离 + 上限防护：隔离与 limit 由 DocumentService 承担，工具只负责"取数 + 排版给 LLM"
+ * 【职责边界】工具**不直连 Mapper**：持久化与隔离规则属 document 模块，工具越界会让同一条口径在多处实现
  * 【常见问题】工具内 DB 失败为何返回文案不抛异常？——错误回填 LLM 让其重试，而非炸掉 ReAct 循环
  */
 @Slf4j
@@ -21,7 +21,10 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class QueryDocumentListTool implements Tool {
 
-    private final DocumentMapper documentMapper;
+    private final DocumentService documentService;
+
+    /** 单次返回上限：控制注入 LLM 的上下文长度，避免长列表挤占答案预算 */
+    private static final int MAX_ROWS = 10;
 
     @Override
     public String name() {
@@ -51,15 +54,9 @@ public class QueryDocumentListTool implements Tool {
     public String execute(Map<String, Object> arguments) {
         String category = arguments.get("category") == null ? null : String.valueOf(arguments.get("category"));
 
-        // 功能：文档列表查询（数据隔离 + 失败返回错误文案不抛异常）｜要点：limit 10 控返回量
+        // 功能：文档列表查询（数据隔离 + 失败返回错误文案不抛异常）｜要点：MAX_ROWS 控返回量
         try {
-            LambdaQueryWrapper<Document> wrapper = new LambdaQueryWrapper<>();
-            wrapper.eq(Document::getUserId, UserContext.getUserId());      // 数据隔离，必加！
-            if (category != null && !category.isBlank()) {
-                wrapper.eq(Document::getCategory, category);
-            }
-            wrapper.orderByDesc(Document::getCreateTime).last("limit 10"); // 最多10条
-            List<Document> docs = documentMapper.selectList(wrapper);
+            List<Document> docs = documentService.listByCategory(category, MAX_ROWS);
             if (docs == null || docs.isEmpty()) {
                 return "知识库中暂无文档" + (category == null ? "" : "（分类：" + category + "）");
             }

@@ -1,12 +1,13 @@
 package com.liushuwen.rag.document.service;
 
+import com.liushuwen.rag.document.dto.DocumentStats;
 import com.liushuwen.rag.document.entity.Document;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 
 /**
- * 文档模块服务契约：定义上传、列表、删除、向量化、增量重解析与索引重建的业务接口。
+ * 文档模块服务契约：定义上传、列表、统计、级联删除、向量化与增量重解析的业务接口。
  * 位于 Controller 与实现类之间，调用方只依赖接口，屏蔽 MinIO/Milvus 等存储细节。
  * 【设计要点】面向接口编程：Controller 依赖 DocumentService 而非实现类，便于替换实现与 Mock 单测
  * 【常见问题】为什么 embed 是独立接口而不是上传时自动执行？——向量化耗时长，与上传解耦便于失败重试与幂等控制
@@ -24,9 +25,21 @@ public interface DocumentService {
     List<Document> list();
 
     /**
-     * 按 ID 删除文档（@TableLogic 逻辑删除）
+     * 按 ID 删除文档：级联清理 Milvus 向量、MinIO 原文件与 MySQL 分块后，再逻辑删除文档行。
+     * 仅文档归属者可删，越权抛业务码 403。
      */
     void delete(Long id);
+
+    /**
+     * 按分类查当前用户文档（category 为空则不过滤），按创建时间倒序取前 limit 条。
+     * 供 Agent 的文档列表工具使用——工具层不应直连 Mapper。
+     */
+    List<Document> listByCategory(String category, int limit);
+
+    /**
+     * 当前用户文档统计（总数 / 已向量化数 / 有内容分块的文档数）。
+     */
+    DocumentStats stats();
 
     /**
      * 触发文档向量化入库：读分块 → 批量 Embedding → 写 Milvus
@@ -41,15 +54,4 @@ public interface DocumentService {
      * @param id 文档ID
      */
     void reparseDocument(Long id);
-
-    /**
-     * 重建混合检索索引：把旧结构 collection 升级为 BM25 混合结构。
-     * 流程：删旧 collection → 按 BM25 结构重建 → 回放所有"已向量化"文档
-     * （分块文本还在 MySQL，重新 Embedding 后插入新结构）。
-     *
-     * 触发场景：从 Milvus 2.4 旧结构升级、或 collection schema 变更。
-     *
-     * @return 回放的文档数
-     */
-    int rebuildHybridIndex();
 }

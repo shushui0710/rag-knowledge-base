@@ -6,6 +6,7 @@ import io.minio.BucketExistsArgs;
 import io.minio.MakeBucketArgs;
 import io.minio.MinioClient;
 import io.minio.PutObjectArgs;
+import io.minio.RemoveObjectArgs;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -118,6 +119,30 @@ public class MinioService {
             return in.readAllBytes();
         } catch (Exception e) {
             throw new BusinessException("文件下载失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 按对象键删除文件：文档删除链路里对象存储侧的级联清理入口。
+     * 【设计要点】三处存储的失败代价不同，故策略不同：Milvus 向量残留会被检索召回（**正确性问题**，
+     *   必须失败即中止）；MinIO 孤儿对象只占存储成本（**成本问题**），由调用方决定是否容忍。
+     *   本方法只如实报告成功/失败，不替调用方做取舍。
+     * 【常见问题】对象不存在会怎样？——S3 语义下 removeObject 对不存在的键也返回成功，天然幂等；
+     *   objectName 为空时直接返回，避免把 null 传进 SDK 触发参数异常。
+     */
+    public void deleteFile(String objectName) {
+        if (objectName == null || objectName.isBlank()) {
+            return;                                   // 空值防御：无对象键视为无需清理
+        }
+        try {
+            minioClient.removeObject(RemoveObjectArgs.builder()
+                    .bucket(minioConfig.getBucketName())
+                    .object(objectName)
+                    .build());
+            log.info("文件删除成功: bucket={}, object={}", minioConfig.getBucketName(), objectName);
+        } catch (Exception e) {
+            log.error("文件删除失败: object={}, error={}", objectName, e.getMessage(), e);
+            throw new BusinessException("文件删除失败: " + e.getMessage());
         }
     }
 }

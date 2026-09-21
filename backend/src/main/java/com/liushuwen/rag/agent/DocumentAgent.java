@@ -1,49 +1,35 @@
 package com.liushuwen.rag.agent;
 
-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.liushuwen.rag.chat.service.LlmService;
-import com.liushuwen.rag.common.LlmUnavailableException;
 import com.liushuwen.rag.common.UserContext;
-import com.liushuwen.rag.config.RagProperties;
-import com.liushuwen.rag.document.entity.Document;
-import com.liushuwen.rag.document.mapper.DocumentMapper;
-import com.liushuwen.rag.document.service.EmbeddingService;
-import com.liushuwen.rag.document.service.MilvusService;
+import com.liushuwen.rag.llm.LlmService;
+import com.liushuwen.rag.llm.LlmUnavailableException;
 import com.liushuwen.rag.rag.MemoryService;
-import com.liushuwen.rag.rag.QueryRewriterService;
-import com.liushuwen.rag.rag.RerankService;
+import com.liushuwen.rag.rag.RetrievalChain;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 /**
- * 文档问答 Agent：专注 RAG 检索问答，复用查询改写→混合检索→Rerank 检索链，并接入长期记忆。
+ * 文档问答 Agent：专注 RAG 检索问答，**委托全站唯一检索链**（RetrievalChain）后生成回答，并接入长期记忆。
  * 【设计要点】检索增强生成（RAG）：改写降歧 + 混合检索召回 + Rerank 精排，提升答案相关性
- * 【常见问题】长期记忆如何回存？——topScore≥0.6 的高质量问答对回存，跨会话按用户隔离召回
+ * 【设计要点·为什么检索不写在这里】修复前本类内联了一份与 ChatServiceImpl 几乎逐字相同的检索链，
+ * 但**漏了 minScore 阈值过滤**——同样的候选在主链被挡掉、在这里却直接进 Prompt。两条链路的召回口径
+ * 悄悄分叉，靠注释承诺"与主链路一致"是保不住的；现统一委托 RetrievalChain。
+ * 【常见问题】长期记忆如何回存？——topScore ≥ MemoryService.SAVE_MIN_SCORE 的高质量问答对回存，跨会话按用户隔离召回
  */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class DocumentAgent implements Agent {
 
-    private final EmbeddingService embeddingService;
-    private final MilvusService milvusService;
     private final LlmService llmService;
-    /** 查询改写 + Rerank（与 ChatServiceImpl 检索链一致，复用成熟链路） */
-    private final QueryRewriterService queryRewriterService;
-    private final RerankService rerankService;
-    private final RagProperties ragProperties;
-    /** 检索层用户隔离 */
-    private final DocumentMapper documentMapper;
-    /** 长期记忆：跨会话召回与回存 */
+    /** 全站唯一检索链：向量化 → 隔离 → 记忆召回 → 改写 → 混合检索 → 重排 → 阈值过滤 */
+    private final RetrievalChain retrievalChain;
+    /** 长期记忆：高质量问答对回存（召回侧由 RetrievalChain 承担） */
     private final MemoryService memoryService;
-
-    /** 记忆入库质量门槛（与 ChatServiceImpl 保持一致） */
-    private static final float MEMORY_SAVE_MIN_SCORE = 0.6f;
 
     /** 注入 Prompt 的历史条数上限：只取最近 N 条，控制 token 与噪声 */
     private static final int HISTORY_MAX_TURNS = 6;
@@ -58,53 +44,19 @@ public class DocumentAgent implements Agent {
 
     @Override
     public AgentResult execute(String task, List<Map<String, Object>> history) {
-        // 功能：本轮 history 多轮记忆 + 跨会话长期记忆 recall（按用户隔离）｜要点：双入口记忆设计
-        // 常见问题：为什么分两轮历史？→ 当前轮多轮上下文 + 跨会话长期记忆，召回注入 Prompt 增强连贯性
-        List<float[]> vectors = embeddingService.embed(List.of(task));
-        if (vectors == null || vectors.isEmpty()) {
+        // 功能：委托全站唯一检索链（向量化 → 检索层隔离 → 记忆召回 → 改写 → 混合检索 → Rerank → minScore 过滤）｜要点：与主链路、报告工具共用同一实现，杜绝三份复制分叉
+        RetrievalChain.Outcome outcome = retrievalChain.retrieve(task);
+        // 功能：区分「向量化失败」与「检索无命中」——两者提示语不同，不能合并成一句"未找到"｜要点：把基础设施故障说成"没有资料"会掩盖问题
+        if (outcome.vectorizationFailed()) {
             return AgentResult.of("文档向量化失败，请稍后重试。");
         }
-
-        // 检索层用户隔离：只在当前用户已向量化文档内检索
-        Long userId = UserContext.getUserId();
-        List<Long> documentIds = null;
-        if (userId != null) {
-            documentIds = documentMapper.selectList(new LambdaQueryWrapper<Document>()
-                            .eq(Document::getUserId, userId)
-                            .eq(Document::getEmbeddingStatus, 1)
-                            .select(Document::getId))
-                    .stream().map(Document::getId).toList();
-        }
-
-        // 长期记忆召回（旁路设计，失败返回空列表，不影响主链路）
-        List<String> memories = memoryService.recall(userId, task);
-
-        String rewriteQuery = queryRewriterService.rewrite(task);
-        int recallTopK = ragProperties.getRetrieval().getRecallTopK();
-        int rerankTopN = ragProperties.getRetrieval().getRerankTopN();
-        List<MilvusService.SearchResult> results = rerankService.rerank(task,
-                milvusService.hybridSearch(rewriteQuery, vectors.get(0), recallTopK, documentIds),
-                rerankTopN);
-        if (results == null || results.isEmpty()) {
+        if (outcome.isEmpty()) {
             return AgentResult.of("未在知识库中找到相关文档，请换个问法或先上传相关文档。");
         }
 
-        // 功能：检索片段既拼进 Prompt 又作为"依据"随结果返回｜要点：上层反思评审要核对"是否有据"，必须拿到原始片段
-        StringBuilder ctx = new StringBuilder();
-        List<String> evidence = new ArrayList<>();
-        for (int i = 0; i < results.size(); i++) {
-            String content = results.get(i).getContent();
-            content = content == null ? "" : content;
-            ctx.append("【参考").append(i + 1).append("】").append(content).append("\n\n");
-            evidence.add(content);
-        }
-        // 长期记忆注入（标注为历史问答记录）
-        if (memories != null && !memories.isEmpty()) {
-            ctx.append("【历史问答记录】\n")
-                    .append(String.join("\n---\n", memories)).append("\n\n");
-        }
+        // 功能：会话历史前缀 + 【参考N】片段 + 【历史问答记录】两轮上下文都进 Prompt｜要点：多轮上下文指代前文，跨会话长期记忆补连贯性
         String prompt = buildHistoryBlock(history)
-                + "请根据以下参考资料回答用户问题：\n\n" + ctx
+                + "请根据以下参考资料回答用户问题：\n\n" + outcome.contextWithMemories()
                 + "用户问题：" + task;
         // 【熔断降级】LLM 唯一出口熔断打开时抛 LlmUnavailableException：本 Agent 返回统一兜底文案，
         // AgentResult 照常携带 evidence ⇒ 上层仍能把"检索到的依据"展示给用户，且整条编排链不会中断
@@ -118,15 +70,12 @@ public class DocumentAgent implements Agent {
             degraded = true;
         }
 
-        // 高质量问答对回存长期记忆（topScore≥门槛才存，与 ChatServiceImpl 同一质量线）
+        // 高质量问答对回存长期记忆（topScore 过门槛才存，与主链路共用同一条质量线 MemoryService.SAVE_MIN_SCORE）
         // 降级产生的兜底文案不含任何知识，不得入库（degraded 拦截）
-        float topScore = results.stream()
-                .map(MilvusService.SearchResult::getScore)
-                .max(Float::compare).orElse(0f);
-        if (!degraded && topScore >= MEMORY_SAVE_MIN_SCORE) {
-            memoryService.saveExchange(userId, task, answer);
+        if (!degraded && outcome.topScore() >= MemoryService.SAVE_MIN_SCORE) {
+            memoryService.saveExchange(UserContext.getUserId(), task, answer);
         }
-        return AgentResult.of(answer, evidence);
+        return AgentResult.of(answer, outcome.evidence());
     }
 
     /**

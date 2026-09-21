@@ -1,7 +1,8 @@
-package com.liushuwen.rag.rag;
+package com.liushuwen.rag.rag.impl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.liushuwen.rag.document.service.MilvusService;
+import com.liushuwen.rag.rag.RerankService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;

@@ -1,4 +1,4 @@
-package com.liushuwen.rag.agent;
+package com.liushuwen.rag.llm;
 
 import java.util.Map;
 
@@ -33,4 +33,15 @@ public interface Tool {
      * @return 结果字符串，封装为 role=tool 消息回填 LLM，使其继续推理或作答
      */
     String execute(Map<String, Object> arguments);
+
+    /**
+     * 本工具的输出是否是「可直接交付给用户的产物」（默认否）。
+     * 【设计要点】工具的交付语义分两类：① 查询类（query_*）的返回值是"给 LLM 推理用的中间材料"，
+     * 允许被概括/转述；② 产物类（generate_report）的返回值**本身就是用户要的东西**，必须原样到达用户。
+     * 【常见问题】为什么不让 LLM 自己决定要不要原样输出？——实测过：即便工具已产出完整报告，
+     * LLM 仍会回一段"报告已生成完成"的元信息，用户拿不到产物（正文只留在证据里且被截断到 500 字符）。
+     */
+    default boolean deliverable() {
+        return false;
+    }
 }

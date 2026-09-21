@@ -1,13 +1,10 @@
-package com.liushuwen.rag.chat.service;
+package com.liushuwen.rag.llm;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.liushuwen.rag.agent.AgentMetrics;
-import com.liushuwen.rag.agent.LlmCircuitBreaker;
-import com.liushuwen.rag.agent.Tool;
 import com.liushuwen.rag.common.BusinessException;
-import com.liushuwen.rag.common.LlmUnavailableException;
+import com.liushuwen.rag.metrics.AgentMetrics;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -106,6 +103,26 @@ public class LlmService {
     }
 
     /**
+     * 取 choices[0].message，并在 content 为空时显式告警。
+     * 【缺陷修复·空回答被静默吞掉】此前只 log.info 记录长度，空 content 在日志里与正常回答长得一样，
+     * 于是「报告生成连续 5 次返回 0 字」没有任何人发现 —— 用户看到的只是模型自称"报告已生成完成"。
+     * 空 content 在思考模型下几乎只有一个原因：max-tokens 预算被 reasoning_content 吃光（finish_reason=length），
+     * 故升级为 WARN，并把 finish_reason 与 reasoning 长度一并打出，直接指向修法。
+     */
+    private Message firstMessageOrWarn(String rawBody, String caller) throws JsonProcessingException {
+        DeepSeekResponse resp = objectMapper.readValue(rawBody, DeepSeekResponse.class);
+        Choice choice = resp.getChoices().get(0);
+        Message msg = choice.getMessage();
+        if (msg.getContent() == null || msg.getContent().isBlank()) {
+            log.warn("[{}] LLM 返回空 content（model={}, finish_reason={}, reasoning 长度={}）。"
+                            + "若为思考模型，多半是 max-tokens 被思考过程耗尽，请检查 llm.deepseek.max-tokens",
+                    caller, model, choice.getFinishReason(),
+                    msg.getReasoningContent() == null ? 0 : msg.getReasoningContent().length());
+        }
+        return msg;
+    }
+
+    /**
      * 纯问答调用：构造 system+user 双消息的 OpenAI 兼容请求，调 DeepSeek 取回答文本。
      * 【设计要点】OpenAI 兼容协议形态（model + messages + max_tokens/temperature），RestTemplate 同步调用与 POJO 绑定解析
      * 【常见问题】为什么 messages 用 List<Map> 而非强类型？——协议字段少且固定，Map 构造最轻；异常如何降级？——catch 后转 BusinessException，不把底层错误暴露给前端
@@ -134,8 +151,9 @@ public class LlmService {
             String raw = postChatCompletions(body);
 
             // 功能：把响应体反序列化为 DeepSeekResponse（@JsonIgnoreProperties 忽略未知字段），取 choices[0].message.content｜要点：POJO 绑定比手动遍历 JsonNode 更稳健，字段缺失由 Jackson 容错；choices 是数组须先 get(0)
-            DeepSeekResponse resp = objectMapper.readValue(raw, DeepSeekResponse.class);
-            String answer = resp.getChoices().get(0).getMessage().getContent();
+            // 功能：取 message（空 content 会显式 WARN）｜要点：思考模型下空 content 多为预算被 reasoning 吃光
+            Message msg = firstMessageOrWarn(raw, "chat");
+            String answer = msg.getContent() == null ? "" : msg.getContent();
 
 
             log.info("DeepSeek生成完成, 回答长度: {}", answer.length());
@@ -162,6 +180,9 @@ public class LlmService {
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class Choice {
         private Message message;
+        /** 结束原因：stop=正常结束；length=达到 max_tokens 被截断（思考模型下 content 常为空，正文全在 reasoning 里） */
+        @com.fasterxml.jackson.annotation.JsonProperty("finish_reason")
+        private String finishReason;
         
     }
     @Data
@@ -234,10 +255,10 @@ public class LlmService {
             // 功能：交唯一出口发请求（熔断前置 + 认证 + 计数），返回原始响应体｜要点：ReAct 每轮决策都算一次真实调用，
             // 计数只在出口处发生，AgentExecutor 不再自行计数——修复前两处都记，导致整体翻倍
             String rawBody = postChatCompletions(body);
-            DeepSeekResponse resp = objectMapper.readValue(rawBody, DeepSeekResponse.class);
 
             // 功能：取 choices[0].message 判断是否有 tool_calls｜要点：choices 是数组须先 get(0)；有 tool_calls 进入工具调用分支，否则直接返回回答
-            Message msg = resp.getChoices().get(0).getMessage();
+            // （ANSWER 态若拿到空 content 同样由 firstMessageOrWarn 打 WARN——「空回答」与「报告没产出」是同一类信号）
+            Message msg = firstMessageOrWarn(rawBody, "chatWithTools");
             if (msg.getToolCalls() != null && !msg.getToolCalls().isEmpty()) {
                 // 功能：把模型返回的 assistant 消息完整原样保存（含 role/content/reasoning_content/tool_calls），供 ReAct 循环回填｜要点：思考模型缺 reasoning_content 必报错、tool_calls 缺 index/type 报 "missing field type"，须从原始 JSON 取
                 // 常见问题：为什么用 readTree→Map 而非 convertValue(POJO→Map)？→ convertValue 会把字段名退化成 Java 的 reasoningContent/toolCalls，API 不认，故必须用 JsonNode 保留原始 JSON 字段名
@@ -310,8 +331,9 @@ public class LlmService {
             // 功能：交唯一出口发请求并复用 POJO 绑定取 choices[0].message.content｜要点：查询改写/意图路由/反思评审这些"子任务"
             // 同样消耗 LLM 额度、同样需要熔断保护，走同一出口后三者自动被覆盖
             String raw = postChatCompletions(body);
-            DeepSeekResponse resp = objectMapper.readValue(raw, DeepSeekResponse.class);
-            return resp.getChoices().get(0).getMessage().getContent();
+            // 功能：取 message（空 content 显式 WARN）｜要点：原先直接 getContent()，为 null 时会把 null 抛给调用方
+            Message msg = firstMessageOrWarn(raw, "chatWithSystem");
+            return msg.getContent() == null ? "" : msg.getContent();
         } catch (LlmUnavailableException e) {
             // 熔断打开：本模块未发出请求，不计失败；由调用方按各自语义降级
             throw e;

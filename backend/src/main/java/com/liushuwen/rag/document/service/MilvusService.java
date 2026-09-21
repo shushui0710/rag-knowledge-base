@@ -3,33 +3,22 @@ package com.liushuwen.rag.document.service;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.liushuwen.rag.common.BusinessException;
+import com.liushuwen.rag.config.MilvusConfig;
 import com.liushuwen.rag.config.RagProperties;
 import io.milvus.client.MilvusServiceClient;
-import io.milvus.common.clientenum.FunctionType;
 import io.milvus.grpc.*;
 import io.milvus.param.*;
-import io.milvus.param.collection.*;
 import io.milvus.param.dml.*;
-import io.milvus.param.index.*;
 import io.milvus.response.SearchResultsWrapper;
 import io.milvus.v2.client.MilvusClientV2;
-import io.milvus.v2.common.IndexParam;
-import io.milvus.v2.service.collection.request.AddFieldReq;
-import io.milvus.v2.service.collection.request.CreateCollectionReq;
-import io.milvus.v2.service.collection.request.HasCollectionReq;
-import io.milvus.v2.service.collection.request.LoadCollectionReq;
-import io.milvus.v2.service.index.request.CreateIndexReq;
 import io.milvus.v2.service.vector.request.InsertReq;
 import io.milvus.v2.service.vector.request.SearchReq;
 import io.milvus.v2.service.vector.request.data.EmbeddedText;
 import io.milvus.v2.service.vector.response.SearchResp;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-
-import jakarta.annotation.PostConstruct;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -37,11 +26,18 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
- * Milvus 向量库操作服务：封装建集合、批量入库、稠密检索、按文档删除，以及混合检索（稠密+BM25 稀疏）双路召回。
- * 在知识库链路中作为向量存储与检索层，下游被 DocumentService（入库/删除）与问答检索（hybridSearch）调用。
- * 【设计要点】v1/v2 双 SDK 共存：v1(MilvusServiceClient) 稳定用于稠密路，v2(MilvusClientV2) 才支持 BM25 Function 查询，各取所长
+ * Milvus 文档向量读写与检索服务：批量入库、稠密检索、按文档删除、混合检索（稠密 + BM25 稀疏双路召回）。
+ *
+ * 职责边界（本类只做**文档向量的数据面**）：
+ *   - 集合的建/删/探测/影子表切换 ⇒ {@link MilvusCollectionManager}
+ *   - 长期记忆库（qa_memory）⇒ {@link MilvusMemoryStore}
+ *   - 本类：文档向量本身（insertVectors / search / hybridSearch / deleteByDocumentId）
+ *   三者同包协作，调用方按需注入，不再有"一个类做三件事"的巨型门面。
+ *
+ * 【设计要点】v1/v2 双 SDK 共存：v1(MilvusServiceClient) 稳定用于稠密路与删除，
+ * v2(MilvusClientV2) 才支持 BM25 稀疏检索与 Function 生成字段插入，各取所长。
  * 【常见问题】向量库为什么单独存？——Milvus 专为 ANN 相似度检索优化，MySQL 不适合高维向量检索；
- *   embedding 维度是多少？——embedding-3 稠密向量 2048 维
+ *   embedding 维度是多少？——embedding-3 稠密向量 2048 维（取自 MilvusConfig，不再各处写死）
  */
 @Slf4j
 @Service
@@ -50,122 +46,17 @@ public class MilvusService {
 
     private final MilvusServiceClient milvusServiceClient;
 
-    /** v2 客户端：BM25 Function 建表 + EmbeddedText 稀疏检索（v1 不支持） */
+    /** v2 客户端：BM25 稀疏检索 + 带 Function 生成字段的插入（v1 不支持） */
     private final MilvusClientV2 milvusClientV2;
 
     /** RAG 配置：混合检索 alpha 加权融合权重等 */
     private final RagProperties ragProperties;
 
-    @Value("${milvus.collection-name}")
-    private String collectionName;
-
-    @Value("${milvus.dimension}")
-    private int dimension;
+    /** Milvus 配置：主 collection 名（向量读写与检索都作用于主表） */
+    private final MilvusConfig milvusConfig;
 
     /**
-     * 应用启动时自动初始化 Milvus collection：主检索库与记忆库不存在则创建。
-     * 在建库链路最前端执行，保证服务就绪即可入库检索，无需手工建表。
-     * 【设计要点】@PostConstruct 生命周期：Bean 依赖注入完成后回调，适合启动期资源准备
-     * 【常见问题】Milvus 未启动导致初始化失败怎么办？——catch 后仅 log.warn 不阻断应用启动（可用性优先），
-     *   待 Milvus 恢复后重启即可补建；为何启动期不重试？——阻塞式重试会拖慢甚至卡死应用上线
-     */
-    @PostConstruct
-    public void init() {
-        try {
-            ensureCollection();
-            ensureMemoryCollection();   // 记忆专用 collection：与文档向量物理隔离，避免记忆混入检索结果
-        } catch (Exception e) {
-            log.warn("Milvus初始化失败（可能Milvus还没启动）: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * 创建主检索 collection：定义 4 字段 Schema（id/document_id/content/embedding）+ IVF_FLAT 索引并加载。
-     * 在建库链路中作为 v1 稠密路的结构基础，启动时由 init() 幂等调用。
-     * 【设计要点】Schema 设计：id 对齐 MySQL document_chunk.id（autoID=false）便于回查关联，
-     * content 直接存原文使检索免回 MySQL，embedding 为 2048 维 FloatVector
-     * 【常见问题】为什么主键用 MySQL 的 chunkId？——两库主键对齐，融合排序后可直接定位分块；
-     *   为什么建索引选 IVF_FLAT？——nlist=1024 聚类倒排 + COSINE 度量，中小规模数据集性价比高
-     */
-    public void ensureCollection() {
-        try {
-            // 功能：幂等检查——已存在直接跳过｜要点：重启安全（重复建表会报错，先 showCollections 判断）
-            R<ShowCollectionsResponse> showResp = milvusServiceClient.showCollections(
-                    ShowCollectionsParam.newBuilder().build());
-            for (String name : showResp.getData().getCollectionNamesList()) {
-                if (name.equals(collectionName)) {
-                    log.info("Milvus collection已存在: {}", collectionName);
-                    return;
-                }
-            }
-
-            // ============================================================
-            // 功能：定义 Collection Schema（4 个字段，FieldType 逐个声明名称/类型/主键/维度）
-            // 考点：Schema 设计对齐 MySQL document_chunk 表
-            // 常见问题：id 为什么 autoID(false)？→ 显式传 MySQL 的 chunkId 作主键，两库主键对齐可回查关联
-            // ============================================================
-            FieldType idField = FieldType.newBuilder()
-                    .withName("id")
-                    .withDataType(DataType.Int64)
-                    .withPrimaryKey(true)
-                    .withAutoID(false)
-                    .build();
-            FieldType documentIdField=FieldType.newBuilder()
-                    .withName("document_id")
-                    .withDataType(DataType.Int64)
-                    .build();
-            FieldType contentField=FieldType.newBuilder()
-                    .withName("content")
-                    .withDataType(DataType.VarChar)
-                    .withMaxLength(2048)
-                    .build();
-            FieldType embeddingField=FieldType.newBuilder()
-                    .withName("embedding")
-                    .withDataType(DataType.FloatVector)
-                    .withDimension(dimension)
-                    .build();
-
-            List<FieldType> fieldTypes = List.of(idField, documentIdField, contentField, embeddingField);
-            CollectionSchemaParam schema = CollectionSchemaParam.newBuilder()
-                    .withFieldTypes(fieldTypes) 
-                    .build();
-            
-            CreateCollectionParam createParam = CreateCollectionParam.newBuilder()
-                    .withCollectionName(collectionName)
-                    .withSchema(schema)
-                    .build();
-
-
-
-            milvusServiceClient.createCollection(createParam);
-            log.info("Milvus collection创建成功: {}", collectionName);
-
-            // 功能：为 embedding 建向量索引（IVF_FLAT + COSINE，nlist=1024）
-            // 考点：ANN 索引选型——IVF_FLAT 聚类倒排加速近似检索，暴力遍历扛不住生产规模
-            CreateIndexParam createIndexParam = CreateIndexParam.newBuilder()
-                    .withCollectionName(collectionName)           // 集合名称
-                    .withFieldName("embedding")                    // 向量字段名
-                    .withIndexType(IndexType.IVF_FLAT)             // 索引类型
-                    .withMetricType(MetricType.COSINE)             // 相似度度量
-                    .withExtraParam("{\"nlist\":1024}")            // 索引参数（JSON 字符串）
-                    .build();
-            milvusServiceClient.createIndex(createIndexParam);
-
-            // 功能：load collection 到内存｜要点：Milvus 检索前必须 load，数据从对象存储载入查询节点后才可查
-            milvusServiceClient.loadCollection(
-                    LoadCollectionParam.newBuilder()
-                            .withCollectionName(collectionName)
-                            .build());
-            log.info("Milvus collection索引创建+加载完成: {}", collectionName);
-
-        } catch (Exception e) {
-            log.error("创建Milvus collection失败: {}", e.getMessage());
-            throw new BusinessException("Milvus初始化失败: " + e.getMessage());
-        }
-    }
-
-    /**
-     * 批量插入向量
+     * 批量插入向量（主 collection）
      *
      * @param chunkIds   文本块ID列表（作为Milvus的主键）
      * @param documentId 所属文档ID
@@ -173,6 +64,18 @@ public class MilvusService {
      * @param vectors    向量列表（和contents一一对应）
      */
     public void insertVectors(List<Long> chunkIds, Long documentId,
+                              List<String> contents, List<float[]> vectors) {
+        insertVectors(milvusConfig.getCollectionName(), chunkIds, documentId, contents, vectors);
+    }
+
+    /**
+     * 批量插入向量到指定 collection。
+     * 【设计要点】索引重建的冷升级路径要把数据先灌进影子表，因此把目标集合名参数化；
+     *   主流程仍走上面不带集合名的重载，调用方无需关心集合名
+     *
+     * @param targetName 目标 collection 名（主表或影子表）
+     */
+    public void insertVectors(String targetName, List<Long> chunkIds, Long documentId,
                               List<String> contents, List<float[]> vectors) {
         try {
             // 功能：构建插入数据，一行用 Gson JsonObject 表示｜要点：v1 SDK 行模型——2.5 起用 Gson，2.4.x 是 FastJSON，升级 SDK 须同步替换否则编译报"不兼容的类型"
@@ -193,19 +96,14 @@ public class MilvusService {
                 rows.add(row);
             }
 
-            InsertParam insertParam = InsertParam.newBuilder()
-                    .withCollectionName(collectionName)
-                    .withRows(rows)
-                    .build();
-
             // ⚠️ 必须走 v2 insert：混合 collection 带 BM25 Function（bm25_vector 由服务端生成），
             //    v1 insert 的 ParamUtils 校验器要求行数据提供全部字段，会报
             //    "The field: bm25_vector is not provided"；v2 insert 识别 Function 生成字段，跳过校验
             milvusClientV2.insert(InsertReq.builder()
-                    .collectionName(collectionName)
+                    .collectionName(targetName)
                     .data(rows)
                     .build());
-            log.info("Milvus插入成功: {}条向量, documentId={}", chunkIds.size(), documentId);
+            log.info("Milvus插入成功: {}条向量, collection={}, documentId={}", chunkIds.size(), targetName, documentId);
 
         } catch (Exception e) {
             log.error("Milvus插入失败: {}", e.getMessage());
@@ -243,7 +141,7 @@ public class MilvusService {
             //   传 float[] 会报 "Search target vector type is illegal"（2.4 时代可传 float[]）
             // ============================================================
             SearchParam.Builder paramBuilder = SearchParam.newBuilder()
-                    .withCollectionName(collectionName)
+                    .withCollectionName(milvusConfig.getCollectionName())
                     .withVectorFieldName("embedding")
                     .withVectors(List.of(toVectorList(queryVector)))
                     .withTopK(topK)
@@ -259,7 +157,6 @@ public class MilvusService {
                         .map(String::valueOf).collect(Collectors.joining(",")) + "]");
             }
             SearchParam searchParam = paramBuilder.build();
-
 
             R<SearchResults> response = milvusServiceClient.search(searchParam);
             SearchResultsWrapper wrapper = new SearchResultsWrapper(
@@ -284,7 +181,9 @@ public class MilvusService {
     }
 
     /**
-     * 搜索结果内部类
+     * 向量命中结构（文档检索与长期记忆共用同一份定义，避免同一个 hit 类型出现两份）。
+     * 【常见问题】跨类复用 MilvusMemoryStore 为什么也用这个类型？——记忆召回与文档召回
+     *   在调用方眼里是同一种东西（chunkId + score + content），用两个同构类型只会增加转换代码。
      */
     @lombok.Data
     public static class SearchResult {
@@ -298,138 +197,13 @@ public class MilvusService {
      * 【设计要点】SDK 版本兼容：Milvus 2.5 SDK 要求 FloatVector 查询向量必须是 List&lt;Float&gt;，
      * 传 float[] 会报 "Search target vector type is illegal"（2.4 时代可传 float[]）
      */
-    private List<Float> toVectorList(float[] vector) {
+    private static List<Float> toVectorList(float[] vector) {
         List<Float> list = new ArrayList<>(vector.length);
         for (float v : vector) {
             list.add(v);
         }
         return list;
     }
-
-    // ============================================================
-    // 长期记忆：独立 qa_memory collection，与文档向量完全隔离
-    // ============================================================
-
-    /** 记忆专用 collection（避免记忆混入文档检索结果） */
-    private static final String MEMORY_COLLECTION = "qa_memory";
-
-    /** 记忆主键自增（记忆行没有 document_id，id 直接自增） */
-    private final java.util.concurrent.atomic.AtomicLong memoryIdSeq = new java.util.concurrent.atomic.AtomicLong(1);
-
-    /**
-     * 创建记忆 collection（启动时 init() 调用；幂等：已存在则跳过）
-     * 字段：id(主键) / user_id(所属用户，记忆也按用户隔离) / content(问题\n回答) / embedding(向量)
-     * ⚠️ 旧版 qa_memory 无 user_id 字段：旧库上插入/召回会失败并静默降级（记忆自动停用），
-     *    删除旧 collection 后重启应用即自动重建新结构
-     */
-    public void ensureMemoryCollection() {
-        try {
-            R<ShowCollectionsResponse> showResp = milvusServiceClient.showCollections(
-                    ShowCollectionsParam.newBuilder().build());
-            for (String name : showResp.getData().getCollectionNamesList()) {
-                if (name.equals(MEMORY_COLLECTION)) {
-                    return;
-                }
-            }
-            FieldType idField = FieldType.newBuilder()
-                    .withName("id").withDataType(DataType.Int64)
-                    .withPrimaryKey(true).withAutoID(false).build();
-            FieldType userIdField = FieldType.newBuilder()
-                    .withName("user_id").withDataType(DataType.Int64)
-                    .build();
-            FieldType contentField = FieldType.newBuilder()
-                    .withName("content").withDataType(DataType.VarChar)
-                    .withMaxLength(2048).build();
-            FieldType embeddingField = FieldType.newBuilder()
-                    .withName("embedding").withDataType(DataType.FloatVector)
-                    .withDimension(dimension).build();
-            milvusServiceClient.createCollection(CreateCollectionParam.newBuilder()
-                    .withCollectionName(MEMORY_COLLECTION)
-                    .withSchema(CollectionSchemaParam.newBuilder()
-                            .withFieldTypes(List.of(idField, userIdField, contentField, embeddingField))
-                            .build())
-                    .build());
-            milvusServiceClient.createIndex(CreateIndexParam.newBuilder()
-                    .withCollectionName(MEMORY_COLLECTION)
-                    .withFieldName("embedding")
-                    .withIndexType(IndexType.IVF_FLAT)
-                    .withMetricType(MetricType.COSINE)
-                    .withExtraParam("{\"nlist\":1024}")
-                    .build());
-            milvusServiceClient.loadCollection(LoadCollectionParam.newBuilder()
-                    .withCollectionName(MEMORY_COLLECTION).build());
-            log.info("Milvus 记忆 collection 创建成功: {}", MEMORY_COLLECTION);
-        } catch (Exception e) {
-            log.warn("记忆 collection 初始化失败: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * 保存一条记忆（问答对，content 存 "问题\n回答"）
-     * @param userId 所属用户（记忆按用户隔离，召回时同用户才可见）
-     * ⚠️ 记忆是旁路增强：失败只记日志，绝不影响问答主流程
-     */
-    public void insertMemory(float[] vector, Long userId, String question, String answer) {
-        try {
-            JsonObject row = new JsonObject();
-            row.addProperty("id", memoryIdSeq.incrementAndGet());
-            row.addProperty("user_id", userId);
-            row.addProperty("content", question + "\n" + answer);
-            JsonArray arr = new JsonArray();
-            for (float v : vector) {
-                arr.add(v);
-            }
-            row.add("embedding", arr);
-            milvusServiceClient.insert(InsertParam.newBuilder()
-                    .withCollectionName(MEMORY_COLLECTION)
-                    .withRows(List.of(row))
-                    .build());
-            log.info("记忆已保存: id={}, question={}", row.get("id").getAsLong(), question);
-        } catch (Exception e) {
-            log.warn("记忆保存失败（不影响本次回答）: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * 召回相关记忆（按向量相似度，expr 按 user_id 过滤实现记忆隔离）
-     * @param userId 当前用户（跨用户的记忆不可见）
-     * ⚠️ 失败返回空列表（等同"没有记忆"），不抛异常
-     */
-    public List<SearchResult> searchMemory(float[] vector, int topK, Long userId) {
-        try {
-            SearchParam.Builder paramBuilder = SearchParam.newBuilder()
-                    .withCollectionName(MEMORY_COLLECTION)
-                    .withVectorFieldName("embedding")
-                    .withVectors(List.of(toVectorList(vector)))   // 2.5 SDK 要求 List<Float>
-                    .withTopK(topK)
-                    .withOutFields(List.of("id", "content"))
-                    .withMetricType(MetricType.COSINE)
-                    .withParams("{\"nprobe\":10}");
-            // 记忆按用户隔离：只召回当前用户的历史问答
-            if (userId != null) {
-                paramBuilder.withExpr("user_id == " + userId);
-            }
-            SearchParam param = paramBuilder.build();
-            R<SearchResults> response = milvusServiceClient.search(param);
-            SearchResultsWrapper wrapper = new SearchResultsWrapper(response.getData().getResults());
-            List<SearchResult> results = new ArrayList<>();
-            for (int i = 0; i < wrapper.getIDScore(0).size(); i++) {
-                SearchResult sr = new SearchResult();
-                sr.setChunkId(wrapper.getIDScore(0).get(i).getLongID());
-                sr.setScore(wrapper.getIDScore(0).get(i).getScore());
-                sr.setContent(wrapper.getFieldData("content", 0).get(i).toString());
-                results.add(sr);
-            }
-            return results;
-        } catch (Exception e) {
-            log.warn("记忆召回失败（按无记忆处理）: {}", e.getMessage());
-            return List.of();
-        }
-    }
-
-    // ============================================================
-    // 按文档删除向量 + 混合检索
-    // ============================================================
 
     /**
      * 按文档 ID 删除 Milvus 向量：文档删除/增量重解析时的向量级联清理入口。
@@ -440,16 +214,25 @@ public class MilvusService {
      *   若担心非主键字段删除的兼容性，兜底可先查 MySQL 拿 chunkIds，再按主键 "id in [...]" 删除
      */
     public void deleteByDocumentId(Long documentId) {
+        deleteByDocumentId(milvusConfig.getCollectionName(), documentId);
+    }
 
+    /**
+     * 按文档 ID 删除指定 collection 中的向量。
+     * 【设计要点】索引重建时目标集合可能是影子表，故把集合名参数化；主流程走上面的单参重载
+     *
+     * @param targetName 目标 collection 名（主表或影子表）
+     */
+    public void deleteByDocumentId(String targetName, Long documentId) {
         try {
             DeleteParam param = DeleteParam.newBuilder()
-                    .withCollectionName(collectionName)
+                    .withCollectionName(targetName)
                     .withExpr("document_id in [" + documentId + "]")   // 布尔表达式：in [x]
                     .build();
             // v1 API：delete(DeleteParam) 返回 R<MutationResult>，删除条数取 getDeleteCnt()
             R<MutationResult> resp = milvusServiceClient.delete(param);
             long deleted = resp.getData().getDeleteCnt();
-            log.info("删除向量: documentId={}, deleteCount={}", documentId, deleted);
+            log.info("删除向量: collection={}, documentId={}, deleteCount={}", targetName, documentId, deleted);
         } catch (Exception e) {
             log.error("删除向量失败: documentId={}, error={}", documentId, e.getMessage(), e);
             throw new BusinessException("删除向量失败: " + e.getMessage());
@@ -464,96 +247,6 @@ public class MilvusService {
     public List<SearchResult> hybridSearch(float[] queryVector, int topK) {
         // 功能：无查询原文只能走稠密路｜要点：BM25 稀疏检索的输入是文本（EmbeddedText）而非向量
         return search(queryVector, topK);
-    }
-
-    // ============================================================
-
-
-    /**
-     * 删除主 collection（重建混合索引第 1 步：旧结构无法原地升级 BM25，只能删了重建）
-     * ⚠️ 危险操作：删除后向量数据清空，必须紧接着 createHybridCollection() + 重新向量化
-     *    （完整流程见 DocumentServiceImpl.rebuildHybridIndex）
-     */
-    public void dropMainCollection() {
-        try {
-            milvusServiceClient.dropCollection(DropCollectionParam.newBuilder()
-                    .withCollectionName(collectionName).build());
-            log.warn("Milvus collection 已删除: {}（待按 BM25 结构重建并重新向量化）", collectionName);
-        } catch (Exception e) {
-            log.error("删除 Milvus collection 失败: {}", e.getMessage());
-            throw new BusinessException("删除 Milvus collection 失败: " + e.getMessage());
-        }
-    }
-
-    /**
-     * 创建含 BM25 Function 的混合检索 collection（v2 API）：稠密 + 稀疏双路召回的结构基础。
-     * 在 rebuildHybridIndex 索引重建流程中调用，替代无稀疏字段的旧结构。
-     * 【设计要点】BM25 Function：注册 FunctionType.BM25（输入 content、输出 bm25_vector），
-     * 插入时服务端自动对 content 分词生成稀疏向量，现有 v1 insertVectors 无需任何改动
-     * 【常见问题】content 为什么必须 enableAnalyzer？——BM25 分词依赖 analyzer，不开则 Function 失效；
-     *   稀疏向量是什么？——SparseFloatVector，按词项存储非零权重，与稠密语义向量互补
-     */
-    public void createHybridCollection() {
-        try {
-            // 幂等：已存在则跳过（如需重建，先 drop 旧 collection）
-            if (Boolean.TRUE.equals(milvusClientV2.hasCollection(
-                    HasCollectionReq.builder().collectionName(collectionName).build()))) {
-                log.warn("collection 已存在，跳过创建：{}（如需用新结构重建，请先 drop 旧 collection）",
-                        collectionName);
-                return;
-            }
-
-            // 1) 定义 Schema（字段 + BM25 Function）
-            // ⚠️ 这里必须用 v2 的 DataType（io.milvus.v2.common.DataType）全限定名，
-            //    因为本类 v1 代码（ensureCollection）用了 io.milvus.grpc.DataType，
-            //    两个枚举同名冲突，统一用全限定名避免歧义
-            CreateCollectionReq.CollectionSchema schema =
-                    CreateCollectionReq.CollectionSchema.builder().build();
-            schema.addField(AddFieldReq.builder()
-                    .fieldName("id").dataType(io.milvus.v2.common.DataType.Int64)
-                    .isPrimaryKey(true).autoID(false).build());   // ⚠️ 必须 false：现有 v1 insertVectors 显式传 chunkId 作为 id，autoID=true 会插入冲突
-            schema.addField(AddFieldReq.builder()
-                    .fieldName("content").dataType(io.milvus.v2.common.DataType.VarChar)
-                    .maxLength(4096).enableAnalyzer(true).build());   // ⚠️ 文本字段必须开 analyzer
-            schema.addField(AddFieldReq.builder()
-                    .fieldName("document_id").dataType(io.milvus.v2.common.DataType.Int64).build());   // ⚠️ 必须有：现有 v1 insertVectors 会写 document_id，schema 缺该字段插入直接报错；同时是检索层用户隔离（expr 过滤）的过滤字段
-            schema.addField(AddFieldReq.builder()
-                    .fieldName("embedding").dataType(io.milvus.v2.common.DataType.FloatVector)
-                    .dimension(dimension).build());                  // 稠密向量（沿用现有）
-            schema.addField(AddFieldReq.builder()
-                    .fieldName("bm25_vector").dataType(io.milvus.v2.common.DataType.SparseFloatVector).build());
-            schema.addFunction(CreateCollectionReq.Function.builder()
-                    .functionType(FunctionType.BM25)
-                    .name("text_bm25_emb")
-                    .inputFieldNames(List.of("content"))
-                    .outputFieldNames(List.of("bm25_vector"))
-                    .build());                                       // 服务端自动 BM25 分词
-
-            // 2) 建表 + 向量索引（稠密 embedding + 稀疏 bm25_vector 都必须建，缺一则 loadCollection 报
-            //    "there is no vector index on field"）+ 加载
-            milvusClientV2.createCollection(CreateCollectionReq.builder()
-                    .collectionName(collectionName).collectionSchema(schema).build());
-            milvusClientV2.createIndex(CreateIndexReq.builder()
-                    .collectionName(collectionName)
-                    .indexParams(List.of(
-                            IndexParam.builder()
-                                    .fieldName("embedding")
-                                    .indexType(IndexParam.IndexType.AUTOINDEX)
-                                    .metricType(IndexParam.MetricType.COSINE)
-                                    .build(),
-                            IndexParam.builder()
-                                    .fieldName("bm25_vector")
-                                    .indexType(IndexParam.IndexType.AUTOINDEX)
-                                    .metricType(IndexParam.MetricType.BM25)
-                                    .build()))
-                    .build());
-            milvusClientV2.loadCollection(LoadCollectionReq.builder()
-                    .collectionName(collectionName).build());
-            log.info("混合检索 collection 创建成功（含 BM25 Function）: {}", collectionName);
-        } catch (Exception e) {
-            log.error("创建混合检索 collection 失败: {}", e.getMessage(), e);
-            throw new BusinessException("Milvus collection 初始化失败: " + e.getMessage());
-        }
     }
 
     /**
@@ -585,7 +278,7 @@ public class MilvusService {
 
             // ---- 稀疏路（v2：EmbeddedText 传文本，服务端自动 BM25 分词；filter 同步按用户隔离）----
             var sparseBuilder = SearchReq.builder()
-                    .collectionName(collectionName)
+                    .collectionName(milvusConfig.getCollectionName())
                     .data(List.of(new EmbeddedText(queryText)))
                     .annsField("bm25_vector")
                     .topK(topK)

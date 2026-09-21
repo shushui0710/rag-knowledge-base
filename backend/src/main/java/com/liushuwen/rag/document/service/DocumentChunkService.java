@@ -1,5 +1,6 @@
 package com.liushuwen.rag.document.service;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.liushuwen.rag.document.entity.DocumentChunk;
 import com.liushuwen.rag.document.mapper.DocumentChunkMapper;
 import lombok.RequiredArgsConstructor;
@@ -65,6 +66,50 @@ public class DocumentChunkService {
         }
 
         return chunks.size();
+    }
+
+    /**
+     * 按文档 ID 查全部分块，按 chunkIndex 升序返回。
+     * 【设计要点】排序即语义：向量入库顺序必须与原文顺序一致，否则 chunkId 与内容的映射会错位
+     */
+    public List<DocumentChunk> listByDocumentId(Long documentId) {
+        return documentChunkMapper.selectList(new LambdaQueryWrapper<DocumentChunk>()
+                .eq(DocumentChunk::getDocumentId, documentId)
+                .orderByAsc(DocumentChunk::getChunkIndex));
+    }
+
+    /**
+     * 按文档 ID 物理删除全部分块：文档删除与增量重解析共用的清场入口。
+     * 【设计要点】document_chunk 没有 deleted 列（见《RAG项目数据存储清单》），
+     *   故这里是**物理删除**——一条条件删除干掉整篇文档的分块，而不是逐条 deleteById
+     */
+    public void deleteByDocumentId(Long documentId) {
+        int rows = documentChunkMapper.delete(new LambdaQueryWrapper<DocumentChunk>()
+                .eq(DocumentChunk::getDocumentId, documentId));
+        log.info("删除文档分块: documentId={}, rows={}", documentId, rows);
+    }
+
+    /** 统计某文档当前的分块行数（用于校验删除/重解析前后的分块是否清干净） */
+    public long countByDocumentId(Long documentId) {
+        return documentChunkMapper.selectCount(new LambdaQueryWrapper<DocumentChunk>()
+                .eq(DocumentChunk::getDocumentId, documentId));
+    }
+
+    /**
+     * 统计「有内容分块的**文档**数」：按 document_id 分组去重，而不是数分块行数。
+     * 【常见问题】为什么不能在调用方直接 selectCount？——512/64 滑窗会把一篇文档切成多块，
+     *   数行数会得出「共 1 篇文档，有内容分块的文档 2 篇」这种自相矛盾的口径（原缺陷）
+     * @param documentIds 待统计文档 ID；空集合直接返回 0（MyBatis-Plus 对空集合会生成非法的 IN ()）
+     */
+    public long countDocumentsWithChunk(List<Long> documentIds) {
+        if (documentIds == null || documentIds.isEmpty()) {
+            return 0L;
+        }
+        return documentChunkMapper.selectList(new LambdaQueryWrapper<DocumentChunk>()
+                .select(DocumentChunk::getDocumentId)
+                .in(DocumentChunk::getDocumentId, documentIds)
+                .isNotNull(DocumentChunk::getContent)
+                .groupBy(DocumentChunk::getDocumentId)).size();
     }
 
     /**

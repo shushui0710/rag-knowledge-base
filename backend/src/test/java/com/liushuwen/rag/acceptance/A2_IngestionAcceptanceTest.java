@@ -1,6 +1,8 @@
 package com.liushuwen.rag.acceptance;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.liushuwen.rag.auth.entity.User;
+import com.liushuwen.rag.auth.mapper.UserMapper;
 import com.liushuwen.rag.document.service.DocumentChunkService;
 import com.liushuwen.rag.document.service.EmbeddingService;
 import com.liushuwen.rag.document.service.MilvusService;
@@ -30,6 +32,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   3. 滑动窗口分块算法的可验证行为（窗口 512 / 重叠 64 / 步长 448 / 尾块抑制）
  *   4. 向量化幂等性与异常分支
  *   5. 【关键】向量真正写入 Milvus 并可通过相似度检索召回（不是只看状态位）
+ *   6. 索引重建的运维闸门（非 ADMIN 一律拒绝；提权后放行）——运维型端点的准入边界
+ *   7. 删除的级联语义（三处存储全部清干净）与归属校验（他人文档不可删）
  *
  * 为什么用"检索召回"而不是"行数统计"证明入库成功：
  *   Milvus 的 rowCount 统计在小批量 insert 后存在延迟，用它做断言会产生偶发假失败；
@@ -56,6 +60,10 @@ class A2_IngestionAcceptanceTest extends AcceptanceSupport {
 
     @Autowired
     private MilvusService milvusService;
+
+    /** 仅用于 A2-13：模拟"运维在库侧提权"，从外部证明角色是闸门的唯一判据 */
+    @Autowired
+    private UserMapper userMapper;
 
     /** 构造一份足够长、内容可辨识的测试文档正文 */
     private static String corpus(String marker, int approxChars) {
@@ -295,6 +303,109 @@ class A2_IngestionAcceptanceTest extends AcceptanceSupport {
         assertTrue(node.path("message").asText().contains("50MB"),
                 "错误信息应给出体积上限，实际：" + node.path("message").asText());
         step("A2-12 通过：" + node.path("message").asText());
+    }
+
+    @Test
+    @Order(13)
+    @DisplayName("A2-13 索引重建运维闸门：非 ADMIN 提交被拒（403 业务码），提权后运维台才放行")
+    void a213_rebuild_index_is_gated_by_admin_role() {
+        // 【为什么要补这一条】修复前 POST /api/document/rebuild-index 只要求"已登录"，
+        // 任意注册用户都能 drop 掉全库向量集合并回放**所有用户**的文档；而当时 62 条验收用例全绿——
+        // 与 G-01~G-09 同源：没有任何一条覆盖"运维型端点"，声明的射程没有覆盖到它。
+        // 本条只钉"闸门"这一新契约，不触发真实重建（分钟级破坏性操作不应进验收套件）。
+        AuthSession s = newUser();   // 注册一律 USER 角色，无法自助提权
+
+        // ① 状态接口：普通用户也应拿到 200，但 allowed=false 且 task=null（不侧漏运维信息）
+        ResponseEntity<byte[]> statusResp = httpGet("/api/document/rebuild-index", s.token());
+        assertEquals(200, statusResp.getStatusCode().value(),
+                "状态接口对普通用户也应返回 200，否则文档页初始化就会弹红错：" + bodyOf(statusResp));
+        JsonNode status = jsonOf(statusResp).path("data");
+        assertFalse(status.path("allowed").asBoolean(), "普通用户 allowed 应为 false");
+        assertTrue(status.path("task").isNull(), "普通用户不应拿到任务快照（不侧漏运维信息）");
+
+        // ② 提交：确认串正确也无效，仍被 403 拒绝（鉴权在确认之前）
+        ResponseEntity<byte[]> denied = httpPostJson("/api/document/rebuild-index",
+                "{\"confirm\":\"CONFIRM-REBUILD\"}", s.token());
+        assertEquals(400, denied.getStatusCode().value(),
+                "业务异常按本项目既有契约统一走 HTTP 400（见 A6-05）：" + bodyOf(denied));
+        assertEquals(403, jsonOf(denied).path("code").asInt(),
+                "应返回 403 业务码（无权限），而不是 200 直接触发全库重建：" + bodyOf(denied));
+
+        // ③ 提权后（等价于运维执行 UPDATE user SET role='ADMIN'）：运维台才放行
+        User promotion = new User();
+        promotion.setId(s.userId());
+        promotion.setRole(User.ROLE_ADMIN);
+        userMapper.updateById(promotion);
+        step("A2-13 已将 " + s.username() + " 提权为 ADMIN（模拟运维在库侧变更角色）");
+
+        JsonNode allowed = jsonOf(httpGet("/api/document/rebuild-index", s.token())).path("data");
+        assertTrue(allowed.path("allowed").asBoolean(),
+                "ADMIN 角色应放行运维台，实际：" + allowed);
+        step("A2-13 通过：非 ADMIN 提交被 403 拒绝；提权后运维台放行");
+    }
+
+    @Test
+    @Order(14)
+    @DisplayName("A2-14 删除文档级联清三处存储：Milvus 向量 / MySQL 分块 / MinIO 对象全清，且不再可召回")
+    void a214_delete_cascades_across_three_stores() {
+        // 【为什么要补这一条】原 delete() 只有一行 documentMapper.deleteById(id)：
+        // document_chunk 分块行、Milvus 向量、MinIO 原文件三项全部残留，而当时 66 条验收用例全绿——
+        // 与 G-01~G-09 同源：**用例只验证了"文档行没了"，没有验证"内容真的没了"**。
+        // 主链路因 documentIds 取自 MySQL(deleted=0) 而恰好看不到脏数据，缺口被掩盖了很久。
+        // 该缺口原先以"反向固化"的形式记在 A6-03；实现修好后按 A6 自身的约定转为本条正向回归。
+        AuthSession s = newUser();
+        String marker = "CASCADE" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        long docId = uploadDoc(s.token(), "级联删除验证.md",
+                "# 级联删除验证\n\n本文档唯一标记词是 " + marker + "，删除后其向量是否仍可被召回？\n"
+                        + "补充内容用于凑足分块长度，确保产生可检索的向量。\n", "其他").path("id").asLong();
+        embedDoc(s.token(), docId);
+
+        // 前置：向量可被检索 + 分块已落库（Milvus 写入有亚秒级可见窗口，故轮询等待）
+        float[] qv = embeddingService.embedSingle("本文档唯一标记词是 " + marker);
+        assertTrue(waitUntilRetrievable(milvusService, qv, docId, marker), "前置条件：向量化后 15s 内仍不可检索");
+        long chunksBefore = documentChunkService.countByDocumentId(docId);
+        assertTrue(chunksBefore > 0, "前置条件：解析后应有分块，实际 " + chunksBefore);
+
+        assertEquals(200, httpDelete("/api/document/" + docId, s.token()).getStatusCode().value(),
+                "删除应返回 200");
+
+        // ① MySQL 分块：物理删除，一行不留
+        assertEquals(0, documentChunkService.countByDocumentId(docId),
+                "【级联删除】document_chunk 分块应被一并清除，实际残留 " + chunksBefore + " 行");
+
+        // ② Milvus 向量：不再是"按 document_id 仍可召回"
+        // 注意：与插入侧同源，Milvus 的删除同样不是立即可见的（Bounded 一致性）——
+        // 删除返回成功（deleteCnt>0）后立刻检索仍可能命中原向量，故这里也必须等待而非直接断言，
+        // 否则会得到与业务无关的假失败（首次实现就踩了这个坑：14/15 通过，唯一失败点正是本条）。
+        assertTrue(waitUntilNotRetrievable(milvusService, qv, docId, marker),
+                "【级联删除】删除后 15s 内 Milvus 仍能召回该文档的向量（残留会被检索召回已删内容）");
+
+        // ③ MySQL 文档行：逻辑删除，列表不可见
+        assertNull(findDoc(s.token(), docId), "文档行应已逻辑删除（列表不可见）");
+
+        step("A2-14 通过：删除后 Milvus 向量 / MySQL 分块 / 文档行三处均已清理，"
+                + chunksBefore + " 行分块归零且不再可召回");
+    }
+
+    @Test
+    @Order(15)
+    @DisplayName("A2-15 删除归属校验：B 无法删除 A 的文档（业务码 403，文档仍在）")
+    void a215_delete_is_owner_only() {
+        // 【为什么要补这一条】原 delete() 只校验"文档存在"，不校验"归谁"：
+        // 任何登录用户拿着别人的文档 id 就能删掉，属典型 IDOR 越权。
+        // 修复后按归属校验，越权返回业务码 403（HTTP 契约仍是 400，见 A6-05）。
+        AuthSession a = newUser();
+        AuthSession b = newUser();
+        long docId = uploadDoc(a.token(), "A的私有文档.md", "# 机密内容，B 不该能删", "其他").path("id").asLong();
+
+        ResponseEntity<byte[]> denied = httpDelete("/api/document/" + docId, b.token());
+        assertEquals(400, denied.getStatusCode().value(),
+                "业务异常按本项目既有契约统一走 HTTP 400：" + bodyOf(denied));
+        assertEquals(403, jsonOf(denied).path("code").asInt(),
+                "越权删除应返回 403 业务码：" + bodyOf(denied));
+
+        assertNotNull(findDoc(a.token(), docId), "A 的文档必须仍然存在（越权删除未生效）");
+        step("A2-15 通过：B 删除 A 的文档被 403 拒绝，文档未被删除");
     }
 
     // ==================== 工具方法 ====================

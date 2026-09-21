@@ -5,15 +5,17 @@
 核心亮点：
 
 - **混合检索**：Milvus 2.5 内置 BM25 Function，稠密 + 稀疏双路召回，加权融合（alpha=0.7）后经智谱 Rerank 精排（召回 20 → 精排 5），并按最低相似度 0.35 过滤
-- **Agentic 能力**：ReAct 循环（≤5 轮）+ 工具调用 + 意图路由（DOCUMENT / STATS / REPORT / HYBRID）+ 多 Agent 编排；反思评审（LLM-as-Judge）带证据评审并限 1 次重写，**只作用于"面向短问答、由 LLM 生成"的回答**（STATS 的工具直出确定性事实、REPORT 的长结构化产物都跳过重写）
-- **生产化设计**：长期记忆（qa_memory）、逐依赖降级（4 条路径：混合检索→纯稠密 / Rerank→原分 / 查询改写→原句 / 记忆·评审 fail-open）+ LLM 熔断器（5 次/60s，**挂在全站 LLM 唯一出口 ⇒ 全链路覆盖**）、指标观测、评估集回归、**63 用例验收套件（A1–A6 + 评估，真实 HTTP 全链路）**
+- **Agentic 能力**：ReAct 循环（≤5 轮）+ 工具调用 + 意图路由（DOCUMENT / STATS / REPORT / HYBRID）+ 多 Agent 编排；反思评审（LLM-as-Judge）带证据评审并限 1 次重写，**只作用于"面向短问答、由 LLM 自由生成"的回答（仅 DOCUMENT 一条分支）**（STATS 的工具直出确定性事实、REPORT 的长结构化产物、HYBRID 的组合拼接都跳过重写）
+- **生产化设计**：长期记忆（qa_memory）、逐依赖降级（4 条路径：混合检索→纯稠密 / Rerank→原分 / 查询改写→原句 / 记忆·评审 fail-open）+ LLM 熔断器（5 次/60s，**挂在全站 LLM 唯一出口 ⇒ 全链路覆盖**）、指标观测、评估集回归、**73 用例验收套件（A1–A7 + 评估，真实 HTTP 全链路）**
 
 ## 核心功能
 
 | 模块 | 功能 |
 |------|------|
 | 用户认证 | 注册 / 登录（JWT + BCrypt），`JwtInterceptor` + ThreadLocal 登录态，路由守卫 |
-| 文档管理 | 上传（PDF/Word/MD/TXT，支持分类）、解析分块、向量化入库、重建混合索引；删除为逻辑删除（⚠️ 未级联清理 chunk/向量/MinIO，见「已知缺口」） |
+| 文档管理 | 上传（PDF/Word/MD/TXT，支持分类）、解析分块、向量化入库；删除为**级联清理**：Milvus 向量 → MinIO 对象 → MySQL 分块 → 文档行，`@Transactional(rollbackFor=Exception)` 包裹 + 归属校验（越权返回业务码 403） |
+| 索引运维 | 混合检索索引重建（`ADMIN` 角色 + 二次确认串 → **异步受理** → 同路径轮询进度）：结构已就绪走原地重灌（**零索引真空期**），旧结构升级走**影子表 + 改名切换**（回放期间旧表继续服务） |
+| 角色准入 | `user.role`（`USER` / `ADMIN`）：破坏性运维操作仅 `ADMIN` 可达，注册一律 `USER`，提权只能由运维在库侧执行 |
 | 智能问答 | 多会话管理、来源引用、Markdown 渲染、历史记录、会话标题修改 |
 | Agentic 问答 | 单 Agent（ReAct + 工具调用）、多 Agent 编排（主管分派 + 证据驱动反思评审） |
 | 长期记忆 | qa_memory 独立 collection 存问答对，问答时自动召回相关历史 |
@@ -21,7 +23,7 @@
 | 指标观测 | 今日问答量、平均耗时、LLM / 工具调用次数 |
 | 数据隔离 | 文档、会话、记忆均按用户隔离；检索支持 documentIds 过滤（含降级路径） |
 | 接口文档 | Knife4j 在线 API 文档（http://localhost:18080/doc.html） |
-| 验收套件 | A1–A6 六个验收域 + 评估回归，共 63 个用例走真实 HTTP（见「测试与验收」） |
+| 验收套件 | A1–A6 六个验收域 + 评估回归，共 66 个用例走真实 HTTP（见「测试与验收」） |
 
 ## 系统架构
 
@@ -113,9 +115,9 @@ POST /api/chat/ask/{sessionId}  {"question":"...","mode":"agent"}
 
 
 > **注意**：ReAct 引擎只被编排层的 REPORT 分支复用（`ReportAgent` 直接复用 `AgentExecutor`，不另写一套循环），引擎直连端点走的也是它；
-> HYBRID 是"子 Agent 组合"而非 ReAct 循环。反思评审只对"面向短问答、由 LLM 生成"的回答生效（DOCUMENT / HYBRID），
+> HYBRID 是"子 Agent 组合"而非 ReAct 循环。反思评审只对"面向短问答、由 LLM 自由生成"的回答生效（仅 DOCUMENT），
 > 且必须把 `AgentResult.evidence`（工具输出 / 检索片段）交给评委 —— 传空证据会让任何回答都被判"无知识库依据"，
-> 触发一次纯 LLM 重写并把准确数字换成模糊复述；STATS（工具直出确定性事实）与 REPORT（长结构化产物）直接跳过评审。
+> 触发一次纯 LLM 重写并把准确数字换成模糊复述；STATS（工具直出确定性事实）、REPORT（长结构化产物）与 HYBRID（组合拼接，其中【数据概况】段与 STATS 同源）直接跳过评审。
 >
 > **为什么要接产品入口**：编排、路由直答、反思重写这类能力必须落在用户已经在用的入口上——
 > 不新增第四个页面，而是把 Agent 能力接到对话页（`mode=agent`），复用同样的落库路径与来源展示，
@@ -129,6 +131,75 @@ POST /api/chat/ask/{sessionId}  {"question":"...","mode":"agent"}
 > 两处的完整来龙去脉见下方缺陷表 **G-07** / **G-09**。
 
 > **降级策略**：collection 未重建（无 BM25 字段）时混合检索自动降级为纯稠密（**降级仍保留 documentIds 用户过滤**）；Rerank API 失败时降级按原分数排序；查询改写失败用原句；记忆召回/评审异常静默 fail-open；**熔断器收口在全站 LLM 唯一出口 `LlmService`（连续失败 5 次 → 熔断 60 秒、成功清零），因此主问答链、编排链、ReAct 链以及意图路由 / 查询改写 / 反思评审这些子任务调用全部受保护**——熔断期内一个请求都不发（`llmCalls` 零增长），各链路按自身语义降级：问答返回统一兜底文案（且不写入长期记忆）、路由回落 DOCUMENT、改写退回原句、评审放行、ReAct 返回降级提示。
+
+
+### 链路逐步数据流：每一步对应用户操作的哪一步 + 数据在代码里怎么流
+
+> 上面三条链路已按「做什么 / 为什么 / 代码在哪个类」讲了一遍。这一节回答两个更细的问题：**① 每一步对应用户操作的哪一步；② 这一步的数据在代码里读写到哪一处**。「数据怎么流」一列的方向即读/写方向，落点用 `MySQL 表` / `Milvus collection` / `MinIO bucket` / 外部 API 标注。
+
+**链路① 离线入库**（用户动作：文档管理页「选分类 → 拖拽/点击上传」+ 表格行「向量化」）
+
+| 步 | 用户操作 / 界面反馈（前端 → 端点） | 代码（Controller → 实现方法） | 数据怎么流（读 / 写落点） |
+|---|---|---|---|
+| 1 | 文档管理页拖拽/点击上传（`DocumentView.vue` 的 `el-upload`，`accept` 只放 pdf/docx/md/txt）→ `POST /api/document/upload`（multipart：`file` + `category`） | `DocumentController.upload` → `DocumentServiceImpl.upload` → `validateFile` | 纯内存校验、不落任何存储：白名单 pdf/docx/md/txt、≤50MB、非空、文件名 ≤200 字符；不通过 ⇒ `BusinessException` ⇒ HTTP 400 |
+| 2 | （同一次提交内） | `MinioService.generateObjectName` → `uploadFile` → `ensureBucketExists` | **写 MinIO** `rag-documents`：对象键 `documents/yyyyMMdd/原文件名`（桶不存在则惰性 `makeBucket`） |
+| 3 | （同上） | `DocumentServiceImpl.upload` → `documentMapper.insert` | **写 MySQL `document`**：`user_id`（= `UserContext.getUserId()`，源自 JWT）、`title`/`file_name`/`file_type`/`file_size`/`category`/`minio_path`，`chunk_count=0`、`embedding_status=0`；自增 `id` 回填实体 |
+| 4 | （同上） | `DocumentParserService.parse` | 读 MinIO 文件流 → 内存全文（PDFBox / POI / 纯文本），**不落库** |
+| 5 | （同上） | `DocumentChunkService.chunkAndSave` → `splitText` | **写 MySQL `document_chunk`**：512 窗口 / 64 重叠 / 步长 448，逐块写 `document_id`/`chunk_index`/`content`/`char_count` |
+| 6 | 上传成功提示出现，表格多出一行（`chunkCount` 已回写） | `DocumentServiceImpl.upload` → `documentMapper.updateById` | **写 MySQL `document`**：回写 `chunk_count` |
+| 7 | 表格行点「向量化」按钮 → `POST /api/document/embed/{id}` | `DocumentController.embed` → `DocumentServiceImpl.embed` | **读 MySQL `document`**：存在性 + **归属校验（非归属 ⇒ 业务码 403）** + 幂等（`embedding_status==1` 直接拒绝） |
+| 8 | （同一次请求内） | `DocumentChunkService.listByDocumentId` → `EmbeddingService.embed` | **读 MySQL `document_chunk`**（按 `chunk_index` 升序）→ 调 **智谱 embeddings**（≤64 条/批、`dimensions=2048`；命中进程内缓存——上限 5000——则免调用） |
+| 9 | （同上） | `MilvusService.insertVectors` | **写 Milvus `rag_document_chunks`**：行 = `id`（= `document_chunk.id`）/ `document_id` / `content` / `embedding`；`bm25_vector` 由服务端 BM25 Function 自动生成（故必须走 v2 insert） |
+| 10 | 表格「向量化状态」标签由「待入库」变「已入库」 | `DocumentServiceImpl.embed` → `documentMapper.updateById` | **写 MySQL `document`**：`embedding_status=1` ⇒ 此后检索链圈定的 `documentIds` 才会包含该文档 |
+
+同页其它写操作（不属于主链路，但用户点得到）：
+
+| 用户操作 | HTTP 端点 | 代码 | 数据怎么流（读写落点） |
+|---|---|---|---|
+| 点「删除」 | `DELETE /api/document/{id}` | `DocumentServiceImpl.delete`（`@Transactional`） | ① **删 Milvus** `deleteByDocumentId`（`document_id in [id]`）；② **删 MinIO** 对象（失败仅告警）；③ **物理删 MySQL `document_chunk`**；④ **逻辑删 MySQL `document`**（`deleted=1`）。顺序＝先外部后 MySQL，失败可整体回滚 |
+| 运维专区点「重建索引」（仅 `ADMIN` 账号可见该区块） | `POST /api/document/rebuild-index`（body 带 `confirm=CONFIRM-REBUILD`） | `DocumentController.rebuildIndex` → `IndexRebuildServiceImpl.submit` | 受理即返回任务快照；后台 `IndexRebuildWorker.runAsync` **读 MySQL `document_chunk`** → 重新向量化 → **写 Milvus**（结构已就绪 ⇒ 原地逐文档重灌；待升级 ⇒ 影子表 `xxx__rebuild` 灌满后改名切换） |
+| 页面加载（普通账号也会成功返回） | `GET /api/document/rebuild-index` | `IndexRebuildServiceImpl.status` | **读**当前用户角色 + 内存任务快照；无权者 `allowed=false`、`task=null`（不侧漏运维信息） |
+| 分类下拉切换 | 无新端点 | `DocumentView.loadDocuments`（前端本地过滤） | `GET /api/document/list` 一次性取回当前用户文档，前端按 `category` 过滤 |
+
+**链路② 在线问答**（用户动作：对话页输入框输入 → 回车/点发送 → 看回答并展开「参考来源」；下表 12 步是同一次点击内部的分步）
+
+| 步 | 用户操作 / 界面反馈（前端 → 端点） | 代码（Controller → 实现方法） | 数据怎么流（读 / 写落点） |
+|---|---|---|---|
+| 1 | 输入框输入问题 → 回车/点「发送」（`ChatView.vue` 的 `sendQuestion()` → `api/chat.js` 的 `askQuestion`）→ `POST /api/chat/ask/{sessionId}`，body `{"question":"…"}`（**不开**「深度思考」开关） | `ChatController.ask` → `ChatServiceImpl.ask`（`mode` 为空 ⇒ `askByRag`） | **写 MySQL `chat_message`**：`role=user`、`content=原问题`、`sources=null`（数据优先：后续检索/LLM 失败也留痕） |
+| 2 | 气泡显示 loading 三点动画（用户仍在等） | `RetrievalChain.retrieve` → `EmbeddingService.embed`（`embedSingle` 带缓存） | 调 **智谱 embeddings**：问题 → 2048 维向量；命中缓存则不发请求 |
+| 3 | （同上） | `RetrievalChain.scopeOf(userId)` → `DocumentMapper.selectList` | **读 MySQL `document`**：`user_id=? AND embedding_status=1` ⇒ 得到 `documentIds`（检索层隔离依据；空列表 ⇒ 直接空召回，连一次注定为空的 RPC 都不发） |
+| 4 | （同上） | `MemoryService.recall` → `MilvusMemoryStore.searchMemory(vec, 3, userId)` | **读 Milvus `qa_memory`**（`user_id` 过滤 + `score＞0.5` 取 Top3）；异常 ⇒ 返回空列表（fail-open 等同无记忆） |
+| 5 | （同上） | `QueryRewriterService.rewrite` → `LlmService.chatWithSystem(temp 0.2)` | 调 **DeepSeek**：口语问题 → 2-3 个检索短语；失败/熔断 ⇒ 返回原句 |
+| 6 | （同上） | `MilvusService.hybridSearch(改写词, 向量, 20, documentIds)` | **读 Milvus `rag_document_chunks`**：稠密路（v1 `search` + `expr document_id in [...]`）+ 稀疏路（v2 `EmbeddedText` + BM25），按 `chunkId` 融合 `0.7×稠密 + 0.3×稀疏`，降序取 20 |
+| 7 | （同上） | `RerankService.rerank(question, hits, 5)` | 调 **智谱 rerank**：20 → 5；失败 ⇒ 按原分排序降级 |
+| 8 | （同上） | `RetrievalChain.retrieve` 内 `filter(score ≥ minScore=0.35)` | 内存过滤（不落存储）；过滤后为空 ⇒ `Outcome.empty()` ⇒ 下一步走兜底文案，**完全不调 LLM** |
+| 9 | （同上） | `ChatServiceImpl.askByRag` 用 `promptTemplate` 的 `{context}` / `{question}` 占位符拼 Prompt | 拼接【参考N】片段（+ 有记忆时【历史问答记录】块）；**改写词只用于检索、Prompt 仍用原问题** |
+| 10 | 三点动画结束，回答气泡出现 | `LlmService.chat(prompt)` | 调 **DeepSeek** `deepseek-v4-flash`（temp 0.7、`max_tokens=8192`）；熔断 ⇒ 返回统一兜底文案且 `degraded=true`（不进记忆） |
+| 11 | 回答下方「参考来源」可展开，来源项带相似度标签 | `ChatServiceImpl.askByRag` → `ChatSessionServiceImpl.appendMessage` | **写 MySQL `chat_message`**：`role=assistant`、`content=answer`、`sources=[{chunkId, score, content 前 100 字}]` |
+| 12 | 界面无变化（后台写记忆） | `MemoryService.saveExchange` → `MilvusMemoryStore.insertMemory` | **写 Milvus `qa_memory`**：仅当 `topScore≥0.6` 且未降级；文本按 UTF-8 字节截到 2048，**向量与入库用同一份文本** |
+
+**链路③ Agentic**（用户动作：对话页打开「深度思考」开关再提问；下表 5 步是编排层，第 4 步才进 ReAct 引擎）
+
+| 步 | 用户操作 / 界面反馈（前端 → 端点） | 代码（Controller → 实现方法） | 数据怎么流（读 / 写落点） |
+|---|---|---|---|
+| 1 | 输入框工具栏打开「深度思考」开关（`deepThink=true`）→ 输入问题 → 发送：`POST /api/chat/ask/{sessionId}`，body `{"question":"…","mode":"agent"}` | `ChatController.ask` → `ChatServiceImpl.ask`（`mode=agent` ⇒ `askByAgent`） | 先 **读 MySQL `chat_message`**（`recentMessages(sessionId, 10)` 取最近 10 条）→ 再 **写 MySQL `chat_message`**（`role=user`）。**顺序不能反**：先落库会把本轮问题也读进历史，Prompt 里问题出现两次 |
+| 2 | 回答回来后气泡上方显示「AI助手 · 多 Agent」标签 | `OrchestratorAgent.executeResult` → `RouterService.route` → `LlmService.chatWithSystem(temp 0.1)` | 调 **DeepSeek** 做四分类 DOCUMENT / STATS / REPORT / HYBRID；失败/熔断 ⇒ 回落 DOCUMENT（宁可多检索，不让问题没人答） |
+| 3a | 问「有多少文档 / 列出文档」类问题 ⇒ 数字直答 | `StatsAgent.execute` → `ToolRegistry.execute("query_document_stats" / "query_document_list")` → `DocumentService.stats` / `listByCategory` | **读 MySQL `document` + `document_chunk`**（按 `user_id` 隔离聚合）；工具原文即 `evidence`，**不经过 LLM** |
+| 3b | 问文档内容类问题 ⇒ 走检索（与链路② 同一条链） | `DocumentAgent.execute` → `RetrievalChain.retrieve`（同链路② 步 2~8）→ `LlmService.chat` | 读 Milvus / MySQL（检索）+ 调 DeepSeek；`topScore≥0.6` ⇒ **写 Milvus `qa_memory`**（与链路② 共用同一门槛） |
+| 3c | 说「生成一份关于 XX 的报告」⇒ 进 ReAct 引擎 | `ReportAgent.execute` → `AgentExecutor.executeResult`（构造「必须调用 `generate_report`」的任务指令） | 引擎内调 `generate_report` → `GenerateReportTool.execute` 内部**再走一次 `RetrievalChain.retrieve`** → 调 DeepSeek 生成 Markdown 报告正文（`deliverable=true`） |
+| 3d | 既问数量又问内容 ⇒ 两段式组合回答 | `OrchestratorAgent`（HYBRID 分支）：先 `StatsAgent` 再 `DocumentAgent` | 拼接 `【数据概况】` + 统计文本 + `【文档解答】` + 问答文本；**跳过反思**（两段天然「看似矛盾」，重写必然抹平结构） |
+| 4 | （仅 REPORT 分支与工具组合不确定的长尾进入；界面仍是 loading） | `AgentExecutor.executeResult`：≤5 轮 `LlmService.chatWithTools(messages, tools)`（temp 0.3、`tool_choice=auto`）；TOOL_CALL ⇒ `ToolRegistry.execute(name, args)` → 结果作 `role=tool` 消息回填 | 每轮 **调 DeepSeek**（`llmCalls` 在 `LlmService` 唯一出口计数、`toolCalls` 在 `ToolRegistry.execute` 计数）；工具输出截 500 字作 `evidence`，**产物型工具输出（`deliverable=true` 且 ≥200 字）原样作答、不截断** |
+| 5 | 回答渲染 + 「参考来源」展开显示「依据片段」（无相似度标签） | `OrchestratorAgent`（**仅 DOCUMENT 分支**）`CriticService.judge(question, answer, evidence)` → 不合格 `LlmService.chatWithSystem(temp 0.4)` 重写（硬上限 1）→ `ChatServiceImpl.askByAgent` → `appendMessage` | 调 DeepSeek 评审/重写；**写 MySQL `chat_message`**：`role=assistant`、`content=answer`、`sources=[{content, type:"evidence"}]`（无相似度，不伪造 `score`）；刷新页面历史可回读；指标可从 `GET /api/metrics/today` 读 `AgentMetrics` 计数 |
+
+**横切：认证与数据隔离**（用户动作：登录 + 之后每一次带 token 的请求）
+
+| 步 | 用户操作 / 界面反馈（前端 → 端点） | 代码（Controller → 实现方法） | 数据怎么流（读 / 写落点） |
+|---|---|---|---|
+| 1 | 登录页输入用户名 / 密码，点登录 | `LoginView.vue` → `POST /api/auth/login` → `AuthController` → `UserServiceImpl` | **读 MySQL `user`**（按 `username`）→ BCrypt 校验 `password`（密文比对，内嵌随机盐）；通过后 `JwtUtil` 签发 token（HS256，24h） |
+| 2 | 登录成功后 token 存 localStorage；此后每个请求由 `api/index.js` 请求拦截器自动注入 `Authorization: Bearer` 头（值为登录拿到的 token） | （前端职责，无后端代码） | 前端本地存储；后端每次请求都独立验签（无状态认证，不查库） |
+| 3 | 任意需登录的接口调用 | `WebMvcConfig` 注册的 `JwtInterceptor.preHandle` | 验签 → `jwtUtil.getUserIdFromToken` → **写 `UserContext`（ThreadLocal）**；排除路径精确到 `/api/auth/login`、`/api/auth/register` |
+| 4 | （用户无感） | 各 Service 内 `UserContext.getUserId()`；会话/文档按 id 的入口统一过 `requireOwner()` | 三层隔离读：**MySQL `eq(user_id)`** / **Milvus `expr document_id in [...]`** / **Milvus `qa_memory` `user_id==`**；越权 ⇒ 抛业务码 403（HTTP 仍 400） |
+| 5 | 请求结束（响应已返回） | `JwtInterceptor.afterCompletion` | **清 `UserContext`（`remove()`）**——Tomcat 线程池复用线程，不清会被下一个请求读到旧 `userId` 造成串号 |
 
 ## 技术栈
 
@@ -297,7 +368,7 @@ mvn.cmd test -Dtest=EvalRunnerTest
 
 ```bash
 cd backend
-mvn.cmd test -Dtest=A1_AuthAndContractAcceptanceTest,A2_IngestionAcceptanceTest,A3_RetrievalAcceptanceTest,A4_ChatFlowAcceptanceTest,A5_AgentAndBreakerAcceptanceTest,A6_KnownGapAcceptanceTest,EvalRunnerTest
+mvn.cmd test -Dtest=A1_AuthAndContractAcceptanceTest,A2_IngestionAcceptanceTest,A3_RetrievalAcceptanceTest,A4_ChatFlowAcceptanceTest,A5*AcceptanceTest,A6_KnownGapAcceptanceTest,A7_ResilienceAcceptanceTest,EvalRunnerTest
 ```
 
 **前置条件**：5 个容器全部 healthy、`.env` 密钥与运行中的容器一致、后端可访问 MySQL/MinIO/Milvus。
@@ -316,19 +387,25 @@ mvn.cmd test -Dtest=A1_AuthAndContractAcceptanceTest,A2_IngestionAcceptanceTest,
 | 域 | 用例 | 覆盖内容 | 通过标准（P0） |
 |----|------|----------|----------------|
 | A1 认证与统一契约 | 13 | 注册/登录/重名/密码不回传/统一失败文案、无 token 与篡改 token 拒绝、`Result` 结构、请求体契约（对象 vs 裸 JSON 串）、空问题校验 | 正向返回 200；负向精确返回 **HTTP 400**（非 500）；密码字段恒为 null |
-| A2 离线入库 | 12 | 格式白名单/空文件/无扩展名/未登录上传拒绝、上传落库字段、分块算法边界、向量化入库可召回、幂等防重、删除幂等、列表隔离 | 非法输入 400；`chunkCount/embeddingStatus` 与实际一致；向量化后可被检索命中 |
+| A2 离线入库 | 15 | 格式白名单/空文件/无扩展名/未登录上传拒绝、上传落库字段、分块算法边界、向量化入库可召回、幂等防重、删除幂等、列表隔离、**索引重建运维闸门（非 `ADMIN` 提交一律 403 / 提权后放行，A2-13）**、**级联删除三处存储且删除后不可再召回（A2-14）**、**越权删除他人文档 403（A2-15）** | 非法输入 400；`chunkCount/embeddingStatus` 与实际一致；向量化后可被检索命中 |
 | A3 检索链路 | 8 | 稠密 TopK/降序/content、BM25 稀疏路词面命中、融合排序差异、`documentIds` 隔离、空集合短路、content 完整性、连续 20 次中文检索稳定性、**降级仍保留隔离** | 分数降序、content 非空；跨用户内容不可见（含降级路径）；Milvus `/healthz` 保持健康 |
-| A4 在线问答全链路 | 8 | 端到端问答+来源引用、sources 结构、空召回兜底（不调 LLM）、历史顺序、会话级联删除、长期记忆闭环（隔离+门槛） | 返回 200 且回答非空；sources 含 chunkId/score/预览；兜底路径不产生 LLM 调用 |
-| A5 Agent 链路与熔断 | 14 | 熔断状态机、**熔断收口到唯一出口（挂点结构 + 三出口守卫）（A5-02）**、ReAct 单 Agent（真实工具调用）、编排 STATS 直答、空问题校验、指标联动、工具注册表、**Agent 证据契约**、**对话页 agent 模式落库回读（A5-10）**、**非法 mode 回退 RAG（A5-11）**、**熔断端到端覆盖三条链路（A5-12）**、**REPORT 分支可达并落库（A5-13）**、**四类路由逐一可达 + 编排与引擎直连端点同一 ReAct 引擎实例（A5-14）** | ReAct 返回非空回答；STATS 回答必须含真实文档数且保留工具计量表述；`AgentResult.evidence` 非空；熔断打开时三条链路均 HTTP 200 + 统一兜底文案且 `llmCalls` 零增长；路由可识别 REPORT 且报告带依据产出 |
-| A6 已知缺口固化 | 7 | 会话归属未校验（读/删）、删文档向量残留、重解析无 HTTP 入口、鉴权返回 400 而非 401、标题引号入库、缓存配置未接线 | **断言"当前真实行为"**：修好即失败，强制同步文档（不计入 P0 门槛） |
+| A4 在线问答全链路 | 11 | 端到端问答+来源引用、sources 结构、空召回兜底（不调 LLM）、历史顺序、会话级联删除、长期记忆闭环（隔离+门槛）、**长期记忆健壮性（主键不跨重启冲突 + 超长内容不静默丢失）（A4-09）**、**越权读他人会话历史 403（A4-10）**、**越权删除他人会话 403（A4-11）** | 返回 200 且回答非空；sources 含 chunkId/score/预览；兜底路径不产生 LLM 调用；越权访问返回业务码 403 且错误体不侧漏 |
+| A5 Agent 链路与熔断 | 15 | （按**变更原因**拆为 A5a~A5f 六个类：熔断单元 2 / ReAct 2 / 编排 4 / 指标 1 / 装配 3 / 对话集成 3；共用夹具 `A5Support`）熔断状态机、**熔断收口到唯一出口（挂点结构 + 三出口守卫）（A5-02）**、ReAct 单 Agent（真实工具调用）、编排 STATS 直答、空问题校验、指标联动、工具注册表、**Agent 证据契约**、**对话页 agent 模式落库回读（A5-10）**、**非法 mode 回退 RAG（A5-11）**、**熔断端到端覆盖三条链路（A5-12）**、**REPORT 分支可达并落库（A5-13）**、**四类路由逐一可达 + 编排与引擎直连端点同一 ReAct 引擎实例（A5-14）**、**HYBRID 组合回答保留【数据概况】/【文档解答】结构（A5-15）** | ReAct 返回非空回答；STATS 回答必须含真实文档数且保留工具计量表述；`AgentResult.evidence` 非空；熔断打开时三条链路均 HTTP 200 + 统一兜底文案且 `llmCalls` 零增长；路由可识别 REPORT 且报告带依据产出 |
+| A6 已知缺口固化 | 4 | 重解析无 HTTP 入口、鉴权返回 400 而非 401、标题引号入库、缓存配置未接线（原「会话越权读/删」与「删除不级联」已于 09-20 修复并移出，取证改挂 A4-10/A4-11、A2-14/A2-15） | **断言"当前真实行为"**：修好即失败，强制同步文档（不计入 P0 门槛） |
+| A7 鲁棒性与并发 | 6 | 并发射程（4 用户真并发上传+向量化+检索，互不串号）、事务射程（删除中途失败 ⇒ MySQL 侧整体回滚，不留半删态）、级联正向射程（删后三处终态一致 + 同内容重传主键不冲突）、异步射程（闸门拒绝零残留 + 陈旧任务号不覆盖快照 + 专用线程池）、权限矩阵射程（14 个受保护端点无 token 全拒 + 越权写 6 格全 403 零副作用）、超长畸形射程（超长文件名/标题前置校验 400；emoji+零宽+控制字符内容完整入库） | 并发互不污染；异常路径不留半成品数据；越权一律 403 且零副作用；非法/超长输入 **400 而非 500** |
 | 评估回归 | 1 | 20 题评估集 Top5 命中率（稠密 vs 混合） | 命中率可复现输出（用于趋势对比，不设硬门槛） |
 
-### 当前结果（2026-09-18）
+### 当前结果（2026-09-20）
 
 ```
-A1  13/13    A2  12/12    A3   8/8    A4   8/8
-A5  14/14    A6   7/7     Eval 1/1     → Tests run: 63, Failures: 0, Errors: 0
+A1  13/13    A2  15/15    A3   8/8    A4  11/11
+A5  15/15    A6   4/4     A7   6/6    Eval 1/1
+                                        → Tests run: 73, Failures: 0, Errors: 0
+
+> A5 的 15 条由六个类承载：A5a 2 / A5b 2 / A5c 4 / A5d 1 / A5e 3 / A5f 3（原 816 行单文件已于第八轮按变更原因拆分）。
 ```
+
+> 09-17 重写时当轮为 **60 条**，09-18「C+A 收口」后为 **63 条**（A5 11→13→14）；09-20 补 **A2-13**（索引重建运维闸门）后为 **64 条**；09-20 二轮补 **A4-09**（记忆健壮性）+ **A5-15**（HYBRID 结构保全）后为 **66 条**；09-20 **第七轮**「结构治理」把原 A6 缺口①②③（会话越权读/删、删除不级联）改正向回归（A4-10/A4-11、A2-14/A2-15）后为 **67 条**；09-20 **第八轮**「测试结构治理」新增 **A7 域**（补六类空缺射程：并发 / 事务回滚 / 级联正向 / 异步失败 / 权限矩阵 / 超长畸形）并把 A5 按变更原因拆为 A5a~A5f 后为 **73 条**（验收域 6 → **7**）。引用旧数字须带当轮限定。
 
 关键实测数据：
 
@@ -350,9 +427,8 @@ A5  14/14    A6   7/7     Eval 1/1     → Tests run: 63, Failures: 0, Errors: 0
 
 | 层 | 规模 | 产物 |
 |----|------|------|
-| 后端集成（JUnit） | 6 域 63 用例，`Tests run: 63, Failures: 0` | 本文件「覆盖范围与通过标准」 |
-| C+A 收口专项（09-18） | 四类路由 4/4 命中 + 报告经对话页落库可回读；界面 7 张 | `screenshots/C+A收口-2026-09-18/` + `_probe/ca_evidence.json` |
-| HTTP 全接口黑盒 | 50 用例（A1–A6 实测 + 补充 S-01…S-08），50/50 PASS | `_probe/api_full_suite.mjs` · `api_supplement.mjs` · `api_suite_result.json` |
+| 后端集成（JUnit） | 7 域 73 用例，`Tests run: 73, Failures: 0` | 本文件「覆盖范围与通过标准」 + 下方「第四轮」缺陷复盘 |
+| HTTP 全接口黑盒 | 51 用例（A1–A6 实测 + 补充 S-01…S-08 + **09-20 补 D-05 报告分支**），51/51 PASS；**射程分档**（第八轮新增）：唯一射程 **3** / 可交叉验证 48 / 未登记 0 | `_probe/api_full_suite.mjs` · `api_supplement.mjs` · `api_suite_result.json` |
 | UI 全流程截图 | 28 张（23 条前端交互 + 5 张接口证据页），全程无 5xx | `screenshots/全量功能测试-2026-09-17/` |
 
 > 说明：上表「产物」中的 `_probe/` 脚本、`screenshots/` 截图目录与汇总报告 `RAG项目全量功能测试报告-*.html`，均位于**仓库同级的工作区目录**（`../`），因体积较大**未随本仓库提交**；本仓库内保留的是可复跑的验收套件 `backend/src/test/java/com/liushuwen/rag/acceptance/`，按下方 runbook 可重新生成全部证据。
@@ -367,15 +443,15 @@ A5  14/14    A6   7/7     Eval 1/1     → Tests run: 63, Failures: 0, Errors: 0
 
 | # | 缺口 | 影响 |
 |---|------|------|
-| ① | `getHistory` 只按 sessionId 过滤，**不校验会话归属** | 任一登录用户可用自己的 token 读取他人会话（越权读） |
-| ② | `deleteSession` 同样不校验归属 | 可删除他人会话（越权删） |
-| ③ | `delete(id)` 只做 document 行逻辑删除，**未清理 document_chunk / Milvus 向量 / MinIO 对象** | 数据残留；实测仍残留 1 行分块、向量可按 document_id 召回 |
+| ① | ~~`getHistory` 只按 sessionId 过滤，不校验会话归属~~ **已修（09-20）** | 原：任一登录用户可用自己的 token 读取他人会话。现：所有按 id 的读写统一过 `ChatSessionService.requireOwner()`，越权返回**业务码 403**（HTTP 仍 400）；取证移到 **A4-10** |
+| ② | ~~`deleteSession` 同样不校验归属~~ **已修（09-20）** | 原：可删除他人会话。现：同样过 `requireOwner()` ⇒ 403；取证移到 **A4-11** |
+| ③ | ~~`delete(id)` 只做 document 行逻辑删除，未清理 document_chunk / Milvus 向量 / MinIO 对象~~ **已修（09-20）** | 原：数据残留、向量仍可按 document_id 召回。现：**级联清理**（Milvus 向量 → MinIO 对象 → MySQL 分块 → 文档行）+ `@Transactional` + 归属校验 403；取证移到 **A2-14**（级联 + 不再可召回）/ **A2-15**（越权删除 403） |
 | ④ | `reparseDocument`（增量重解析）已实现但 **Controller 未暴露** | HTTP 层不可达 |
 | ⑤ | 鉴权失败返回 **HTTP 400**，前端仅在 401 时登出跳转 | 前端 401 分支为死代码，token 过期不会自动跳登录页 |
 | ⑥ | 会话标题：前端发 JSON 字符串、后端收裸 String | **引号被一并入库**（如 `"验收标题"`） |
 | ⑦ | `rag.retrieval.embed-cache-limit` 已配置但 `EmbeddingService` 未注入 | 改 yml 不生效，上限实为硬编码常量 |
 
-> 这七项都已写进 `A6_KnownGapAcceptanceTest`，是"文档准确性"的可回归护栏，而非"已知问题无所谓"。
+> 上述 7 项里 ①②③ 已于 **09-20 第七轮 · 结构治理**修复并**移出** A6（改正向回归，取证挂到 A4-10/A4-11、A2-14/A2-15）；余下 ④⑤⑥⑦ 仍写进 `A6_KnownGapAcceptanceTest`（现 **4 条**，编号**刻意不重排**——它是旧报告的追溯锚点）。A6 是"文档准确性"的可回归护栏：**断言「缺陷当前成立」，修好即失败，强制同步文档**。
 
 ### 第一轮（验收套件重写）修复的 6 处缺陷
 
@@ -447,9 +523,9 @@ G-07 更进一步——它不是"行为不对"，而是"功能正确却没接上
 
 **回归护栏**：`A5-06` 从"断言 `llmCalls > 0`"升级为**精确增量断言**——实测一次验收会话 `queryCount 2→5`、`llmCalls 3→7`、`toolCalls 3→6`，
 分解正好 = RAG 链 1 次 LLM（仅查询改写）+ 编排 STATS 链 1 次 LLM / 2 次工具（统计 + 列表）+ ReAct 链 2 次 LLM / 1 次工具，无任何倍数偏差。
-数字错了用例立刻变红；后端 63 条、API 50 条同步复测全绿。
+数字错了用例立刻变红；后端 73 条、API 51 条同步复测全绿（09-20 第八轮测试结构治理后复跑）。
 
-#### 后续收口（2026-09-18）：把「挂错层 / 没有入口」的两处同类残留一并修掉
+#### 第三轮（2026-09-18）：「挂错层 / 没有入口」两处同类残留收口
 
 > 下面 2 处**不计入**上面的 9 项（G-01 ~ G-09）：G 编号表是 09-17 定稿轮的快照，
 > 追溯改写历史轮计数只会让各文档口径全部漂移。本轮属**同一根因的延续修复**，按同一格式单列说明。
@@ -462,6 +538,58 @@ G-07 更进一步——它不是"行为不对"，而是"功能正确却没接上
 > **这两处共有的判断力（面试可讲）**：`grep 机制名 / 能力名` 扫全部表面，逐处问"它**真覆盖/真触达**这条入口吗"。
 > 熔断被四处文档写成"降级矩阵的一员"（读起来像主链路也有），报告生成被写成"助手能自主决定"（读起来像能用）——
 > **数字对、定位错，比数字错更难被发现**；而两者的发现方式都是交叉核对，不是任何一次测试执行。
+
+#### 第四轮（2026-09-20）：报告分支的「假产出」——连取证截图都是假的
+
+> 同样**不计入** G-01 ~ G-09：这是 09-18 收口时「接线通了、但产物是假的」留下的隐患，被交付前的一次追问回查出来。
+
+有人问了一句「报告真有实际产出报告吗？我从截图里看不出来」，回查发现：**REPORT 分支从接进产品那天起，从未产出过一份报告正文。**
+
+| 层面 | 现象 | 根因 | 修法 |
+|------|------|------|------|
+| 配置 | 报告正文 0 字 | `application.yml` 的 `llm.deepseek.max-tokens: 2048` 被**思考模型**的推理阶段吃光——`deepseek-v4-flash` 先写 `reasoning_content` 再写 `content`，实测 `finish_reason=length`、`reasoning_tokens=2048`、`content` 0 字 | `max-tokens: 8192`；`LlmService` 三个出口统一走 `firstMessageOrWarn()`，空 `content` 升为 WARN 并打印 `finish_reason` / reasoning 长度 |
+| 链路 | 工具产物被 LLM 概括 | 执行器只用 LLM 的最终回答作答，而 LLM 把两千字的报告概括成一句「报告已生成完成」 | 新增 `Tool.deliverable()`（默认 false、`generate_report` 覆写 true）；执行器识别到可信产物（≥200 字）时**优先以产物原文作答**且不截断 |
+| 测试 | 假产出照样全绿 | 断言只校验 `answer` 非空 + `evidence` 非空 + `toolCalls` 增长——「报告已生成」的说明句三项全满足 | A5-13 补 `assertReportBody()`（长度 ≥200 字 **且** 命中 ≥2 个报告结构要素词）；黑盒补 D-05（50 → 51 条） |
+
+**为什么会漏**：三条问法实测产出 **399 / 495 / 662 字**，全是「关于报告的说明」而非报告；09-18 拍的那张「报告生成」截图，拍到的就是这个假产出——**取证截图也会骗人，必须回原始响应体核对**。
+修复后实测（`_probe/report_branch_evidence.json`）：产品自然问法即产出 **3094 字**报告正文（命中结构要素 引言/现状/问题/建议），耗时 33879ms。
+
+#### 第五轮（2026-09-20 二轮）：主动审计——「跑通了」不等于「产出了」
+
+> 同样**不计入** G-01 ~ G-09。触发点是那句追问的延伸：「你就不能自己找找错误吗，比如说那个 qa_memory 有没有真落地，agent 链路有没有问题」。这四项都有一个共同形状——**代码在跑、日志在响、用例全绿，但该产出的东西其实没产出**。
+
+| # | 缺陷 | 真相 | 修法 | 取证 |
+|---|------|------|------|------|
+| 1 | **记忆主键跨重启冲突** —— 号称"跨会话长期记忆"，实为"进程内记忆" | `memoryIdSeq` 是单例**实例字段**且初值恒为 `1`，每次重启（含每轮验收测试）都归零 ⇒ 新记忆主键从 2 重新开始，与上一轮**完全重叠**。Milvus 不强制主键唯一（insert 不报错），仅 query/search 阶段按主键**去重** ⇒ 实测 `qa_memory` 物理 **202 行**、`id=2` 一个主键压了 **38 条**、全部记录只落在 `id=2..10` 九个主键上，**可召回实体仅剩 9 条** | 初值改取 `System.currentTimeMillis()`（时间戳量级且单调递增），不改 schema、不重建 collection，历史数据原地保留 | A4-09 ①（反射断言序列量级 >1e12，防无声回归） |
+| 2 | **记忆「向量与入库文本不同源」** —— 注释宣称的截断对存储侧根本没生效 | `MemoryServiceImpl.saveExchange` 把"截断到 200 字"的结果**只用于算向量**，入库却传了完整 `answer`：① 单条记忆可无限长、直撞 `content` 字段上限；② 向量只反映"问题 + 前 200 字"，content 存全文，>200 字回答的后半段对相似度贡献为零 | 先按 **UTF-8 字节上限 2048**（与 Milvus schema 同一常量 `MEMORY_CONTENT_MAX_LEN`）裁剪一次，再让 embedding 与入库**共用这一份文本**；`insertMemory` 签名收敛为 `(vector, userId, content)`，把"入库什么"的契约显式化 | A4-09 ② |
+| 3 | **超长记忆静默丢失**（#2 的直接后果） | 入库拼"问题 + 完整回答"无长度保护 ⇒ Milvus 报 `code=1100`（`length: 6124, max length: 2048`）被 `catch` 吞成一行 WARN（实测 2600 字必失败、1900 字正常）。踩坑：`max_length` 计 **UTF-8 字节**（中文 1 字符 = 3 字节），首次按"字符数 ≤ 2048"截断仍得 ~6124 字节、被 A4-09 当场打回 | 按字节边界截断 + WARN；`truncateUtf8()` 保证不切坏多字节字符 | A4-09 ②（实测 2606 字 → 入库 **2047 字节**、可召回） |
+| 4 | **HYBRID 组合回答被反思推平** | STATS/REPORT 早已 `skipReflection`，而含**同源工具直出数字**的 HYBRID 漏在特判之外 ⇒ Critic 判"对文档数量的回答自相矛盾…整体回答不够简洁"必触发重写，硬拼接的【数据概况】/【文档解答】+ 文档列表被整段抹平（实测 **200+ 字 → 54 字**） | 与 STATS/REPORT 同处理（`skipReflection = true`），并同步修正 `OrchestratorAgent` 内"只作用于 DOCUMENT / HYBRID"等三处已失效注释 | A5-15（断言回答含【数据概况】与【文档解答】双结构） |
+
+**这一轮的射程教训**：A4-09 原先**直连 `milvusService.insertMemory`**，绕过了 `MemoryServiceImpl` ⇒ 上游那层"截断失效"永远测不到。测试射程决定能发现什么——**从生产入口测，而不是从最方便的那个方法测**。
+
+#### 第六轮（2026-09-20）：系统性梳理 —— 自顶向下四维审计（架构 / 依赖 / 测试 / 文档）
+
+> 同样**不计入** G-01 ~ G-09。这一轮不发新功能，只做三件事：把三处各写一份、且**互不一致**的检索实现收敛为唯一的 `RetrievalChain`（P0）；抽出 `llm/`（LLM 唯一出口）与 `metrics/` 两个模块、controller 归位，打断 2 处包级循环依赖（P1）；把四份文档从「编年式补N」改成**同一套轮次编号**、清掉指向已删文件的悬空引用（P1）。完整四维审计（含 P1/P2/P3 方案与逐条取证）见 `RAG项目系统性梳理报告-2026-09-20.html`。
+
+#### 第七轮（2026-09-20）：结构治理（P2/P3 落地）—— 拆上帝类 / 收口会话读写 / 级联删除
+
+> 承接第六轮排出的方案，**不改行为、只改结构**：`MilvusService`（835 行）按变更原因拆三份（`MilvusCollectionManager` 集合结构面 341 行 / `MilvusService` 文档向量数据面 339 行 / `MilvusMemoryStore` 长期记忆面 253 行；三者各自 `@PostConstruct` 自初始化），**最长文件 835 → 360**；新增 `ChatSessionService` 作为会话/消息**读写唯一出口**（所有按 id 的读写统一过归属校验 ⇒ 越权返回业务码 **403**），`ChatServiceImpl` 321 → **248 行**；文档删除改**级联 + 事务 + 归属校验**（Milvus 向量 → MinIO 对象 → MySQL 分块 → 文档行）；两个 agent 工具不再跨层直摸 Mapper（`agent → document` 的 4 条边全部落在 service/dto）；`rag/impl/` 子包与其余模块的 `service/impl` 约定对齐。
+>
+> **同时把已修好的 3 条缺口从 A6 改正向回归并移出**（会话越权读/删 → A4-10 / A4-11，删除不级联 → A2-14 / A2-15）——A6 是"断言缺陷当前成立"的台账，**修好即变红**，若只改断言就会从护栏变成掩饰。A6 **7 → 4 条**（编号刻意不重排，它是旧报告的追溯锚点），验收套件 **66 → 67**；复跑 **67/67** + 黑盒 **51/51** 全绿。
+
+#### 第八轮（2026-09-20）：测试结构治理 —— 补六类射程 / A5 拆 6 类 / 黑盒射程分档
+
+> 承接第六轮四维审计里「测试」维度的三条结论（T-1 A5 816 行单文件、T-2 黑盒与 Java 套件同射程重复、**六类射程完全空缺**），**不改行为、只改测试结构与射程**：
+>
+> **① 新增 A7 域，把六类空缺射程补齐**（`A7_ResilienceAcceptanceTest`，6 条）：并发（4 用户真并发上传+向量化+检索，验证 `ThreadLocal` 用户隔离在真并发下成立）、事务回滚（删除中途抛异常 ⇒ MySQL 侧分块与文档行整体回滚，不留「文档还在、分块已空」的半删态）、级联正向（删后三处终态一致 + 同内容重传主键不冲突）、异步失败（运维闸门拒绝时零残留、陈旧任务号不覆盖快照、任务走专用池）、权限矩阵（14 个受保护端点无 token 全拒 + 越权读/删/改/触发向量化 6 格全 403 零副作用）、超长畸形（超长文件名/标题前置校验 400；emoji+零宽+控制字符内容完整入库）。
+>
+> **② A5 拆 6 类**：原 `A5_AgentAndBreakerAcceptanceTest`（816 行单文件、塞了 15 个用例 + 大量内联辅助）按**变更原因**拆成 `A5a_BreakerUnit`（2）/ `A5b_ReAct`（2）/ `A5c_Orchestration`（4）/ `A5d_Metrics`（1）/ `A5e_AgentWiring`（3）/ `A5f_ChatIntegration`（3），共用夹具抽进 `A5Support`（143 行），原文件归档到 `_trash-2026-09-20/`。用例总数与断言不变（15），换的只是承载结构。
+>
+> **③ 黑盒射程分档**：主套件 43 条 + 补充 8 条逐条标注 `unique` / `replaceable`（`_probe/api_suite_tiers.mjs`），当前**唯一射程 3 条**（C-08 更新标题异常语义 / D-04 编排 DOCUMENT 分支端到端 / S-03 前后端白名单一致性），其余可被 Java 套件交叉验证。分档表由 `_run_api_suite.py` 在收口处复核，**新增用例漏登记会直接告警**。
+>
+> **★ 首跑即抓到 2 处真缺陷**（已修，**单列、不计入 G-01~G-09**）：① **IDOR 写越权** —— `POST /api/document/embed/{id}` 只校验文档存在、不校验归属，任何登录用户拿他人文档 id 就能替对方触发向量化（改状态位 + 写向量库）；同源方法 `reparseDocument` 一并补校验。② **超长输入落 500** —— 超长文件名（> `VARCHAR(200)`）与会话标题（> `VARCHAR(100)`）不命中任何业务校验，一路走到 INSERT/UPDATE 才被列上限拒绝 ⇒ 把「你输入太长」误报成「服务端故障」。两处与 G-01~G-09 同源：**不是代码写错，而是射程没覆盖**（越权只逐点补过删除与会话，非法输入只按类型测过）。
+>
+> 套件 **67 → 73**、验收域 **6 → 7**、测试类 9 → 13（16 文件 / 3834 行）；主代码 **81 类 / 6493 行**（第七轮 6448，第八轮修 2 缺陷 +45）；复跑 **73/73** + 黑盒 **51/51** 全绿。
 
 ### 交付前代码审计：删掉 2 个孤立类 + 4 处冗余 import
 
@@ -541,47 +669,63 @@ rag-knowledge-base/
 │       │   │       ├── DocumentParserService.java   PDF/Word/MD/TXT 解析
 │       │   │       ├── DocumentChunkService.java    滑动窗口分块
 │       │   │       ├── EmbeddingService.java        智谱向量化
-│       │   │       └── MilvusService.java           向量库 CRUD + 混合检索
+│       │   │       ├── MilvusService.java           文档向量 CRUD + 混合检索（数据面）
+│       │   │       ├── MilvusCollectionManager.java 集合结构：建库/探测/影子表切换（结构面）
+│       │   │       ├── MilvusMemoryStore.java       长期记忆库 qa_memory（独立集合 + 字节级裁剪）
+│       │   │       └── IndexRebuildService.java + impl/ + Worker   索引重建（运维型端点 · @Async）
 │       │   ├── chat/                     💬 问答模块
 │       │   │   ├── controller/ChatController.java
 │       │   │   ├── entity/ChatSession.java + ChatMessage.java
 │       │   │   ├── mapper/ChatSessionMapper.java + ChatMessageMapper.java
-│       │   │   └── service/ChatService.java + impl/ChatServiceImpl.java
-│       │   │       └── LlmService.java              DeepSeek 调用（chat/chatWithSystem/chatWithTools）
+│       │   │   └── service/
+│       │   │       ├── ChatService.java + impl/ChatServiceImpl.java      问答编排（提问→召回→生成→落库）
+│       │   │       └── ChatSessionService.java + impl/                  会话/消息读写唯一出口（含归属校验 403）
+│       │   ├── llm/                      🧠 LLM 接入层（全站唯一出口）
+│       │   │   ├── LlmService.java                  DeepSeek 调用（chat / chatWithSystem / chatWithTools）
+│       │   │   ├── LlmCircuitBreaker.java           熔断器（挂唯一出口 ⇒ 全链路覆盖）
+│       │   │   ├── LlmUnavailableException.java     熔断专属异常（各链路按自身语义降级）
+│       │   │   └── Tool.java                        工具契约（Function Calling 入参 Schema）
+│       │   ├── metrics/                  📈 指标模块
+│       │   │   ├── AgentMetrics.java                指标埋点（按天累计，唯一写者口径）
+│       │   │   └── controller/MetricsController.java  /api/metrics/today
 │       │   ├── agent/                    🤖 Agent 模块
-│       │   │   ├── Tool.java + ToolRegistry.java    工具抽象 + 注册表
+│       │   │   ├── ToolRegistry.java                工具注册表（工具执行唯一出口）
 │       │   │   ├── QueryDocumentStatsTool.java      工具：文档统计
 │       │   │   ├── QueryDocumentListTool.java       工具：文档列表
 │       │   │   ├── GenerateReportTool.java          工具：报告生成
 │       │   │   ├── AgentExecutor.java               ReAct 循环执行器（≤5 轮）
 │       │   │   ├── Agent.java + AgentResult.java   Agent 契约（回答 + 证据片段）
-│       │   │   ├── DocumentAgent / StatsAgent       专用子 Agent（DOCUMENT / STATS 两类）
+│       │   │   ├── DocumentAgent / StatsAgent / ReportAgent   子 Agent（DOCUMENT / STATS / REPORT）
 │       │   │   ├── OrchestratorAgent.java           多 Agent 编排（主管分派 + 反思评审）
-│       │   │   ├── AgentMetrics.java                指标埋点
-│       │   │   └── LlmCircuitBreaker.java           熔断器
 │       │   ├── rag/                      🔍 检索增强模块
-│       │   │   ├── Route.java + RouterService.java + Impl   意图路由
-│       │   │   ├── QueryRewriterService.java + Impl         查询改写
-│       │   │   ├── RerankService.java + Impl                重排序
-│       │   │   ├── CriticService.java + Impl + Critique     反思评审
-│       │   │   └── MemoryService.java + Impl                长期记忆（qa_memory）
-│       │   ├── controller/               🌐 顶层控制器
-│       │   │   ├── AgentController.java             /api/agent/ask（引擎直连端点）
-│       │   │   └── MetricsController.java           /api/metrics/today
+│       │   │   ├── impl/                  五个 Service 实现（Critic / Memory / QueryRewriter / Rerank / Router）
+│       │   │   ├── Route.java + RouterService.java          意图路由（DOCUMENT / STATS / REPORT / HYBRID）
+│       │   │   ├── QueryRewriterService.java                查询改写
+│       │   │   ├── RerankService.java                       重排序
+│       │   │   ├── CriticService.java + Critique            反思评审
+│       │   │   ├── MemoryService.java                       长期记忆接口层（qa_memory）
+│       │   │   └── RetrievalChain.java                      ⭐ 全站唯一检索链（向量化→用户隔离→记忆→改写→混合检索→重排→阈值过滤）
 │       │   ├── common/                   🔧 Result / BusinessException / GlobalExceptionHandler / UserContext
 │       │   └── config/                   ⚙️ JwtUtil / JwtInterceptor / WebMvcConfig / RestTemplateConfig
 │       │       ├── MilvusConfig / MinioConfig / RagProperties(@ConfigurationProperties)
 │       │       └── MybatisPlusConfig / MyMetaObjectHandler / CorsConfig
 │       ├── main/resources/application.yml
 │       └── test/java/com/liushuwen/rag/
-│           ├── acceptance/                ✅ 验收套件（真实 HTTP，63 用例）
+│           ├── acceptance/                ✅ 验收套件（真实 HTTP，73 用例 / 7 域）
 │           │   ├── AcceptanceSupport.java        基类：真实 RestTemplate + 环境指纹 + 向量可见性等待
+│           │   ├── A5Support.java                 A5 共用夹具（检索语料 / 熔断开关 / 反射取证）
 │           │   ├── A1_AuthAndContractAcceptanceTest.java      认证与统一契约（13）
-│           │   ├── A2_IngestionAcceptanceTest.java            离线入库（12）
+│           │   ├── A2_IngestionAcceptanceTest.java            离线入库（15）
 │           │   ├── A3_RetrievalAcceptanceTest.java            检索链路与隔离（8）
-│           │   ├── A4_ChatFlowAcceptanceTest.java             在线问答全链路（8）
-│           │   ├── A5_AgentAndBreakerAcceptanceTest.java      Agent 链路与熔断（14）
-│           │   └── A6_KnownGapAcceptanceTest.java             已知缺口固化（7）
+│           │   ├── A4_ChatFlowAcceptanceTest.java             在线问答全链路（11）
+│           │   ├── A5a_BreakerUnitAcceptanceTest.java         熔断单元（2）
+│           │   ├── A5b_ReActAcceptanceTest.java               ReAct 引擎（2）
+│           │   ├── A5c_OrchestrationAcceptanceTest.java       编排层（4）
+│           │   ├── A5d_MetricsAcceptanceTest.java             指标联动（1）
+│           │   ├── A5e_AgentWiringAcceptanceTest.java         Agent 装配（3）
+│           │   ├── A5f_ChatIntegrationAcceptanceTest.java     对话页集成与降级（3）
+│           │   ├── A6_KnownGapAcceptanceTest.java             已知缺口固化（4 · 缺口台账）
+│           │   └── A7_ResilienceAcceptanceTest.java           鲁棒性与并发（6 · 第八轮新增域）
 │           └── eval/
 │               └── EvalRunnerTest.java       唯一评估入口（读 docs/eval/questions.json，20 题）
 │
@@ -633,9 +777,10 @@ rag-knowledge-base/
 | GET | `/api/auth/me` | 获取当前用户信息 | 是 |
 | POST | `/api/document/upload` | 上传文档（`file` + 可选 `category`，自动解析分块入库） | 是 |
 | GET | `/api/document/list` | 文档列表（按用户隔离） | 是 |
-| DELETE | `/api/document/{id}` | 删除文档（⚠️ 当前仅逻辑删除 document 行，未清理分块 / Milvus 向量 / MinIO 对象，见「已知缺口」） | 是 |
+| DELETE | `/api/document/{id}` | 删除文档（**级联**：Milvus 向量 → MinIO 对象 → MySQL 分块 → 文档行，事务包裹；非归属者 403） | 是 |
 | POST | `/api/document/embed/{id}` | 触发向量化入库 | 是 |
-| POST | `/api/document/rebuild-index` | 重建混合检索索引（升级 BM25 结构；⚠️ 全局操作：drop 主 collection 后回放**所有用户**已向量化文档） | 是 |
+| POST | `/api/document/rebuild-index` | **受理索引重建（异步）**：仅 `ADMIN` 角色；body 需带 `{"confirm":"CONFIRM-REBUILD"}`；立即返回任务快照，长任务在后台线程执行 | 是 |
+| GET | `/api/document/rebuild-index` | 查询重建任务状态与当前账号的运维权限（`{allowed, task}`，无权时 `task=null`）；与 POST **同路径**，故端点路径总数不变 | 是 |
 | POST | `/api/chat/session` | 创建对话会话 | 是 |
 | GET | `/api/chat/sessions` | 会话列表 | 是 |
 | PUT | `/api/chat/session/{sessionId}/title` | 修改会话标题 | 是 |
@@ -646,6 +791,7 @@ rag-knowledge-base/
 | GET | `/api/metrics/today` | 今日指标（问答量 / 平均耗时 / LLM / 工具调用） | 是 |
 
 > **端点总数：16 个**（认证 3 / 文档 5 / 会话问答 6 / Agent 1 / 指标 1）。09-17 时为 17 个（Agent 2），09-18 收敛动作删除了与产品入口完全重叠的 `POST /api/agent/orchestrate` ⇒ 16。
+> 计算口径按**路径**数（`/v3/api-docs` 的 `len(paths)`）：09-20 索引重建端点新增了同路径的 `GET`（查状态），故文档模块仍是 5 条路径、6 个方法，总数不变。
 
 > 完整接口文档：http://localhost:18080/doc.html （Knife4j）。认证接口在页面右上角「Authorize」输入 `Bearer <token>` 统一配置。
 
@@ -659,7 +805,12 @@ rag-knowledge-base/
 | 第 7 周 | 项目文档与评估 | ✅ |
 | 第 8 周 | Agentic RAG 演进：混合检索 / Rerank / 查询改写 / ReAct / 意图路由 / 多 Agent / 长期记忆 / 降级熔断 / 评估 | ✅ |
 | 第 9 周 | 验收测试重写（A1–A6 + 评估，当轮 60 用例真实 HTTP；09-18 收口后 63）+ 全量功能黑盒测试（50 API 用例 + 28 张 UI 截图，全程无 5xx）+ 修复 15 处缺陷（6 + G-01 ~ G-09）+ **Agent 模块接入对话页（深度思考开关 → mode=agent 落库回读）** + **指标埋点口径重构（埋点收敛到唯一出口：LlmService / ToolRegistry.execute / 入口层）** + 文档与实现对齐 + 已知缺口固化 | ✅ |
-| 第 9 周·收口 | **熔断收口到唯一出口**（`LlmService`，从此覆盖主问答链 / 编排链 / ReAct 链全链路，新增 `LlmUnavailableException` 供各链路按自身语义降级）+ **报告生成接入对话页**（意图路由第 4 类 `REPORT` + `ReportAgent` 复用 ReAct 引擎 + `AgentExecutor.executeResult` 返回证据）+ 验收套件扩到 **63 用例**（新增 A5-02 改造 / A5-12 熔断端到端 / A5-13 REPORT 分支 / A5-14 四类路由 + 单引擎实例（编排与引擎直连端点 assertSame））| ✅ |
+| 第 9 周·收口 | **熔断收口到唯一出口**（`LlmService`，从此覆盖主问答链 / 编排链 / ReAct 链全链路，新增 `LlmUnavailableException` 供各链路按自身语义降级）+ **报告生成接入对话页**（意图路由第 4 类 `REPORT` + `ReportAgent` 复用 ReAct 引擎 + `AgentExecutor.executeResult` 返回证据）+ 验收套件扩到 **63 用例**（该轮口径；09-20 补 A2-13 后为 64、二轮后为 66）（新增 A5-02 改造 / A5-12 熔断端到端 / A5-13 REPORT 分支 / A5-14 四类路由 + 单引擎实例（编排与引擎直连端点 assertSame））| ✅ |
+| 第 9 周·收口Ⅲ（09-20） | **索引重建从"无门槛的全局破坏性接口"收口为受控运维能力**（三处缺陷一并修复）：① 系统无角色概念 ⇒ 新增 `user.role` + `ADMIN` 准入，修掉「任何登录用户都能 drop 主 collection 并回放所有用户文档」；② `drop` 在 `try` 之外、先删后灌 ⇒ 改为**影子表 + 改名切换**（回放期间旧表继续服务，索引真空期从实测 72.3s 量级压到毫秒级），结构已就绪时走**原地逐文档重灌**（零真空期）；③ 同步长任务阻塞请求线程 ⇒ 新增 `AsyncConfig`/`IndexRebuildService`/`IndexRebuildWorker`，改为 **`@Async` 异步受理 + 同路径 `GET` 轮询进度**，并在前端文档页补上运维入口；同时补验收用例 **A2-13**（把"运维型端点"纳入射程，套件 **63 → 64**）| ✅ |
+| 第 9 周·收口Ⅳ（09-20）· 运维链路实测取证 | `_probe/rebuild_ops_evidence.json` + `verify_rebuild_ops.mjs`（两条路径各跑一轮真实重建）。**warm（原地重灌）**：受理 **15ms** 返回（修复前同步 72300ms）、非 ADMIN 提交 HTTP 400/code 403、无权时 `task=null`、缺确认串 400/code 400、运行中重复提交 400/code 409、354/354 文档回放完成（243.2s），**全程每 1.2s 采样主 collection 恒存在且可查 ⇒ 真空期 0ms** | ✅ |
+| 第 9 周·收口Ⅳ（09-20）· cold 路径（影子表切换）取证 | 旧结构主表（无 `bm25_vector`）⇒ 先建影子表 `rag_document_chunks__rebuild` 全量回放，**回放 244.9s 期间 201 次采样旧表恒定可查（≥5 行）⇒ 检索全程不中断**；回放完成才改名顶替主表，切换后主表已带 `bm25_vector`、影子表自动清理，真空期 0ms | ✅ |
+| 第 9 周·收口Ⅴ（09-20）· 记忆与 HYBRID 三处缺陷 | 主动审计（起因：用户质疑"qa_memory 到底有没有真落地、agent 链路有没有问题"）挖出并修复：① **记忆主键跨重启冲突** —— `memoryIdSeq` 是单例实例字段且初值恒为 1，每次重启（含每一轮验收测试）id 又从 2 重新开始，与历史记忆主键完全重叠；Milvus 虽允许重复主键，但 query/search 按主键去重 ⇒ 实测 qa_memory 物理 202 行、`id=2` 一个主键上压了 38 条记录、全部记录只落在 id=2..10 九个主键上，**可召回实体仅剩 9 条，"跨会话长期记忆"实际退化为"进程内记忆"**；改为初值取时间戳（不改 schema、不重建 collection）。② **超长记忆静默丢失** —— content 字段上限是 2048 **字节**（UTF-8，不是字符数），而入库拼的是"问题+完整回答"且无长度保护，超长时 Milvus 报 code=1100 又被 `catch` 吞成一行 WARN ⇒ 记忆无声消失（实测 2600 字必失败、1900 字正常）；改为按 **UTF-8 字节边界**截断并告警（首次按"字符数"截断仍被 A4-09 实测打回——日志明示 6124 字节，中文 1 字符 = 3 字节）。③ **HYBRID 组合回答被反思重写推平** —— STATS 早已 `skipReflection`（"重写会把准确数字换成模糊复述"），但含同样工具直出数字的 HYBRID 漏在特判之外，Critic 见两段来源天然矛盾（数据段"有 1 篇文档" vs 检索段"资料未提及"）必判不合格并重写 ⇒ 硬拼接的【数据概况】/【文档解答】与文档列表被整段抹平（实测 200+ 字结构化成文 → 54 字口语概述）；与 STATS 同处理跳过反思（修复后 209 字、结构与文档列表完整）。取证：A4-09（记忆主键量级 + 超长入库防线）、A5-15（HYBRID 结构保全）、`_probe/hybrid_branch_evidence.json`、`_probe/r26_verify_evidence.json`；套件 **64 → 66** | ✅ |
+| 第 9 周·收口Ⅵ（09-20）· **测试结构治理（第八轮）** | 三项测试侧重构，**不改行为、只改测试结构与射程**：① **新增 A7 域补六类空缺射程**（并发 / 事务回滚 / 级联正向 / 异步失败 / 权限矩阵 / 超长畸形）——首跑 6 条即抓到 **2 处真缺陷**（`POST /api/document/embed/{id}` 写越权 IDOR、超长文件名/会话标题落 HTTP 500），当场修复并固化为 A7-05 / A7-06 正向护栏；② **A5 按变更原因拆 6 类**（A5a 熔断单元 / A5b ReAct / A5c 编排 / A5d 指标 / A5e 装配 / A5f 对话集成）+ 抽 `A5Support` 共用夹具，原 816 行单文件归档到 `_trash-2026-09-20/`；③ **黑盒 51 条按射程分档**（`_probe/api_suite_tiers.mjs`：唯一射程 3 / 可交叉验证 48 / 未登记 0），并在 `_run_api_suite.py` 收口处复核，防止「新增用例却漏登记」静默通过。套件 **67 → 73**、验收域 **6 → 7**（测试类 9 → 13）；复跑 **73/73** + 黑盒 **51/51** 全绿 | ✅ |
 
 ## 常见问题
 
@@ -706,7 +857,7 @@ Docker Desktop → Settings → Docker Engine 配置镜像加速器：
 |----|-----------|-----------|------|
 | 服务端镜像 | `milvusdb/milvus:v2.4.10` | `v2.5.16` | `docker-compose up -d` 重拉镜像 |
 | Java SDK | `milvus-sdk-java 2.4.1` | `2.5.14` | SDK 改用 Gson，项目已显式声明 fastjson 并适配 |
-| BM25 Function | 不支持 | 支持 | 旧 collection 需重建（调用 `POST /api/document/rebuild-index`，自动回放已向量化文档） |
+| BM25 Function | 不支持 | 支持 | 旧 collection 需重建（由 `ADMIN` 角色调用 `POST /api/document/rebuild-index`，body 带 `{"confirm":"CONFIRM-REBUILD"}`；自动回放已向量化文档） |
 
 > v1 gRPC 协议向后兼容，不重建 collection 也能继续用（混合检索自动降级为纯稠密）。
 

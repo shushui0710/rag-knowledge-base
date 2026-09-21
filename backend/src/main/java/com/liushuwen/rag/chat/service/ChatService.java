@@ -5,6 +5,11 @@ import com.liushuwen.rag.chat.entity.ChatSession;
 
 import java.util.List;
 
+/**
+ * 对话服务契约（Controller 面向的唯一入口）。
+ * 【职责边界】会话与消息的增删改查本身由 ChatSessionService（含归属校验）承担，
+ *   本接口保留同名方法是为了让 Controller 只依赖一个门面，避免调用方在两层之间来回切换。
+ */
 public interface ChatService {
 
     ChatSession createSession();

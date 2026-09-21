@@ -65,7 +65,10 @@ llm:
     # ⚠️ 2026-07-24 起 deepseek-chat / deepseek-reasoner 已弃用（兼容仍可用），
     # 新模型名：deepseek-v4-flash（非思考）/ deepseek-v4-pro（更强）。问答场景用 flash 即可。
     model: deepseek-v4-flash
-    max-tokens: 2048
+    # ⚠️ max-tokens 必须同时覆盖「思考过程 + 正文」：deepseek-v4-flash 是思考模型，
+    # 先用 reasoning_content 思考、再用 content 作答。预算不足时思考阶段就耗尽（finish_reason=length），
+    # content 恒为空串 —— 09-20 实测：2048 时「报告生成」连续 5 次返回 0 字，提到 8192 后正常产出 2192 字。
+    max-tokens: 8192
     temperature: 0.7
 
 # JWT配置

@@ -1,9 +1,10 @@
 package com.liushuwen.rag.agent;
 
 import com.alibaba.fastjson.JSONObject;
-import com.liushuwen.rag.chat.service.LlmService;
-import com.liushuwen.rag.common.LlmUnavailableException;
 import com.liushuwen.rag.config.RagProperties;
+import com.liushuwen.rag.llm.LlmService;
+import com.liushuwen.rag.llm.LlmUnavailableException;
+import com.liushuwen.rag.llm.Tool;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -33,6 +34,9 @@ public class AgentExecutor {
 
     /** 单条工具输出作为"证据"入库时的截断长度：报告类工具输出很长，全量回传会让 sources 字段膨胀 */
     private static final int EVIDENCE_MAX_CHARS = 500;
+
+    /** 产物型工具的最小可信长度：低于此值更可能是「未检索到 / 生成失败」的提示语，不可当作交付物 */
+    private static final int DELIVERABLE_MIN_CHARS = 200;
 
     /** 注入 ReAct 循环的历史条数上限：只取最近 N 条，控制 token */
     private static final int HISTORY_MAX_TURNS = 6;
@@ -76,6 +80,9 @@ public class AgentExecutor {
     public AgentResult executeResult(String userQuestion, List<Map<String, Object>> history) {
         // 功能：证据收集——循环内每次工具输出都作为"依据"存下来｜要点：不暴露可变状态，随返回值传递，天然线程安全
         List<String> evidence = new ArrayList<>();
+        // 功能：产物型工具（deliverable）的成功输出单独留一份｜要点：它要作为最终回答原样交付，
+        // 而 evidence 里那份会被截断（sources 不能膨胀），两者用途不同、不能合用一份
+        String deliverableAnswer = null;
         try {
             // 功能：ReAct 循环（思考→行动→观察→再思考）｜要点：maxIterations 上限防 LLM 死循环
             // 常见问题：为什么需要轮数上限？→ 防止重复调用工具死循环，控制成本与延迟
@@ -98,7 +105,13 @@ public class AgentExecutor {
 
                 // LLM 认为可以回答了 → 直接返回（随回答带上本轮工具证据）
                 if (resp.isAnswer()) {
-                    return AgentResult.of(resp.getContent(), evidence);
+                    // 【缺陷修复·产物被概括掉】产物型工具（如 generate_report）已经把用户要的东西整篇产出，
+                    // 此时若仍采用 LLM 的收尾文本，它多半只回"报告已生成完成"——用户拿不到产物（09-20 实测）。
+                    // 故：有可信产物时以【产物原文】作答，LLM 在此处退化为多余的二次概括。
+                    String answer = (deliverableAnswer != null && !deliverableAnswer.isBlank())
+                            ? deliverableAnswer
+                            : resp.getContent();
+                    return AgentResult.of(answer, evidence);
                 }
 
                 // 功能：回填含 tool_calls 的 assistant 消息｜要点：OpenAI 要求 tool 消息前必有对应 assistant 消息，漏填 400
@@ -108,6 +121,8 @@ public class AgentExecutor {
                 // 【设计要点】工具统一经 toolRegistry.execute 执行（查表+执行+计数唯一出口），本类不再自行记工具数
                 for (LlmService.ToolCall call : resp.getToolCalls()) {
                     String result;
+                    Tool tool = toolRegistry.get(call.getFunction().getName());
+                    boolean deliverable = tool != null && tool.deliverable();
                     try {
                         // arguments 是 JSON 字符串，先解析再传给工具
                         result = toolRegistry.execute(call.getFunction().getName(),
@@ -118,6 +133,10 @@ public class AgentExecutor {
                     }
                     // 功能：把工具输出收作证据（截断防膨胀）｜要点：报告类工具输出可达数千字，全量回传会让 sources 膨胀
                     if (result != null && !result.isBlank()) {
+                        // 功能：产物型工具的输出额外留一份「不截断」的原文｜要点：它是最终回答，不能被截断
+                        if (deliverable && result.length() >= DELIVERABLE_MIN_CHARS) {
+                            deliverableAnswer = result;
+                        }
                         evidence.add(result.length() > EVIDENCE_MAX_CHARS
                                 ? result.substring(0, EVIDENCE_MAX_CHARS) + "..." : result);
                     }

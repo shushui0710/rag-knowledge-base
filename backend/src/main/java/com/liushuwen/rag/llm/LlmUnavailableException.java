@@ -1,4 +1,5 @@
-package com.liushuwen.rag.common;
+package com.liushuwen.rag.llm;
+import com.liushuwen.rag.common.BusinessException;
 
 /**
  * LLM 服务暂时不可用：熔断打开期间由唯一出口 LlmService 抛出，提示各链路"本次根本没发出请求，请走兜底"。
